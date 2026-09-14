@@ -143,6 +143,12 @@ typedef enum {
     LOCALE_MENU_SEARCH,
     LOCALE_SCREEN_SEARCH,
 
+    // Help (button combos)
+    LOCALE_MENU_HELP,
+    LOCALE_SCREEN_HELP,
+    LOCALE_HELP_EQ,
+    LOCALE_HELP_SEEK,
+
     // Count
     LOCALE_COUNT
 } LocaleKey;

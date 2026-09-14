@@ -20,6 +20,7 @@ static const MenuItem kMainMenu[] = {
     { LOCALE_MENU_EQ,          SCREEN_EQ            },
     { LOCALE_MENU_WAVE,        SCREEN_WAVE          },
     { LOCALE_MENU_SEARCH,      SCREEN_SEARCH        },
+    { LOCALE_MENU_HELP,        SCREEN_HELP          },
 };
 #define MAIN_MENU_COUNT ((int)(sizeof(kMainMenu) / sizeof(kMainMenu[0])))
 

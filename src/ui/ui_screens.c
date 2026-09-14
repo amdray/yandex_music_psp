@@ -37,6 +37,7 @@
 #include "ui/ui_screen_eq.h"
 #include "ui/ui_screen_wave.h"
 #include "ui/ui_screen_search.h"
+#include "ui/ui_screen_help.h"
 #include "ui/ui_common.h"
 
 static void *s_splash_pixels = NULL;
@@ -208,6 +209,10 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .update = ui_screen_search_update,
         .handle_input = ui_screen_search_handle_input,
         .render = ui_screen_search_render,
+    },
+    [SCREEN_HELP] = {
+        .name = "help",
+        .render = ui_screen_help_render,
     },
 };
 

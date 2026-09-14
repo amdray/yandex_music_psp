@@ -517,6 +517,16 @@ static unsigned long long s_sel_t0 = 0;
 static int s_sel_fired = 0;
 static unsigned long long s_hint_until = 0;
 
+/* Холд влево/вправо = перемотка, тап = соседний трек.
+ * Тап срабатывает на отпускании (до 450 мс), иначе seek-повторы. */
+#define NAV_HOLD_US 450000ULL
+#define NAV_SEEK_REPEAT_US 300000ULL
+#define NAV_SEEK_STEP_MS 10000
+static unsigned long long s_nav_t0 = 0;
+static int s_nav_dir = 0;
+static int s_nav_seeking = 0;
+static unsigned long long s_nav_last = 0;
+
 static void dd_adjust(int dir)
 {
     if (s_dd_sel == 0) {
@@ -786,9 +796,41 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
     } else if (input->pressed & PSP_CTRL_START) {
         playback_controller_request_toggle_pause();
     } else if (input->pressed & PSP_CTRL_RIGHT) {
-        playback_controller_request_next();
+        s_nav_t0 = now;
+        s_nav_dir = +1;
+        s_nav_seeking = 0;
     } else if (input->pressed & PSP_CTRL_LEFT) {
-        playback_controller_request_previous();
+        s_nav_t0 = now;
+        s_nav_dir = -1;
+        s_nav_seeking = 0;
+    }
+
+    /* Холд-автомат соседних треков/перемотки (каждый кадр). */
+    if (s_nav_t0 != 0) {
+        int bit = (s_nav_dir < 0) ? PSP_CTRL_LEFT : PSP_CTRL_RIGHT;
+        if (input->buttons & bit) {
+            if (!s_nav_seeking && now - s_nav_t0 >= NAV_HOLD_US) {
+                s_nav_seeking = 1;
+                s_nav_last = 0;
+                logLine("now_playing: seek hold dir=%d\n", s_nav_dir);
+            }
+            if (s_nav_seeking &&
+                (s_nav_last == 0 || now - s_nav_last >= NAV_SEEK_REPEAT_US)) {
+                s_nav_last = now;
+                playback_controller_request_seek_relative(s_nav_dir * NAV_SEEK_STEP_MS);
+            }
+        } else {
+            if (!s_nav_seeking) {
+                if (s_nav_dir < 0) {
+                    playback_controller_request_previous();
+                } else {
+                    playback_controller_request_next();
+                }
+            }
+            s_nav_t0 = 0;
+            s_nav_dir = 0;
+            s_nav_seeking = 0;
+        }
     }
 }
 
@@ -1007,7 +1049,7 @@ void ui_screen_now_playing_render(const AppState *state)
                (unsigned long long)sceKernelGetSystemTimeWide() < s_hint_until) {
         const char *hint = locale_get(LOCALE_SELECT_HOLD_HINT);
         float w = text_measure_width(hint);
-        ui_draw_text(((float)480 - w) * 0.5f, 200.0f, hint, 0xFFFFFF00);
+        ui_draw_text(((float)480 - w) * 0.5f, 200.0f, hint, 0xFF00D5FF);
     } else {
         s_hint_until = 0;
     }

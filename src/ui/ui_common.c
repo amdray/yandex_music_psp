@@ -220,7 +220,7 @@ const char *ui_common_eq_preset_name(int preset)
 void ui_common_draw_eq_toast(void)
 {
     char buf[64];
-    float w, x, y = 120.0f;
+    float w, x, y = 222.0f;
     int kind = eq_toast_kind();
 
     if (kind == 2) {

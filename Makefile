@@ -18,6 +18,7 @@ OBJS = src/main.o \
        src/ui/ui_screen_device_login.o \
        src/ui/ui_screen_wave.o \
        src/ui/ui_screen_search.o \
+       src/ui/ui_screen_help.o \
        src/ui/ui_screen_eq.o \
        src/hal/hal_input.o \
        src/hal/hal_gpu.o \

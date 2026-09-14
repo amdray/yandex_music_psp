@@ -25,6 +25,7 @@ typedef enum ScreenId {
     SCREEN_EQ,
     SCREEN_WAVE,
     SCREEN_SEARCH,
+    SCREEN_HELP,
     SCREEN_COUNT
 } ScreenId;
 

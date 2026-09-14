@@ -72,6 +72,7 @@ ASSET_RESOURCES = $(wildcard assets/*)
 PACKAGED_FONT_RESOURCES = $(patsubst fonts/%,$(RELEASE_DIR)/fonts/%,$(FONT_RESOURCES))
 PACKAGED_ASSET_RESOURCES = $(patsubst assets/%,$(RELEASE_DIR)/assets/%,$(ASSET_RESOURCES))
 RELEASE_TOKEN = $(RELEASE_DIR)/config/token.txt
+PBP_ICON = branding/ICON0.PNG
 
 INCDIR = include
 
@@ -98,10 +99,10 @@ include $(PSPSDK)/lib/build.mak
 
 -include $(OBJS:.o=.d)
 
-$(RELEASE_DIR)/EBOOT.PBP: $(TARGET).elf PARAM.SFO $(RELEASE_TOKEN)
+$(RELEASE_DIR)/EBOOT.PBP: $(TARGET).elf PARAM.SFO $(PBP_ICON) $(RELEASE_TOKEN)
 	@mkdir -p $(RELEASE_DIR)
 	@psp-strip $(TARGET).elf -o $(RELEASE_DIR)/$(TARGET)_strip.elf
-	@pack-pbp $@ PARAM.SFO NULL NULL NULL NULL NULL $(RELEASE_DIR)/$(TARGET)_strip.elf NULL
+	@pack-pbp $@ PARAM.SFO $(PBP_ICON) NULL NULL NULL NULL $(RELEASE_DIR)/$(TARGET)_strip.elf NULL
 	@rm -f $(RELEASE_DIR)/$(TARGET)_strip.elf
 
 $(RELEASE_TOKEN):

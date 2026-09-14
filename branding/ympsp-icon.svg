@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="144" height="82" viewBox="0 0 144 82">
+  <rect width="144" height="82" fill="#080808"/>
+  <g aria-label="Audio waveform">
+    <rect x="36" y="31" width="12" height="20" rx="6" fill="#F5A800"/>
+    <rect x="51" y="21" width="12" height="40" rx="6" fill="#FFD21F"/>
+    <rect x="66" y="11" width="12" height="60" rx="6" fill="#FFE45C"/>
+    <rect x="81" y="21" width="12" height="40" rx="6" fill="#FFD21F"/>
+    <rect x="96" y="31" width="12" height="20" rx="6" fill="#F5A800"/>
+  </g>
+</svg>

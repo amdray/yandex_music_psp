@@ -227,8 +227,6 @@ static void log_profile_snapshot(int profile)
     log_profile_param_uint(profile, PSP_NETPARAM_MANUAL_DNS, "manual_dns");
     log_profile_param_string(profile, PSP_NETPARAM_PRIMARYDNS, "primary_dns", 0);
     log_profile_param_string(profile, PSP_NETPARAM_SECONDARYDNS, "secondary_dns", 0);
-    log_profile_param_string(profile, PSP_NETPARAM_PROXY_USER, "proxy_user", 1);
-    log_profile_param_string(profile, PSP_NETPARAM_PROXY_PASS, "proxy_pass", 1);
     log_profile_param_uint(profile, PSP_NETPARAM_USE_PROXY, "use_proxy");
     log_profile_param_string(profile, PSP_NETPARAM_PROXY_SERVER, "proxy_server", 0);
     log_profile_param_uint(profile, PSP_NETPARAM_PROXY_PORT, "proxy_port");
@@ -347,9 +345,7 @@ int net_stack_get_snapshot(NetStackSnapshot *out)
     unsigned int loss_generation;
     unsigned int got_ip_generation;
     unsigned int generation;
-    int balance[NET_LINK_STATE_COUNT];
     int state;
-    int i;
     if (!out) return -1;
     for (;;) {
         epoch_before = s_link.completion_epoch;
@@ -358,8 +354,7 @@ int net_stack_get_snapshot(NetStackSnapshot *out)
             sceKernelDelayThread(100);
             continue;
         }
-        for (i = 0; i < NET_LINK_STATE_COUNT; ++i)
-            balance[i] = s_link.balance[i];
+        state = s_link.current_state;
         disconnected_generation = s_link.disconnected_generation;
         loss_generation = s_link.loss_generation;
         got_ip_generation = s_link.got_ip_generation;
@@ -370,12 +365,7 @@ int net_stack_get_snapshot(NetStackSnapshot *out)
         inflight_after = s_link.inflight;
         if (epoch_before != epoch_after || inflight_after != 0U) continue;
 
-        state = -1;
-        for (i = 0; i < NET_LINK_STATE_COUNT; ++i) {
-            if (balance[i] == 1 && state < 0) state = i;
-            else if (balance[i] != 0) return -1;
-        }
-        if (state < 0) return -1;
+        if (!net_link_state_valid(state)) return -1;
         out->apctl_state = state;
         out->disconnected_generation = disconnected_generation;
         out->loss_generation = loss_generation;
@@ -590,7 +580,7 @@ int net_stack_init(const NetTlsNetworkConfig *config)
     s_apctl_diag_read = 0U;
     s_connect_attempt_id = 0U;
     s_connect_attempt_profile = 0;
-    s_link.balance[PSP_NET_APCTL_STATE_DISCONNECTED] = 1;
+    s_link.current_state = PSP_NET_APCTL_STATE_DISCONNECTED;
     s_last_profile = 0;
     s_runtime_stuck = 0;
     supervisor_set_phase(NET_SUPERVISOR_IDLE);

@@ -1,0 +1,9 @@
+#ifndef YM_HAL_GFX_CONFIG_H
+#define YM_HAL_GFX_CONFIG_H
+
+#define SCREEN_WIDTH 480
+#define SCREEN_HEIGHT 272
+#define VRAM_BUFFER_WIDTH 512
+#define FRAMEBUFFER_BPP 4
+
+#endif

@@ -1,0 +1,31 @@
+# Build artifacts
+*.o
+*.d
+*.elf
+*.prx
+*.PBP
+*.su
+*.log
+
+# Archives
+*.zip
+
+# Python/tool caches and local diagnostics
+__pycache__/
+*.py[cod]
+layout_dump.txt
+tools/
+
+# Local project notes (not part of the public repository)
+docs/
+AGENTS.md
+
+# Local secrets
+config/token.txt
+
+# Runtime and research data
+data/
+cache_music/
+
+# Emulator working copy — contains OAuth token, cached media, logs, binaries. Never track.
+release/

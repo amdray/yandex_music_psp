@@ -1,0 +1,55 @@
+name: Build and Release PSP Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkgconf libreadline8 libusb-0.1 libgpgme11 libarchive-tools fakeroot wget zip rsync
+
+      - name: Install PSP SDK (prebuilt)
+        run: |
+          wget https://github.com/pspdev/pspdev/releases/latest/download/pspdev-ubuntu-latest-x86_64.tar.gz
+          tar -xvf pspdev-ubuntu-latest-x86_64.tar.gz -C "$HOME"
+          export PSPDEV="$HOME/pspdev"
+          export PATH="$PATH:$PSPDEV/bin"
+          psp-config --pspdev-path
+
+      - name: Build project
+        run: |
+          export PSPDEV="$HOME/pspdev"
+          export PATH="$PATH:$PSPDEV/bin"
+          make
+
+      - name: Create structured release archive
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PKG="YandexMusicPSP-${TAG}.zip"
+          mkdir -p package/YandexMusicPSP
+          rsync -a release/ package/YandexMusicPSP/
+          (cd package && zip -r "../${PKG}" YandexMusicPSP)
+          sha256sum "${PKG}" > "${PKG}.sha256"
+
+      - name: Create GitHub release and upload archive only
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            YandexMusicPSP-*.zip
+            YandexMusicPSP-*.zip.sha256
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

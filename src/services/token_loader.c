@@ -5,11 +5,11 @@
 #include "core/fs.h"
 #include "core/logger.h"
 
+static char s_cached_token[256];
+static int s_cached_len = 0;
+
 int token_loader_read(char *out_token, int out_size)
 {
-    static char s_cached_token[256];
-    static int s_cached_len = 0;
-
     if (!out_token || out_size <= 0) {
         return -1;
     }
@@ -78,4 +78,11 @@ int token_loader_read(char *out_token, int out_size)
     memcpy(out_token, s_cached_token, (size_t)s_cached_len + 1);
     logLine("token: ok len=%d\n", len);
     return 0;
+}
+
+void token_loader_clear(void)
+{
+    s_cached_len = 0;
+    s_cached_token[0] = '\0';
+    logLine("token: cache cleared\n");
 }

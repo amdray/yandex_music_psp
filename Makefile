@@ -15,6 +15,7 @@ OBJS = src/main.o \
        src/ui/ui_screen_artist.o \
        src/ui/ui_screen_artist_menu.o \
        src/ui/ui_screen_net_info.o \
+       src/ui/ui_screen_device_login.o \
        src/hal/hal_input.o \
        src/hal/hal_gpu.o \
        src/hal/hal_fb.o \
@@ -29,6 +30,7 @@ OBJS = src/main.o \
        src/services/image_loader.o \
        src/services/locale.o \
        src/services/token_loader.o \
+       src/services/ya_auth.o \
        src/services/splash_flow.o \
        src/services/net_stack.o \
        src/services/net_activity.o \

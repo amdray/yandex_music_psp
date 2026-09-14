@@ -32,6 +32,7 @@
 #include "ui/ui_screen_artist.h"
 #include "ui/ui_screen_artist_menu.h"
 #include "ui/ui_screen_net_info.h"
+#include "ui/ui_screen_device_login.h"
 #include "ui/ui_common.h"
 
 static void *s_splash_pixels = NULL;
@@ -151,6 +152,7 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
     },
     [SCREEN_ACCOUNT] = {
         .name = "account",
+        .handle_input = ui_screen_account_handle_input,
         .render = ui_screen_account_render,
     },
     [SCREEN_ARTIST] = {
@@ -170,6 +172,14 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
     [SCREEN_NET_INFO] = {
         .name = "net_info",
         .render = net_info_render,
+    },
+    [SCREEN_DEVICE_LOGIN] = {
+        .name = "device_login",
+        .on_enter = ui_screen_device_login_on_enter,
+        .on_exit = ui_screen_device_login_on_exit,
+        .update = ui_screen_device_login_update,
+        .handle_input = ui_screen_device_login_handle_input,
+        .render = ui_screen_device_login_render,
     },
 };
 

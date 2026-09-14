@@ -1,8 +1,31 @@
 #include "ui/ui_screen_account.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_screens.h"
 #include "services/locale.h"
+#include "services/token_loader.h"
+#include "core/logger.h"
+#include "core/fs.h"
+#include <pspctrl.h>
 #include <stdio.h>
+#include <string.h>
+
+void ui_screen_account_handle_input(AppState *state, const InputState *input)
+{
+    // Без профиля X ведёт на вход по коду (ya_auth).
+    if ((input->pressed & PSP_CTRL_CROSS) && state->currentUser.uid <= 0) {
+        logLine("account: login requested\n");
+        ui_screens_navigate(state, SCREEN_DEVICE_LOGIN);
+    }
+    // С профилем квадрат — выход: чистим токен (файл + кэш) и профиль.
+    if ((input->pressed & PSP_CTRL_SQUARE) && state->currentUser.uid > 0) {
+        logLine("account: logout\n");
+        logger_flush();
+        fs_remove("config/token.txt");
+        token_loader_clear();
+        memset(&state->currentUser, 0, sizeof(state->currentUser));
+    }
+}
 
 void ui_screen_account_render(const AppState *state)
 {
@@ -36,8 +59,10 @@ void ui_screen_account_render(const AppState *state)
             } else {
                 ui_draw_text(16.0f, y, locale_get(LOCALE_ACCOUNT_SUBSCRIPTION_INACTIVE), 0xFFFF0000);
             }
+            ui_common_draw_prompts(LOCALE_ACCOUNT_LOGOUT_PROMPT, LOCALE_MENU_BACK_PROMPT);
         } else {
             ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_ACCOUNT_LOAD_ERROR), 0xFFFF4444);
+            ui_common_draw_prompts(LOCALE_ACCOUNT_LOGIN_PROMPT, LOCALE_MENU_BACK_PROMPT);
         }
     }
 }

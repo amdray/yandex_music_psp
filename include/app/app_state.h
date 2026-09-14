@@ -21,6 +21,7 @@ typedef enum ScreenId {
     SCREEN_ARTIST,
     SCREEN_ARTIST_MENU,
     SCREEN_NET_INFO,
+    SCREEN_DEVICE_LOGIN,
     SCREEN_COUNT
 } ScreenId;
 

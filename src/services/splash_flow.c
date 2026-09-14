@@ -210,10 +210,11 @@ void splash_flow_tick(SplashFlow *flow, AppState *app)
         if (token_loader_read(flow->token, sizeof(flow->token)) == 0) {
             flow->stage++;
         } else {
-            flow->status = locale_get(LOCALE_SPLASH_TOKEN_ERROR);
-            logLine("splash: status -> %s\n", flow->status);
-            flow->error_stage = 4;
-            flow->ready = 0; // This will halt the flow
+            /* Без токена не стоим: дальше сеть, пропуск auth и меню —
+             * войти можно пунктом «Профиль» (ya_auth). */
+            logLine("splash: no token -> menu, login via Profile\n");
+            flow->token[0] = '\0';
+            flow->stage++;
         }
         break;
     case 5:
@@ -266,6 +267,14 @@ void splash_flow_tick(SplashFlow *flow, AppState *app)
 #endif
         break;
     case 6:
+        if (!flow->token[0]) {
+            /* Токена нет (пришли из меню без входа): auth нечего проверять —
+             * сразу в меню, профиль пуст. Вход — пункт «Профиль». */
+            logLine("splash: empty token -> menu as guest\n");
+            flow->status = NULL;
+            flow->ready = 1;
+            break;
+        }
         if (!flow->auth_attempted) {
             logLine("splash: starting auth (stage 6)\n");
             flow->auth_attempted = 1;

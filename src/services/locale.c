@@ -106,6 +106,15 @@ static const char *s_locale_strings[LOCALE_COUNT][LOCALE_LANG_COUNT] = {
     [LOCALE_NET_INFO_GATEWAY]       = { "Gateway",        "Шлюз" },
     [LOCALE_NET_INFO_DNS1]          = { "DNS1",           "DNS1" },
     [LOCALE_NET_INFO_DNS2]          = { "DNS2",           "DNS2" },
+    [LOCALE_ACCOUNT_LOGIN_PROMPT] = { "X: phone login", "X: вход по коду" },
+    [LOCALE_ACCOUNT_LOGOUT_PROMPT] = { "[]: logout", "[]: выйти" },
+    [LOCALE_LOGIN_TITLE]        = { "Phone code login", "Вход по коду" },
+    [LOCALE_LOGIN_REQUEST]      = { "Requesting login code...", "Запрос кода..." },
+    [LOCALE_LOGIN_OPEN]         = { "On your phone open:", "На телефоне открой:" },
+    [LOCALE_LOGIN_ENTER_CODE]   = { "and enter the code:", "и введи код:" },
+    [LOCALE_LOGIN_LEFT]         = { "Left: %d sec. Waiting... (%d/%d)", "Осталось: %d сек. Жду... (%d/%d)" },
+    [LOCALE_LOGIN_OK]           = { "Login ok!", "Вход выполнен!" },
+    [LOCALE_LOGIN_RETRY_PROMPT] = { "X: retry", "X: повтор" },
 };
 
 static LocaleLang s_current_lang = LOCALE_LANG_EN;

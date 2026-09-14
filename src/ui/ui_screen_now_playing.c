@@ -678,6 +678,13 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
         playback_controller_request_stop();
     } else if (input->pressed & PSP_CTRL_TRIANGLE) {
         like_request_toggle(state);
+    } else if (input->pressed & PSP_CTRL_LTRIGGER) {
+        /* Кнопка ♪ (NOTE) на этом железе молчит — профили крутят L/R. */
+        eq_prev_preset();
+        eq_save();
+    } else if (input->pressed & PSP_CTRL_RTRIGGER) {
+        eq_next_preset();
+        eq_save();
     } else if (input->pressed & PSP_CTRL_SELECT) {
         /* Качество MP3 на следующие треки: nq (192) <-> hq (320). */
         const char *q = ym_api_download_quality();

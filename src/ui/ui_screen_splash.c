@@ -25,12 +25,14 @@ void ui_screen_splash_update(AppState *state, SplashFlow *flow)
 {
     splash_flow_tick(flow, state);
     if (flow->ready) {
-        // Было что играть — продолжаем сразу на плеере, иначе в меню.
+        // Было что играть — продолжаем сразу на плеере, но меню
+        // кладём под него (иначе с плеера некуда выйти по кругу).
         if (last_play_restore(state) == 0) {
-            logLine("splash: ready -> app_state_reset(NOW_PLAYING) begin\n");
+            logLine("splash: ready -> menu+now_playing begin\n");
             logger_flush();
-            app_state_reset(state, SCREEN_NOW_PLAYING);
-            logLine("splash: app_state_reset(NOW_PLAYING) done\n");
+            app_state_reset(state, SCREEN_MENU);
+            app_state_push(state, SCREEN_NOW_PLAYING);
+            logLine("splash: restore stack done\n");
             logger_flush();
             return;
         }

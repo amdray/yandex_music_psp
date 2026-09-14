@@ -29,5 +29,7 @@ int fs_get_cwd(char *out, size_t size);
 int fs_make_abs_path(const char *path, char *out, size_t size);
 void fs_log_open(const char *path);
 int fs_ensure_dir(const char *path);
+// Удалить самые старые файлы каталога, оставив keep самых свежих.
+void fs_evict_oldest(const char *dir, int keep);
 
 #endif

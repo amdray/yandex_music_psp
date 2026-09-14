@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pspthreadman.h>
@@ -405,4 +406,85 @@ int fs_ensure_dir(const char *path)
     }
 
     return 0;
+}
+
+#define FS_EVICT_SCAN_MAX 512
+
+typedef struct {
+    char name[64];
+    unsigned long long mtime_key;
+} FsEvictEntry;
+
+static unsigned long long fs_mtime_key(const ScePspDateTime *t)
+{
+    // Лексикографический порядок = хронологический.
+    return ((unsigned long long)(t->year & 0xFFFF) << 40) |
+           ((unsigned long long)(t->month & 0xFF) << 32) |
+           ((unsigned long long)(t->day & 0xFF) << 24) |
+           ((unsigned long long)(t->hour & 0xFF) << 16) |
+           ((unsigned long long)(t->minute & 0xFF) << 8) |
+           ((unsigned long long)(t->second & 0xFF));
+}
+
+// Удалить самые старые файлы каталога, оставив keep самых свежих.
+// Вызывать из worker-потоков (readdir+удаления — не для UI).
+void fs_evict_oldest(const char *dir, int keep)
+{
+    char abs_dir[512];
+    char full[576];
+    SceUID dfd;
+    SceIoDirent ent;
+    FsEvictEntry *list;
+    int count = 0, i, j;
+
+    if (!dir || !dir[0] || keep < 0) {
+        return;
+    }
+    if (fs_make_abs_path(dir, abs_dir, sizeof(abs_dir)) != 0) {
+        return;
+    }
+    list = (FsEvictEntry *)malloc(sizeof(FsEvictEntry) * FS_EVICT_SCAN_MAX);
+    if (!list) {
+        return;
+    }
+    memset(&ent, 0, sizeof(ent));
+    dfd = sceIoDopen(abs_dir);
+    if (dfd < 0) {
+        free(list);
+        return;
+    }
+    while (count < FS_EVICT_SCAN_MAX &&
+           sceIoDread(dfd, &ent) > 0) {
+        if (ent.d_name[0] == '\0' || strcmp(ent.d_name, ".") == 0 ||
+            strcmp(ent.d_name, "..") == 0) {
+            continue;
+        }
+        if (FIO_S_ISDIR(ent.d_stat.st_mode)) {
+            continue;
+        }
+        snprintf(list[count].name, sizeof(list[count].name),
+                 "%.63s", ent.d_name);
+        list[count].mtime_key = fs_mtime_key(&ent.d_stat.sce_st_mtime);
+        count++;
+        memset(&ent, 0, sizeof(ent));
+    }
+    sceIoDclose(dfd);
+    // Выборкой удаляем oldest, пока не останется keep.
+    while (count > keep) {
+        int oldest = 0;
+        for (i = 1; i < count; i++) {
+            if (list[i].mtime_key < list[oldest].mtime_key) {
+                oldest = i;
+            }
+        }
+        snprintf(full, sizeof(full), "%s/%s", abs_dir, list[oldest].name);
+        if (sceIoRemove(full) == 0) {
+            logLine("fs: evicted '%s'\n", list[oldest].name);
+        }
+        for (j = oldest; j + 1 < count; j++) {
+            list[j] = list[j + 1];
+        }
+        count--;
+    }
+    free(list);
 }

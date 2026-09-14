@@ -565,6 +565,9 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
                     logLine("ac: cache written slot=%d '%s' size=%d took=%u ms\n",
                             slot->slot_id, job->path, (int)write_size,
                             (unsigned)((t1 - t0) / 1000));
+                    /* Чистка: свежие 32 mp3, свежие 150 обложек. */
+                    fs_evict_oldest("cache_music", 32);
+                    fs_evict_oldest("data/cache/covers", 150);
                 } else {
                     fs_remove(job->path);
                 }

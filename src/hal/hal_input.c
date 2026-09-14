@@ -92,5 +92,6 @@ void hal_input_poll(InputState *out_state)
         if (out_state->pressed & PSP_CTRL_CIRCLE)   logLine("hal_input: CIRCLE (OK) pressed\n");
         if (out_state->pressed & PSP_CTRL_CROSS)    logLine("hal_input: CROSS (X) pressed\n");
         if (out_state->pressed & PSP_CTRL_SQUARE)   logLine("hal_input: SQUARE pressed\n");
+        if (out_state->pressed & PSP_CTRL_NOTE)     logLine("hal_input: NOTE pressed\n");
     }
 }

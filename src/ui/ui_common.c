@@ -4,6 +4,7 @@
 #include "fonts/text.h"
 #include "services/locale.h"
 #include "services/eq.h"
+#include "services/ym_api.h"
 #include "services/system_status.h"
 #include "services/net_ui_status.h"
 #include <pspkernel.h>
@@ -159,8 +160,11 @@ void ui_common_draw_top_status(void)
     else if (net.download_visible) {
         const char *download_icon = "\xE2\x86\x93"; /* U+2193 DOWNWARDS ARROW */
         float icon_width = text_measure_width(download_icon);
-        ui_draw_text(372.0f - icon_width * 0.5f, 2.0f,
-                     download_icon, 0xFFBBBBBB);
+        /* Мигает 2 Гц — видно, что идёт загрузка и надо ждать. */
+        if ((sceKernelGetSystemTimeWide() / 500000ULL) % 2ULL == 0ULL) {
+            ui_draw_text(372.0f - icon_width * 0.5f, 2.0f,
+                         download_icon, 0xFFBBBBBB);
+        }
     }
     if (activity) {
         text_render_clipped(350.0f, 2.0f, activity, 0xFFBBBBBB, 44.0f);
@@ -222,6 +226,10 @@ void ui_common_draw_eq_toast(void)
     if (kind == 2) {
         // Предусиление: «VOL +4dB».
         snprintf(buf, sizeof(buf), "VOL +%ddB", (int)eq_get_preamp_db());
+    } else if (kind == 3) {
+        // Качество: «MP3 320» / «MP3 192».
+        snprintf(buf, sizeof(buf), "MP3 %s",
+                 strcmp(ym_api_download_quality(), "hq") == 0 ? "320" : "192");
     } else if (kind == 1) {
         snprintf(buf, sizeof(buf), "EQ: %s",
                  ui_common_eq_preset_name(eq_get_preset()));

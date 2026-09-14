@@ -11,7 +11,7 @@
 #define EQ_BANDS 7
 #define EQ_GAIN_MIN_DB (-12.0f)
 #define EQ_GAIN_MAX_DB (+12.0f)
-#define EQ_PREAMP_MAX_DB (+12.0f)
+#define EQ_PREAMP_MAX_DB (+18.0f)
 #define EQ_PREAMP_STEP_DB (2.0f)
 
 typedef enum {
@@ -59,8 +59,9 @@ float eq_get_preamp_db(void);
 void eq_process(short *pcm, int frames, int channels, int rate);
 int eq_is_active(void);
 
-// Тост после смены: 0 нет, 1 пресет, 2 предусиление (2.5 c).
+// Тост после смены: 0 нет, 1 пресет, 2 предусиление, 3 качество.
 int eq_toast_kind(void);
 int eq_toast_preset(void);  // пресет при kind==1, иначе -1
+void eq_notify_quality(void);  // показать тост качества (kind 3)
 
 #endif

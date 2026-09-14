@@ -58,6 +58,10 @@ void net_client_track_store_unlock(void);
    background hydration for any not-yet-valid rows in it. Cheap to call every
    frame: repeat requests are deduplicated and rate-limited. */
 void net_client_track_window_focus(struct AppState *state, const char *token, int focus);
+/* То же, но гидратирует только span строк (быстрый первый экран гейта;
+ * полный obtained окном доберёт обычный update). */
+void net_client_track_window_focus_span(struct AppState *state, const char *token,
+                                        int focus, int span);
 
 /* 1 when rows [pos, pos+span) are hydrated (span clamped to the list end).
    Caller holds the track-store lock. */

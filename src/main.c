@@ -1,6 +1,7 @@
 #include <pspkernel.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
+#include <psppower.h>
 #include <pspmodulemgr.h>
 #include <psploadexec.h>
 #include <pspdebug.h>
@@ -97,6 +98,16 @@ static int exit_callback(int arg1, int arg2, void *common)
     return 0;
 }
 
+/* Флаг событий питания (сон/пробуждение/переключатель). Ставит колбэк,
+// разбирает главный цикл: там можно писать в лог. */
+static volatile int s_power_event = 0;
+
+static void power_callback(int unknown, int power_info)
+{
+    (void)unknown;
+    s_power_event = power_info;
+}
+
 /* Callback thread - handles system callbacks */
 static int callback_thread(SceSize args, void *argp)
 {
@@ -112,6 +123,16 @@ static int callback_thread(SceSize args, void *argp)
         return -1;
     }
     logLine("app: exit callback registered\n");
+    {
+        int pcbid = sceKernelCreateCallback("Power Callback",
+                                            (void *)power_callback, NULL);
+        if (pcbid >= 0) {
+            int slot = scePowerRegisterCallback(-1, pcbid);
+            logLine("app: power callback slot=%d\n", slot);
+        } else {
+            logLine("app: failed to create power callback: %d\n", pcbid);
+        }
+    }
     sceKernelSleepThreadCB();
     return 0;
 }
@@ -247,11 +268,26 @@ int main(int argc, char *argv[])
     logLine("app: entering main loop\n");
     logger_flush();
     u64 last_net_poll_us = 0;
+    int wd_pos = -1;
+    u64 wd_t0 = 0;
+    int wd_stage = 0;
     while (1) {
         InputState input;
         u64 now_us;
+        AudioPlayerSnapshot snap;
+        int have_snap;
 
         hal_input_poll(&input);
+
+        /* События питания (сон/пробуждение/переключатель): сразу
+         * перепроверяем сеть, а не ждём секундного тика. */
+        if (s_power_event) {
+            int ev = s_power_event;
+            s_power_event = 0;
+            logLine("app: power event 0x%08X, net recheck\n", ev);
+            logger_flush();
+            net_client_poll();
+        }
 
         /* Кнопка ♪ (NOTE): переключение профилей эквалайзера везде. */
         if (input.pressed & PSP_CTRL_NOTE) {
@@ -295,6 +331,35 @@ int main(int argc, char *argv[])
         if (last_net_poll_us == 0 || now_us - last_net_poll_us >= 1000000ULL) {
             net_client_poll();
             last_net_poll_us = now_us;
+        }
+
+        /* Watchdog: PLAYING, но позиция стоит — движок подвис (сон экрана,
+         * умерший ME/поток). L1: перепроверка сети. L2: перезапуск трека. */
+        have_snap = audio_player_get_snapshot(&snap);
+        if (have_snap && snap.state == AUDIO_PLAYER_PLAYING &&
+            snap.duration_ms > 0 &&
+            snap.position_ms < snap.duration_ms - 5000) {
+            if (snap.position_ms != wd_pos) {
+                wd_pos = snap.position_ms;
+                wd_t0 = now_us;
+                wd_stage = 0;
+            } else if (wd_stage == 0 && now_us - wd_t0 >= 8000000ULL) {
+                wd_stage = 1;
+                logLine("app: watchdog stall L1 net recheck pos=%d\n",
+                        snap.position_ms);
+                logger_flush();
+                net_client_poll();
+            } else if (wd_stage == 1 && now_us - wd_t0 >= 16000000ULL) {
+                wd_stage = 2;
+                logLine("app: watchdog stall L2 restart pos=%d\n",
+                        snap.position_ms);
+                logger_flush();
+                playback_controller_play_current();
+            }
+        } else {
+            wd_pos = have_snap ? snap.position_ms : -1;
+            wd_t0 = now_us;
+            wd_stage = 0;
         }
 
         /* Memory Stick writes can block for 50-180 ms. Never flush while the

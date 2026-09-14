@@ -8,6 +8,7 @@
 
 #include "core/fs.h"
 #include "core/logger.h"
+#include "services/ym_api.h"
 
 #define EQ_CFG_PATH "config/eq.cfg"
 #define EQ_TOAST_US 2500000ULL
@@ -158,6 +159,11 @@ static void toast(int kind)
     s_toast_until = sceKernelGetSystemTimeWide() + EQ_TOAST_US;
 }
 
+void eq_notify_quality(void)
+{
+    toast(3);
+}
+
 int eq_set_preset(int preset)
 {
     if (preset < 0) preset = 0;
@@ -293,19 +299,20 @@ void eq_process(short *pcm, int frames, int channels, int rate)
 }
 
 // --- persistence: config/eq.cfg ---
-// "preset=N", "custom=a,b,c,d,e,f,g" (int dB), "preamp=N".
+// Построчно, каждое поле независимо (старые файлы без новых строк читаются).
 void eq_save(void)
 {
-    char buf[128];
+    char buf[160];
     SceUID fd;
     int w, len;
 
     len = snprintf(buf, sizeof(buf),
-                   "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\npreamp=%d\n",
+                   "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\npreamp=%d\nquality=%s\n",
                    s_preset,
                    (int)s_custom[0], (int)s_custom[1], (int)s_custom[2],
                    (int)s_custom[3], (int)s_custom[4], (int)s_custom[5],
-                   (int)s_custom[6], (int)s_preamp_db);
+                   (int)s_custom[6], (int)s_preamp_db,
+                   ym_api_download_quality());
     if (len <= 0 || len >= (int)sizeof(buf)) {
         return;
     }
@@ -323,11 +330,12 @@ void eq_save(void)
 
 void eq_init(void)
 {
-    char buf[160];
+    char buf[192];
     SceUID fd;
-    int n, p, pre;
+    int n, p, pre, b;
     int g[EQ_BANDS];
-    int b;
+    const char *pl;
+    char q[8];
 
     for (b = 0; b < EQ_BANDS; b++) {
         s_custom[b] = 0.0f;
@@ -340,21 +348,29 @@ void eq_init(void)
         fs_close(fd);
         if (n > 0) {
             buf[n] = '\0';
-            if (sscanf(buf, "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\npreamp=%d",
-                       &p, &g[0], &g[1], &g[2], &g[3], &g[4], &g[5], &g[6],
-                       &pre) == 9) {
+            pl = strstr(buf, "preset=");
+            if (pl && sscanf(pl, "preset=%d", &p) == 1 &&
+                p >= 0 && p < EQ_PRESET_COUNT) {
+                s_preset = p;
+            }
+            pl = strstr(buf, "custom=");
+            if (pl && sscanf(pl, "custom=%d,%d,%d,%d,%d,%d,%d",
+                             &g[0], &g[1], &g[2], &g[3], &g[4], &g[5],
+                             &g[6]) == 7) {
                 for (b = 0; b < EQ_BANDS; b++) {
                     s_custom[b] = clamp_db((float)g[b]);
                 }
-                if (p >= 0 && p < EQ_PRESET_COUNT) {
-                    s_preset = p;
-                }
-                if (pre >= 0 && pre <= (int)EQ_PREAMP_MAX_DB) {
-                    s_preamp_db = (float)pre;
-                }
-                logLine("eq: loaded preset=%d preamp=%d\n", s_preset, pre);
             }
-            // Старый 5-полосный формат молча игнорируем (перезапишется).
+            pl = strstr(buf, "preamp=");
+            if (pl && sscanf(pl, "preamp=%d", &pre) == 1 &&
+                pre >= 0 && pre <= (int)EQ_PREAMP_MAX_DB) {
+                s_preamp_db = (float)pre;
+            }
+            pl = strstr(buf, "quality=");
+            if (pl && sscanf(pl, "quality=%7s", q) == 1) {
+                ym_api_download_set_quality(q);
+            }
+            logLine("eq: loaded preset=%d\n", s_preset);
         }
     }
     // Применяем без тоста (молча).

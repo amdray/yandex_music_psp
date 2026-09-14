@@ -226,14 +226,17 @@ int library_track_entry_ready(AppState *s, int *out_pos, int *out_count)
         return 0;
     }
 
-    /* Держим гидрацию текущей к входному окну, пока ждём. */
+    /* Держим гидрацию текущей к входному окну, пока ждём.
+     * Горячий путь: только видимые строки (5, а не 48) — первый экран
+     * в разы раньше; полное окно доберёт обычный update после входа. */
     if (s_gate_token_generation != generation) {
         s_gate_token[0] = '\0';
         if (token_loader_read(s_gate_token, sizeof(s_gate_token)) == 0) {
             s_gate_token_generation = generation;
         }
     }
-    net_client_track_window_focus(s, s_gate_token, enter_pos);
+    net_client_track_window_focus_span(s, s_gate_token, enter_pos,
+                                       TRACK_LIST_VISIBLE_ROWS);
 
     if (!window_ready) {
         return 0;

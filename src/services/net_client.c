@@ -318,6 +318,23 @@ static YmApiStreamDecision track_boot_on_track_id(const char *track_id, void *us
              "%s", track_id);
     ++parser->staged_count;
 
+    /* Частичная публикация каждые 64 id: экран входит по первым строкам
+     * (гейт ждёт окно, не весь список), хвост докачивается в фоне.
+     * Без этого список на 2500 треков висит до конца всего стрима. */
+    if ((parser->staged_count % LIST_INDEX_LOAD_BLOCK) == 0) {
+        net_client_track_store_lock();
+        if (!track_boot_is_stale(parser->state, parser->generation,
+                                 parser->playlist_kind) &&
+            track_boot_ensure_id_capacity(parser->state,
+                                          parser->staged_count) == 0) {
+            memcpy(parser->state->track_store.ids, parser->staged_ids,
+                   (size_t)parser->staged_count * sizeof(ListIndexId));
+            parser->state->track_store.count = parser->staged_count;
+            parser->state->track_boot.loaded_count = parser->staged_count;
+        }
+        net_client_track_store_unlock();
+    }
+
     if (parser->index_active &&
         list_index_writer_append(&parser->index_writer, track_id) != 0) {
         logLine("track_boot: index write-through failed, disabling\n");
@@ -344,8 +361,16 @@ static void track_hydrator_sink_cb(const TrackEntry *entry, int position, int ge
 
 void net_client_track_window_focus(struct AppState *state, const char *token, int focus)
 {
+    net_client_track_window_focus_span(state, token, focus,
+                                       TRACK_WINDOW_CAPACITY);
+}
+
+void net_client_track_window_focus_span(struct AppState *state, const char *token,
+                                        int focus, int want_span)
+{
     static int s_req_start = -1;
     static int s_req_gen = -1;
+    static int s_req_span = -1;
     static u64 s_req_us = 0;
     ListIndexId slice[TRACK_WINDOW_CAPACITY];
     int count;
@@ -359,6 +384,8 @@ void net_client_track_window_focus(struct AppState *state, const char *token, in
         return;
     }
 
+    span = want_span;
+
     net_client_track_store_lock();
     count = state->track_store.count;
     if (count <= 0) {
@@ -371,10 +398,16 @@ void net_client_track_window_focus(struct AppState *state, const char *token, in
     if (focus >= count) {
         focus = count - 1;
     }
+    if (span <= 0) {
+        span = TRACK_LIST_VISIBLE_ROWS;
+    }
+    if (span > TRACK_WINDOW_CAPACITY) {
+        span = TRACK_WINDOW_CAPACITY;
+    }
 
-    start = focus - TRACK_WINDOW_CAPACITY / 2;
-    if (start > count - TRACK_WINDOW_CAPACITY) {
-        start = count - TRACK_WINDOW_CAPACITY;
+    start = focus - span / 2;
+    if (start > count - span) {
+        start = count - span;
     }
     if (start < 0) {
         start = 0;
@@ -401,9 +434,12 @@ void net_client_track_window_focus(struct AppState *state, const char *token, in
         ts->window_start = start;
     }
 
-    span = TRACK_WINDOW_CAPACITY;
     if (start + span > count) {
         span = count - start;
+    }
+    if (span <= 0) {
+        net_client_track_store_unlock();
+        return;
     }
     for (i = 0; i < span; i++) {
         if (!state->track_store.window_valid[i]) {
@@ -426,12 +462,13 @@ void net_client_track_window_focus(struct AppState *state, const char *token, in
        hydration can never wedge the gate or leave permanent "..." rows. */
     {
         u64 now = sceKernelGetSystemTimeWide();
-        if (start == s_req_start && gen == s_req_gen &&
+        if (start == s_req_start && gen == s_req_gen && span == s_req_span &&
             (now - s_req_us) < 2000000ULL) {
             return;
         }
         s_req_start = start;
         s_req_gen = gen;
+        s_req_span = span;
         s_req_us = now;
     }
     track_hydrator_request_window(token, slice, start, span, gen);

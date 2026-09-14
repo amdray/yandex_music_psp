@@ -18,6 +18,10 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
                                      const char *track_id,
                                      YmDownloadVariant *out);
 
+/* Качество MP3 для следующих треков: "nq" (192) / "hq" (320). */
+void ym_api_download_set_quality(const char *q);
+const char *ym_api_download_quality(void);
+
 /* out_status (optional) receives the load-failure cause: 0 on success,
    an HTTP status on non-200, or a NET_LOAD_ERR_* code otherwise. */
 int ym_api_playlists_list(YmApiContext *ctx,

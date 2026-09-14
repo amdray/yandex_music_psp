@@ -7,6 +7,7 @@
 #include "services/eq.h"
 #include "services/token_loader.h"
 #include "services/wave.h"
+#include "services/ym_api.h"
 #include "services/ym_api_like.h"
 #include "services/audio_cache.h"
 #include "services/audio_player.h"
@@ -272,7 +273,7 @@ static void format_audio_info(const AudioPlayerSnapshot *snapshot, char *out, si
     sample_rate_str[0] = '\0';
 
     if (snapshot->bitrate_kbps > 0) {
-        snprintf(bitrate_str, sizeof(bitrate_str), "%d kbps", snapshot->bitrate_kbps);
+        snprintf(bitrate_str, sizeof(bitrate_str), "MP3 %d kbps", snapshot->bitrate_kbps);
     }
 
     if (snapshot->sample_rate > 0) {
@@ -407,7 +408,31 @@ static void draw_volume_bar(float x, float y, float width, float height)
 static char s_last_requested_track_id[128] = {0};
 static int s_last_selected_index = -1;
 static char s_last_loaded_track_id[128] = {0};
+static char s_last_cover_uri[96] = {0};
 static int s_video_cover_requested = 0;
+
+/* Сердце лайка: всегда видно, красное = в лайках, серое = нет.
+ * Геометрия 5x5, масштаб 2 (10x10 px). */
+static void draw_like_heart(float x, float y, int liked)
+{
+    static const char rows[5][6] = {
+        "XX XX",
+        "XXXXX",
+        "XXXXX",
+        " XXX ",
+        "  X  ",
+    };
+    u32 color = liked ? 0xFF0000FF : 0xFF444444;
+    int r, c;
+    for (r = 0; r < 5; r++) {
+        for (c = 0; c < 5; c++) {
+            if (rows[r][c] == 'X') {
+                ui_draw_rect(x + (float)(c * 2), y + (float)(r * 2),
+                             2.0f, 2.0f, color);
+            }
+        }
+    }
+}
 
 /* --- Лайк треугольником (фон, без фриза UI) -------------------------------
  * Метка "*" — локальный паритет на трек (предзагрузки всего сета лайков
@@ -564,7 +589,10 @@ void ui_screen_now_playing_update(AppState *state)
      * Automatic advance (prefetch swap) updates g_playback.current_track but
      * not state->now_playing_track, which is only set on manual track selection. */
     if (g_playback.current_track.id[0] != '\0' &&
-        strcmp(state->now_playing_track.id, g_playback.current_track.id) != 0) {
+        (strcmp(state->now_playing_track.id, g_playback.current_track.id) != 0 ||
+         /* Восстановление: id уже стоит, а метаданные докатились позже. */
+         (state->now_playing_track.title[0] == '\0' &&
+          g_playback.current_track.title[0] != '\0'))) {
         memcpy(&state->now_playing_track, &g_playback.current_track, sizeof(TrackEntry));
     }
 
@@ -579,6 +607,7 @@ void ui_screen_now_playing_update(AppState *state)
             strncpy(s_last_loaded_track_id, track->id,
                     sizeof(s_last_loaded_track_id) - 1);
             s_last_loaded_track_id[sizeof(s_last_loaded_track_id) - 1] = '\0';
+            s_last_cover_uri[0] = '\0';
 
             /* A track change invalidates every previous video-cover attempt.
              * Queue the ordinary cover first; its worker stays asleep while
@@ -587,9 +616,19 @@ void ui_screen_now_playing_update(AppState *state)
             s_video_cover_requested = 0;
             if (track->cover_uri[0] && track->album_id != 0) {
                 cover_now_playing_request_load(track->album_id, track->cover_uri);
+                snprintf(s_last_cover_uri, sizeof(s_last_cover_uri),
+                         "%s", track->cover_uri);
             } else {
                 cover_now_playing_clear();
             }
+        } else if (track->cover_uri[0] && track->album_id != 0 &&
+                   strcmp(s_last_cover_uri, track->cover_uri) != 0) {
+            /* Тот же трек, но обложка появилась позже (восстановление
+             * после перезапуска): запросить сейчас, иначе пусто навсегда. */
+            cover_now_playing_request_load(track->album_id, track->cover_uri);
+            snprintf(s_last_cover_uri, sizeof(s_last_cover_uri),
+                     "%s", track->cover_uri);
+            logLine("np: late cover request track_id='%s'\n", track->id);
         }
 
         /* Wake the ordinary-cover worker only when the audio state permits it. */
@@ -608,6 +647,7 @@ void ui_screen_now_playing_update(AppState *state)
         }
     } else if (s_last_loaded_track_id[0]) {
         s_last_loaded_track_id[0] = '\0';
+        s_last_cover_uri[0] = '\0';
         s_video_cover_requested = 0;
         cover_now_playing_clear();
         video_cover_clear();
@@ -622,6 +662,13 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
         playback_controller_request_stop();
     } else if (input->pressed & PSP_CTRL_TRIANGLE) {
         like_request_toggle(state);
+    } else if (input->pressed & PSP_CTRL_SELECT) {
+        /* Качество MP3 на следующие треки: nq (192) <-> hq (320). */
+        const char *q = ym_api_download_quality();
+        ym_api_download_set_quality(strcmp(q, "hq") == 0 ? "nq" : "hq");
+        eq_save();
+        eq_notify_quality();
+        logLine("now_playing: quality -> %s\n", ym_api_download_quality());
     } else if (input->pressed & PSP_CTRL_START) {
         playback_controller_request_toggle_pause();
     } else if (input->pressed & PSP_CTRL_RIGHT) {
@@ -715,9 +762,13 @@ void ui_screen_now_playing_render(const AppState *state)
     // Draw track info справа от обложки
     float text_y = text_y_start;
     
-    // 1. Название трека ("*" — наш локальный паритет лайка)
+    // 1. Название трека ("*" + сердце — наш локальный паритет лайка)
     if (track->title[0]) {
-        if (like_is_on(track->id)) {
+        int liked = like_is_on(track->id);
+        float mx = text_x + 14.0f;
+        float mw = text_width - 14.0f;
+        draw_like_heart(text_x, text_y, liked);
+        if (liked) {
             snprintf(title_line, sizeof(title_line), "* %s%s",
                      track->title,
                      track->explicit_content ? " [E]" : "");
@@ -727,7 +778,7 @@ void ui_screen_now_playing_render(const AppState *state)
                      track->explicit_content ? " [E]" : "");
         }
         title_line[sizeof(title_line) - 1] = '\0';
-        draw_marquee_parts(text_x, text_y, text_width,
+        draw_marquee_parts(mx, text_y, mw,
                             title_line, text_color,
                             track->version, 0xFF888888,
                             marquee_now_us);
@@ -765,8 +816,15 @@ void ui_screen_now_playing_render(const AppState *state)
 
         {
             char eqline[48];
-            snprintf(eqline, sizeof(eqline), "EQ: %s",
-                     ui_common_eq_preset_name(eq_get_preset()));
+            float pre = eq_get_preamp_db();
+            if (pre > 0.0f) {
+                snprintf(eqline, sizeof(eqline), "EQ: %s +%ddB",
+                         ui_common_eq_preset_name(eq_get_preset()),
+                         (int)(pre + 0.5f));
+            } else {
+                snprintf(eqline, sizeof(eqline), "EQ: %s",
+                         ui_common_eq_preset_name(eq_get_preset()));
+            }
             ui_draw_text(text_x, text_y, eqline, text_color_secondary);
             text_y += text_line_height;
         }

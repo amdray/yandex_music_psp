@@ -38,18 +38,18 @@ jobs:
       - name: Create structured release archive
         run: |
           TAG="${GITHUB_REF_NAME}"
-          PKG="YandexMusicPSP-${TAG}.zip"
-          mkdir -p package/YandexMusicPSP
-          rsync -a release/ package/YandexMusicPSP/
-          (cd package && zip -r "../${PKG}" YandexMusicPSP)
+          PKG="YMPSP-${TAG}.zip"
+          mkdir -p package/YMPSP
+          rsync -a release/ package/YMPSP/
+          (cd package && zip -r "../${PKG}" YMPSP)
           sha256sum "${PKG}" > "${PKG}.sha256"
 
       - name: Create GitHub release and upload archive only
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            YandexMusicPSP-*.zip
-            YandexMusicPSP-*.zip.sha256
+            YMPSP-*.zip
+            YMPSP-*.zip.sha256
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

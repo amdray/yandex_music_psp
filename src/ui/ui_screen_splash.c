@@ -60,7 +60,7 @@ void ui_screen_splash_render(const SplashFlow *flow, void *splash_pixels, int sp
                            0, 0, stride, dst);
     } else {
         ui_draw_clear(0xFF1A1A1A);
-        ui_common_draw_header("Yandex Music PSP");
+        ui_common_draw_header("YMPSP");
     }
     if (flow->status) {
         ui_draw_text(16.0f, 230.0f, flow->status, 0xFFFFFFFF);

@@ -1,4 +1,4 @@
-TARGET = yandex_music_psp
+TARGET = ympsp
 BUILD_PRX = 0
 OBJS = src/main.o \
        src/app/app_state.o \
@@ -77,7 +77,7 @@ INCDIR = include
 
 CFLAGS = -O2 -G0 -Wall -Wextra -Wshadow -std=c99 -MMD -MP -DEXIT_STAGE=$(EXIT_STAGE)
 EXTRA_TARGETS = $(RELEASE_DIR)/EBOOT.PBP $(PACKAGED_FONT_RESOURCES) $(PACKAGED_ASSET_RESOURCES)
-PSP_EBOOT_TITLE = Yandex Music PSP
+PSP_EBOOT_TITLE = YMPSP
 
 # pspdebug/pspdisplay/pspge/pspctrl/pspnet/pspnet_apctl НЕ указывать здесь:
 # build.mak добавляет их последними сам; дубль раньше по строке рвёт группы

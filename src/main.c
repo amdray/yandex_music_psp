@@ -129,7 +129,7 @@ static int setup_callbacks(void)
     return thid;
 }
 
-PSP_MODULE_INFO("YandexMusicPSP", 0, 1, 1);
+PSP_MODULE_INFO("YMPSP", 0, 1, 1);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
 PSP_MAIN_THREAD_STACK_SIZE_KB(2048);  // 2MB stack - increased from 512KB for large JSON parsing (875 tracks)
 PSP_HEAP_SIZE_KB(16384);  // 16MB heap - increased from 8MB for cJSON (149k allocations, ~4MB peak)

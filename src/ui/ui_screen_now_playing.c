@@ -1,6 +1,7 @@
 #include "ui/ui_screen_now_playing.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_screens.h"
 #include "hal/hal_fb.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
@@ -506,6 +507,54 @@ static int like_is_on(const char *track_id)
            strcmp(s_like_marked, track_id) == 0;
 }
 
+/* Дропдаун на удержание SELECT: качество, эквалайзер, усиление.
+ * Короткое нажатие — только подсказка. */
+#define DD_HOLD_US 700000ULL
+#define DD_ROWS 3
+static int s_dd_open = 0;
+static int s_dd_sel = 0;
+static unsigned long long s_sel_t0 = 0;
+static int s_sel_fired = 0;
+static unsigned long long s_hint_until = 0;
+
+static void dd_adjust(int dir)
+{
+    if (s_dd_sel == 0) {
+        const char *q = ym_api_download_quality();
+        ym_api_download_set_quality(strcmp(q, "hq") == 0 ? "nq" : "hq");
+        eq_save();
+        eq_notify_quality();
+        logLine("now_playing: dd quality -> %s\n", ym_api_download_quality());
+    } else if (s_dd_sel == 1) {
+        if (dir > 0) {
+            eq_next_preset();
+        } else {
+            eq_prev_preset();
+        }
+        eq_save();
+    } else {
+        eq_set_preamp_db(eq_get_preamp_db() + (float)dir * EQ_PREAMP_STEP_DB);
+        eq_save();
+    }
+}
+
+static void dd_row_text(int row, char *out, int out_size)
+{
+    if (row == 0) {
+        snprintf(out, out_size, "%s: %s",
+                 locale_get(LOCALE_DD_QUALITY),
+                 strcmp(ym_api_download_quality(), "hq") == 0 ? "320" : "192");
+    } else if (row == 1) {
+        snprintf(out, out_size, "%s: %s",
+                 locale_get(LOCALE_EQ_TITLE),
+                 ui_common_eq_preset_name(eq_get_preset()));
+    } else {
+        snprintf(out, out_size, "%s: +%ddB",
+                 locale_get(LOCALE_DD_GAIN),
+                 (int)(eq_get_preamp_db() + 0.5f));
+    }
+}
+
 static void like_request_toggle(AppState *state)
 {
     const char *id = state->now_playing_track.id;
@@ -672,8 +721,57 @@ void ui_screen_now_playing_update(AppState *state)
 
 void ui_screen_now_playing_handle_input(AppState *state, const InputState *input)
 {
-    (void)state;
+    unsigned long long now = sceKernelGetSystemTimeWide();
 
+    /* SELECT: удержание открывает дропдаун, короткое — подсказка. */
+    if (input->pressed & PSP_CTRL_SELECT) {
+        s_sel_t0 = now;
+        s_sel_fired = 0;
+    }
+    if (s_sel_t0 != 0) {
+        if (input->buttons & PSP_CTRL_SELECT) {
+            if (!s_sel_fired && !s_dd_open &&
+                now - s_sel_t0 >= DD_HOLD_US) {
+                s_dd_open = 1;
+                s_dd_sel = 0;
+                s_sel_fired = 1;
+                s_hint_until = 0;
+                logLine("now_playing: dropdown open\n");
+            }
+        } else {
+            if (!s_sel_fired && !s_dd_open) {
+                s_hint_until = now + 2000000ULL;
+            }
+            s_sel_t0 = 0;
+            s_sel_fired = 0;
+        }
+    }
+
+    if (s_dd_open) {
+        if (input->pressed & PSP_CTRL_UP) {
+            s_dd_sel = (s_dd_sel + DD_ROWS - 1) % DD_ROWS;
+        }
+        if (input->pressed & PSP_CTRL_DOWN) {
+            s_dd_sel = (s_dd_sel + 1) % DD_ROWS;
+        }
+        if (input->pressed & PSP_CTRL_LEFT) {
+            dd_adjust(-1);
+        }
+        if ((input->pressed & PSP_CTRL_RIGHT) ||
+            (input->pressed & PSP_CTRL_CROSS)) {
+            dd_adjust(+1);
+        }
+        if (input->pressed & PSP_CTRL_CIRCLE) {
+            s_dd_open = 0;
+            logLine("now_playing: dropdown close\n");
+        }
+        return;  // остальное молчит, пока открыто меню
+    }
+
+    if (input->pressed & PSP_CTRL_CIRCLE) {
+        ui_screens_pop_screen(state);
+        return;
+    }
     if (input->pressed & PSP_CTRL_SQUARE) {
         playback_controller_request_stop();
     } else if (input->pressed & PSP_CTRL_TRIANGLE) {
@@ -685,13 +783,6 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
     } else if (input->pressed & PSP_CTRL_RTRIGGER) {
         eq_next_preset();
         eq_save();
-    } else if (input->pressed & PSP_CTRL_SELECT) {
-        /* Качество MP3 на следующие треки: nq (192) <-> hq (320). */
-        const char *q = ym_api_download_quality();
-        ym_api_download_set_quality(strcmp(q, "hq") == 0 ? "nq" : "hq");
-        eq_save();
-        eq_notify_quality();
-        logLine("now_playing: quality -> %s\n", ym_api_download_quality());
     } else if (input->pressed & PSP_CTRL_START) {
         playback_controller_request_toggle_pause();
     } else if (input->pressed & PSP_CTRL_RIGHT) {
@@ -895,4 +986,29 @@ void ui_screen_now_playing_render(const AppState *state)
                            LOCALE_NOW_PLAYING_STOP_PROMPT,
                            LOCALE_NOW_PLAYING_LIKE_PROMPT,
                            LOCALE_TRACK_BACK_PROMPT);
+
+    /* Подсказка короткого SELECT и дропдаун удержания поверх всего. */
+    if (s_dd_open) {
+        char row[96];
+        float bx = 90.0f, bw = 300.0f, by = 84.0f;
+        int i;
+        ui_draw_rect(0.0f, 0.0f, 480.0f, 272.0f, 0xAA000000);
+        ui_draw_rect(bx, by, bw, 3.0f * 22.0f + 12.0f, 0xFF1A1A1A);
+        for (i = 0; i < DD_ROWS; i++) {
+            float ry = by + 6.0f + (float)i * 22.0f;
+            if (i == s_dd_sel) {
+                ui_draw_rect(bx + 6.0f, ry - 2.0f, 6.0f, 14.0f, 0xFF00D5FF);
+            }
+            dd_row_text(i, row, sizeof(row));
+            ui_draw_text(bx + 18.0f, ry, row,
+                         i == s_dd_sel ? 0xFFFFFFFF : 0xFFBBBBBB);
+        }
+    } else if (s_hint_until != 0 &&
+               (unsigned long long)sceKernelGetSystemTimeWide() < s_hint_until) {
+        const char *hint = locale_get(LOCALE_SELECT_HOLD_HINT);
+        float w = text_measure_width(hint);
+        ui_draw_text(((float)480 - w) * 0.5f, 200.0f, hint, 0xFFFFFF00);
+    } else {
+        s_hint_until = 0;
+    }
 }

@@ -69,6 +69,9 @@ static const char *s_locale_strings[LOCALE_COUNT][LOCALE_LANG_COUNT] = {
     [LOCALE_NOW_PLAYING_TOGGLE_PROMPT] = { "START: play/pause", "START: играть/пауза" },
     [LOCALE_NOW_PLAYING_STOP_PROMPT] = { "[]: stop", "[]: стоп" },
     [LOCALE_NOW_PLAYING_LIKE_PROMPT] = { "/\\: like", "/\\: лайк" },
+    [LOCALE_SELECT_HOLD_HINT] = { "Hold SELECT: menu", "Удерживайте SELECT: меню" },
+    [LOCALE_DD_QUALITY] = { "Quality", "Качество" },
+    [LOCALE_DD_GAIN] = { "Boost", "Усиление" },
     
     // Albums
     [LOCALE_ALBUM_OPEN_PROMPT] = { "X: open album", "X: открыть альбом" },

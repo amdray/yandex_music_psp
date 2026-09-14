@@ -132,6 +132,7 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .update = ui_screen_now_playing_update,
         .handle_input = ui_screen_now_playing_handle_input,
         .render = ui_screen_now_playing_render,
+        .owns_back = 1,  // круг перехватывает дропдаун SELECT
     },
     [SCREEN_ALBUM_LIST] = {
         .name = "album_list",
@@ -303,6 +304,14 @@ static void apply_resource_mode(const AppState *state)
 
     int browsing_active = (app_state_get_resource_mode(state) == APP_MODE_BROWSING);
     cover_manager_set_browsing_active(browsing_active);
+}
+
+/* Ручной выход экрана (owns_back): то же, что generic-pop. */
+void ui_screens_pop_screen(AppState *state)
+{
+    logLine("ui: manual pop\n");
+    app_state_pop(state);
+    apply_resource_mode(state);
 }
 
 void ui_screens_update(AppState *state, const InputState *input)

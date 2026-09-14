@@ -17,5 +17,7 @@ int ui_screens_shutdown(void);
    source screen cancels the pending navigation. */
 void ui_screens_navigate(AppState *state, ScreenId target);
 ScreenId ui_screens_nav_pending(void);
+/* Ручной выход экрана с owns_back=1 (эквивалент generic Circle-pop). */
+void ui_screens_pop_screen(AppState *state);
 
 #endif

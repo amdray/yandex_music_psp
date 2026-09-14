@@ -17,7 +17,6 @@
 #include "ui/ui_common.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_screens.h"
-#include "ui/ui_screens.h"
 
 #define ARTIST_MENU_VISIBLE 6
 

@@ -6,6 +6,7 @@
 #include "services/cover_manager.h"
 #include "services/library.h"
 #include "services/ym_api.h"       // NET_LOAD_ERR_* cause codes
+#include "fonts/text.h"
 #include "core/logger.h"
 #include "app/app_state.h"
 #include <pspctrl.h>
@@ -244,6 +245,7 @@ void ui_screen_playlist_list_render(const AppState *state)
         const float text_x = thumb_x + thumb_size + gap_after_cover;
         /* 58 + 5 rows x 40 = 258 — список заканчивается ровно у панели подсказок */
         const float start_y = 58.0f;
+        const float text_max_w = 480.0f - text_x - 8.0f;
         const int max_visible = PLAYLIST_VISIBLE_SLOTS;
 
         int start_idx = active_scroll;
@@ -269,7 +271,7 @@ void ui_screen_playlist_list_render(const AppState *state)
             }
 
             // Draw title
-            ui_draw_text(text_x, y, pl->title, i == active_selected ? 0xFFFFFFFF : 0xFFBBBBBB);
+            text_render_clipped(text_x, y, pl->title, i == active_selected ? 0xFFFFFFFF : 0xFFBBBBBB, text_max_w);
 
             // Draw info (track count, etc.)
             char info[128];

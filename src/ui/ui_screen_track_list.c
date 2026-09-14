@@ -289,6 +289,7 @@ void ui_screen_track_list_render(const AppState *state)
         const float gap_after_cover = 5.0f;  // Gap after cover
         const float text_x = thumb_x + thumb_size + gap_after_cover;  // Text starts 5px after cover
         const float start_y = 48.0f;
+        const float text_max_w = 480.0f - text_x - 8.0f;
         
         for (int row = 0; row < visible_tracks_count; row++) {
             int i = start_idx + row;
@@ -323,10 +324,14 @@ void ui_screen_track_list_render(const AppState *state)
                 line1[sizeof(line1) - 1] = '\0';
             }
             // logLine("ui: render track %d: artist='%s' title='%s' line1='%s'\n", i, track->artist, track->title, line1);
-            ui_draw_text(text_x, y, line1, line1_color);
+            text_render_clipped(text_x, y, line1, line1_color, text_max_w);
             if (track->version[0]) {
-                ui_draw_text(text_x + text_measure_width(line1) + text_measure_width(" "),
-                             y, track->version, version_color);
+                float line1_w = text_measure_width(line1);
+                float ver_x = text_x + line1_w + text_measure_width(" ");
+                float ver_w = text_max_w - (line1_w + text_measure_width(" "));
+                if (ver_w > 0.0f) {
+                    text_render_clipped(ver_x, y, track->version, version_color, ver_w);
+                }
             }
             
             // Second line: year %space% duration %space% genre %space% [E] explicit

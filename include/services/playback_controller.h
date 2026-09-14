@@ -38,6 +38,11 @@ void          playback_controller_request_next(void);
 void          playback_controller_request_previous(void);
 void          playback_controller_request_toggle_pause(void);
 void          playback_controller_request_stop(void);
+/* SEEK: queue a relative seek (ms, signed) for UI hold handling. Deferred
+ * like other intents: service() forwards position_ms + delta to
+ * audio_player_seek_to_ms once per frame; dropped when the engine is
+ * busy/idle (hold repeats re-issue). */
+void          playback_controller_request_seek_relative(int delta_ms);
 void          playback_controller_service(void);
 
 /* Start playback for the current queue item.

@@ -305,13 +305,20 @@ void ui_screen_artist_menu_render(const AppState *state)
 
                 {
                     float title_x = col_x + sel_w + 3.0f;
+                    float title_max_w = (col_x + col_w) - title_x;
                     u32 title_color = i == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB;
                     u32 version_color = i == s_selected ? 0xFFBBBBBB : 0xFF777777;
-                    ui_draw_text(title_x, y, alb->title, title_color);
+                    text_render_clipped(title_x, y, alb->title, title_color, title_max_w);
                     if (alb->version[0]) {
-                        ui_draw_text(title_x + text_measure_width(alb->title) +
-                                     text_measure_width(" "),
-                                     y, alb->version, version_color);
+                        float title_w = text_measure_width(alb->title);
+                        float version_x = title_x + title_w +
+                                     text_measure_width(" ");
+                        float version_w = title_max_w - (title_w +
+                                     text_measure_width(" "));
+                        if (version_w > 0.0f) {
+                            text_render_clipped(version_x, y, alb->version,
+                                                version_color, version_w);
+                        }
                     }
                 }
 

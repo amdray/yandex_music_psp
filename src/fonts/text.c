@@ -110,6 +110,63 @@ void text_render_clipped(float x, float y, const char *text,
     text_draw((int)x, (int)y, buf, color_abgr);
 }
 
+void text_render_window(float x, float y, const char *text,
+                        u32 color_abgr, float skip_px, float max_width)
+{
+    const CbmfFont *f;
+    const unsigned char *p;
+    char buf[512];
+    size_t out = 0;
+    float used = 0.f;
+    float skipped = 0.f;
+
+    if (!text || !hal_gpu_in_frame()) {
+        return;
+    }
+    if (max_width <= 0.f) {
+        return;
+    }
+    if (skip_px <= 0.f) {
+        text_render_clipped(x, y, text, color_abgr, max_width);
+        return;
+    }
+
+    f = cbmf_fonts_get_font();
+    if (!f) {
+        return;
+    }
+
+    p = (const unsigned char *)text;
+
+    while (*p) {
+        uint32_t cp;
+        int n = utf8_step(p, &cp);
+        CbmfGlyphView gv;
+        float adv = (cbmf_get_glyph(f, cp, &gv) == CBMF_OK) ? (float)gv.advance_x : 0.f;
+        if (skipped + adv > skip_px) {
+            break;
+        }
+        skipped += adv;
+        p += n;
+    }
+
+    while (*p && out + 4u < sizeof(buf)) {
+        uint32_t cp;
+        int n = utf8_step(p, &cp);
+        CbmfGlyphView gv;
+        float adv = (cbmf_get_glyph(f, cp, &gv) == CBMF_OK) ? (float)gv.advance_x : 0.f;
+        if (used + adv > max_width) {
+            break;
+        }
+        memcpy(buf + out, p, (size_t)n);
+        out += (size_t)n;
+        used += adv;
+        p += n;
+    }
+    buf[out] = '\0';
+    text_draw((int)x, (int)y, buf, color_abgr);
+}
+
 float text_measure_width(const char *text)
 {
     if (!text) {

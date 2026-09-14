@@ -136,6 +136,10 @@ typedef enum {
     LOCALE_WAVE_LOADING,
     LOCALE_WAVE_ERROR,
 
+    // Search
+    LOCALE_MENU_SEARCH,
+    LOCALE_SCREEN_SEARCH,
+
     // Count
     LOCALE_COUNT
 } LocaleKey;

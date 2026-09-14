@@ -12,6 +12,7 @@
 #include "core/logger.h"
 #include "services/api_parser.h"
 #include "services/net_http.h"
+#include "services/ym_api_track_parse.h"
 
 /* Load-failure cause reported via *out_status (see ym_api.h): HTTP status when
    the server answered non-200; NET_LOAD_ERR_TRANSPORT when no HTTP response;
@@ -263,135 +264,8 @@ int ym_api_playlist_tracks_build_url(int uid,
     return 0;
 }
 
-static int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
-{
-    if (!track_obj || !entry) {
-        return -1;
-    }
-
-    /* API marks region/rights-blocked tracks with "error":"no-rights" and omits
-     * duration/albums for them; we skip such tracks, so the final parsed count
-     * can legitimately be lower than the count reported by the API response. */
-    cJSON *error_node = cJSON_GetObjectItem(track_obj, "error");
-    if (error_node && cJSON_IsString(error_node) && error_node->valuestring) {
-        if (strcmp(error_node->valuestring, "no-rights") == 0) {
-            return 1;
-        }
-    }
-
-    memset(entry, 0, sizeof(TrackEntry));
-
-    cJSON *title_node = cJSON_GetObjectItem(track_obj, "title");
-    if (title_node && cJSON_IsString(title_node) && title_node->valuestring) {
-        strncpy(entry->title, title_node->valuestring, sizeof(entry->title) - 1);
-        entry->title[sizeof(entry->title) - 1] = '\0';
-    }
-
-    cJSON *artists_node = cJSON_GetObjectItem(track_obj, "artists");
-    if (artists_node && cJSON_IsArray(artists_node) && cJSON_GetArraySize(artists_node) > 0) {
-        int artist_count = cJSON_GetArraySize(artists_node);
-        int artist_index;
-        size_t used = 0;
-
-        for (artist_index = 0; artist_index < artist_count; ++artist_index) {
-            cJSON *artist = cJSON_GetArrayItem(artists_node, artist_index);
-            cJSON *name_node = artist ? cJSON_GetObjectItem(artist, "name") : NULL;
-            if (name_node && cJSON_IsString(name_node) && name_node->valuestring) {
-                const char *separator = used > 0 ? ", " : "";
-                size_t remaining = sizeof(entry->artist) - used;
-                int written = snprintf(entry->artist + used, remaining, "%s%s",
-                                       separator, name_node->valuestring);
-                if (written < 0) {
-                    break;
-                }
-                if ((size_t)written >= remaining) {
-                    entry->artist[sizeof(entry->artist) - 1] = '\0';
-                    logLine("ym_api_playlists: artist list truncated\n");
-                    break;
-                }
-                used += (size_t)written;
-            }
-        }
-    }
-
-    cJSON *duration_node = cJSON_GetObjectItem(track_obj, "durationMs");
-    if (duration_node && cJSON_IsNumber(duration_node)) {
-        entry->duration_ms = (int)duration_node->valuedouble;
-    }
-
-    cJSON *id_node = cJSON_GetObjectItem(track_obj, "id");
-    if (id_node && cJSON_IsString(id_node) && id_node->valuestring) {
-        strncat(entry->id, id_node->valuestring, sizeof(entry->id) - 1);
-    }
-
-    cJSON *albums_node = cJSON_GetObjectItem(track_obj, "albums");
-    if (albums_node && cJSON_IsArray(albums_node) && cJSON_GetArraySize(albums_node) > 0) {
-        cJSON *first_album = cJSON_GetArrayItem(albums_node, 0);
-        if (first_album) {
-            cJSON *album_title_node = cJSON_GetObjectItem(first_album, "title");
-            if (album_title_node && cJSON_IsString(album_title_node) && album_title_node->valuestring) {
-                strncpy(entry->album, album_title_node->valuestring, sizeof(entry->album) - 1);
-                entry->album[sizeof(entry->album) - 1] = '\0';
-            }
-            cJSON *album_version_node = cJSON_GetObjectItem(first_album, "version");
-            if (album_version_node && cJSON_IsString(album_version_node) &&
-                album_version_node->valuestring) {
-                strncpy(entry->album_version, album_version_node->valuestring,
-                        sizeof(entry->album_version) - 1);
-                entry->album_version[sizeof(entry->album_version) - 1] = '\0';
-            }
-            cJSON *album_id_node = cJSON_GetObjectItem(first_album, "id");
-            if (album_id_node && cJSON_IsNumber(album_id_node)) {
-                entry->album_id = album_id_node->valueint;
-            }
-
-            cJSON *album_cover_node = cJSON_GetObjectItem(first_album, "coverUri");
-            if (album_cover_node && cJSON_IsString(album_cover_node) && album_cover_node->valuestring) {
-                strncat(entry->cover_uri, album_cover_node->valuestring, sizeof(entry->cover_uri) - 1);
-            }
-        }
-    }
-
-    cJSON *cover_node = cJSON_GetObjectItem(track_obj, "coverUri");
-    if (cover_node && cJSON_IsString(cover_node) && cover_node->valuestring) {
-        entry->cover_uri[0] = '\0';
-        strncat(entry->cover_uri, cover_node->valuestring, sizeof(entry->cover_uri) - 1);
-    }
-
-    cJSON *version_node = cJSON_GetObjectItem(track_obj, "version");
-    cJSON *background_video_node = cJSON_GetObjectItem(track_obj, "backgroundVideoUri");
-    if (background_video_node && cJSON_IsString(background_video_node) &&
-        background_video_node->valuestring) {
-        strncpy(entry->background_video_uri,
-                background_video_node->valuestring,
-                sizeof(entry->background_video_uri) - 1);
-        entry->background_video_uri[sizeof(entry->background_video_uri) - 1] = '\0';
-    }
-
-    if (version_node && cJSON_IsString(version_node) && version_node->valuestring) {
-        strncpy(entry->version, version_node->valuestring, sizeof(entry->version) - 1);
-        entry->version[sizeof(entry->version) - 1] = '\0';
-    }
-
-    cJSON *genre_node = cJSON_GetObjectItem(track_obj, "genre");
-    if (genre_node && cJSON_IsString(genre_node) && genre_node->valuestring) {
-        strncpy(entry->genre, genre_node->valuestring, sizeof(entry->genre) - 1);
-        entry->genre[sizeof(entry->genre) - 1] = '\0';
-    }
-
-    cJSON *year_node = cJSON_GetObjectItem(track_obj, "year");
-    if (year_node && cJSON_IsNumber(year_node)) {
-        entry->year = year_node->valueint;
-    }
-
-    cJSON *explicit_node = cJSON_GetObjectItem(track_obj, "contentWarning");
-    if (explicit_node && cJSON_IsString(explicit_node) && explicit_node->valuestring) {
-        entry->explicit_content = (strcmp(explicit_node->valuestring, "explicit") == 0) ? 1 : 0;
-    }
-
-    return 0;
-}
-
+/* Full-track parsing lives in ym_api_track_parse.c (shared with Rotor);
+ * this unit keeps only the playlist id-stream helpers. */
 static int ym_api_parse_track_id(const char *item_json,
                                  size_t item_size,
                                  char *out_id,

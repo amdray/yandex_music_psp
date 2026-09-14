@@ -31,7 +31,8 @@ void ui_screen_wave_on_enter(AppState *state)
 void ui_screen_wave_on_exit(AppState *state)
 {
     (void)state;
-    wave_reset();
+    /* Только подобрать воркер: сессия живёт дальше (плеер+рефилл+репорт). */
+    wave_dismiss_screen();
 }
 
 void ui_screen_wave_update(AppState *state)

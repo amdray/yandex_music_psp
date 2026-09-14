@@ -16,6 +16,7 @@
 #include "services/playback_queue.h"
 #include "services/token_loader.h"
 #include "services/ym_api_albums.h"
+#include "fonts/text.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
 #include "ui/ui_screens.h"
@@ -262,8 +263,9 @@ void ui_screen_album_list_render(void)
                 ui_draw_rect(27.0f, y, 30.0f, 30.0f, 0xFF444444);
             }
         }
-        ui_draw_text(62.0f, y, a->title,
-                     i == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB);
+        text_render_clipped(62.0f, y, a->title,
+                            i == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB,
+                            480.0f - 62.0f - 8.0f);
         if (a->year > 0) {
             snprintf(sub, sizeof(sub), "%d", a->year);
         } else if (a->track_count > 0) {

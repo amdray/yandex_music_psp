@@ -10,6 +10,7 @@
 #include "services/locale.h"
 #include "services/net_client.h"
 #include "services/token_loader.h"
+#include "fonts/text.h"
 #include "ui/ui_common.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_screen_artist_menu.h"
@@ -198,6 +199,7 @@ void ui_screen_artist_render(const AppState *state)
     const float gap_after_cover = 5.0f;
     const float text_x = thumb_x + thumb_size + gap_after_cover;
     const float start_y = 48.0f;
+    const float text_max_w = 480.0f - text_x - 8.0f;
 
     int start_idx = state->artist_scroll;
     int end_idx = start_idx + ARTIST_VISIBLE_SLOTS;
@@ -220,8 +222,9 @@ void ui_screen_artist_render(const AppState *state)
             }
         }
 
-        ui_draw_text(text_x, y, ar->name,
-                     i == state->artist_selected ? 0xFFFFFFFF : 0xFFBBBBBB);
+        text_render_clipped(text_x, y, ar->name,
+                            i == state->artist_selected ? 0xFFFFFFFF : 0xFFBBBBBB,
+                            text_max_w);
 
         char info[64];
         if (ar->genre[0]) {

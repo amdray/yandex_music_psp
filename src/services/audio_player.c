@@ -37,6 +37,9 @@
 #define AUDIO_PLAYER_WAIT_DEADLINE_US  (45ULL * 1000000ULL)
 #define AUDIO_PLAYER_MP3_BUF_SIZE      (16 * 1024)
 #define AUDIO_PLAYER_PCM_BUF_SIZE      (16 * (1152 / 2))
+/* SEEK: upper bound on garbage/EOS probe decodes after a decoder restart
+ * while waiting for sceMp3 frame sync. See audio_player_apply_seek(). */
+#define AUDIO_PLAYER_SEEK_RESYNC_FRAMES 8
 
 static const char *audio_player_state_name(AudioPlayerState state)
 {
@@ -69,6 +72,13 @@ static int s_mp3_modules_loaded = 0;
 static int s_mp3_resource_initialized = 0;
 static unsigned char s_mp3_buf[AUDIO_PLAYER_MP3_BUF_SIZE] __attribute__((aligned(64)));
 static unsigned char s_pcm_buf[AUDIO_PLAYER_PCM_BUF_SIZE] __attribute__((aligned(64)));
+/* SEEK: pending time-based seek request. The UI thread sets
+ * s_seek_target_ms and s_seek_pending = 1 and returns immediately (never
+ * blocks); the worker thread consumes the flag once per decode iteration
+ * (see audio_player_apply_seek). Plain int volatile: single-copy atomic
+ * on MIPS, no mutex needed. */
+static volatile int s_seek_pending = 0;
+static volatile int s_seek_target_ms = 0;
 
 static int release_audio_src_channel(void)
 {
@@ -214,10 +224,135 @@ static void set_active_status(AudioPlayerState state, const char *track_id)
 {
     if (s_pause_requested) {
         s_resume_state = state;
-        set_status(AUDIO_PLAYER_PAUSED, track_id, 0);
+        set_status(state, track_id, 0);
     } else {
         set_status(state, track_id, 0);
     }
+}
+
+/* WAVE-REPORT: really-audible events (spec section 6). Static storage only:
+ * no malloc, no HTTP/JSON on the audio thread. The controller consumes each
+ * event exactly once; a new start_current() discards stale ones. */
+static unsigned int s_report_generation = 0;
+static int s_first_pcm_pending = 0;
+static char s_first_pcm_track_id[40];
+static unsigned int s_first_pcm_generation = 0;
+static int s_terminal_pending = 0;
+static char s_terminal_track_id[40];
+static unsigned int s_terminal_generation = 0;
+static AudioEndReason s_terminal_reason = AUDIO_END_MANUAL_STOP;
+static int s_terminal_audible_ms = 0;
+static int s_terminal_had_first_pcm = 0;
+
+static void audio_report_lock(void)
+{
+    if (s_mutex_initialized) {
+        sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    }
+}
+
+static void audio_report_unlock(void)
+{
+    if (s_mutex_initialized) {
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    }
+}
+
+static void audio_report_publish_first_pcm(const char *track_id,
+                                           unsigned int generation)
+{
+    if (!track_id || !track_id[0]) {
+        return;
+    }
+    audio_report_lock();
+    snprintf(s_first_pcm_track_id, sizeof(s_first_pcm_track_id),
+             "%s", track_id);
+    s_first_pcm_generation = generation;
+    s_first_pcm_pending = 1;
+    audio_report_unlock();
+}
+
+static void audio_report_publish_terminal(const char *track_id,
+                                          unsigned int generation,
+                                          AudioEndReason reason,
+                                          int audible_ms,
+                                          int had_first_pcm)
+{
+    if (!track_id || !track_id[0]) {
+        return;
+    }
+    audio_report_lock();
+    snprintf(s_terminal_track_id, sizeof(s_terminal_track_id),
+             "%s", track_id);
+    s_terminal_generation = generation;
+    s_terminal_reason = reason;
+    s_terminal_audible_ms = (audible_ms > 0) ? audible_ms : 0;
+    s_terminal_had_first_pcm = had_first_pcm ? 1 : 0;
+    s_terminal_pending = 1;
+    audio_report_unlock();
+}
+
+void audio_player_set_report_generation(unsigned int generation)
+{
+    s_report_generation = generation;
+}
+
+int audio_player_take_first_pcm_event(char *out_track_id,
+                                      size_t track_id_size,
+                                      unsigned int *out_generation)
+{
+    int present = 0;
+
+    if (!out_track_id || track_id_size == 0) {
+        return -1;
+    }
+    out_track_id[0] = '\0';
+    audio_report_lock();
+    if (s_first_pcm_pending) {
+        snprintf(out_track_id, track_id_size, "%s", s_first_pcm_track_id);
+        if (out_generation) {
+            *out_generation = s_first_pcm_generation;
+        }
+        s_first_pcm_pending = 0;
+        present = 1;
+    }
+    audio_report_unlock();
+    return present ? 0 : -1;
+}
+
+int audio_player_take_terminal_snapshot(char *out_track_id,
+                                        size_t track_id_size,
+                                        unsigned int *out_generation,
+                                        AudioEndReason *out_reason,
+                                        int *out_audible_ms,
+                                        int *out_had_first_pcm)
+{
+    int present = 0;
+
+    if (!out_track_id || track_id_size == 0) {
+        return -1;
+    }
+    out_track_id[0] = '\0';
+    audio_report_lock();
+    if (s_terminal_pending) {
+        snprintf(out_track_id, track_id_size, "%s", s_terminal_track_id);
+        if (out_generation) {
+            *out_generation = s_terminal_generation;
+        }
+        if (out_reason) {
+            *out_reason = s_terminal_reason;
+        }
+        if (out_audible_ms) {
+            *out_audible_ms = s_terminal_audible_ms;
+        }
+        if (out_had_first_pcm) {
+            *out_had_first_pcm = s_terminal_had_first_pcm;
+        }
+        s_terminal_pending = 0;
+        present = 1;
+    }
+    audio_report_unlock();
+    return present ? 0 : -1;
 }
 
 static int wait_while_paused(const char *track_id)
@@ -524,6 +659,245 @@ static int feed_mp3_stream(int *fd_ptr, int handle, const char *track_id,
     return read_now;
 }
 
+/* SEEK: apply one queued time-based seek on the worker thread.
+ *
+ * Byte mapping is byte_offset = total_bytes * target_ms / duration_ms, i.e. a
+ * CBR approximation assuming constant byte rate over the track. On VBR the
+ * real audio position drifts from the request by the local bitrate ratio.
+ *
+ * There is no public cache "restart at offset" API (Range resume lives inside
+ * audio_cache.c's own download loop), and restarting the cache job would
+ * discard buffered data, so no cache job is touched: the read cursor is
+ * repositioned inside the already-acquired source (RAM stream buffer or
+ * cached file, both randomly readable) and the decoder window is restarted
+ * at byte_offset. If the target bytes are not downloaded yet,
+ * wait_for_more_data() parks on the async producer exactly like the normal
+ * buffering path -- no blocking network calls here.
+ *
+ * No malloc: reuses s_mp3_buf/s_pcm_buf. Position source of truth is
+ * unchanged (played_samples/sampling_rate); nothing new is exposed.
+ *
+ * Decoder resync relies on sceMp3 frame sync after the restart: up to
+ * AUDIO_PLAYER_SEEK_RESYNC_FRAMES probe decodes are attempted and
+ * garbage/EOS results are skipped; persistent failure gives up with an
+ * error. At most one good frame (~26 ms) is discarded as the sync probe, so
+ * no bulk "skip until target" is needed -- the new window already starts at
+ * the target. A mid-frame mp3StreamStart that makes sceMp3Init itself fail
+ * is NOT retried here (the error is returned; see risks).
+ *
+ * Returns 0 on success, AUDIO_PLAYER_EOF when the target is at/past EOF
+ * (caller finishes the track like a natural EOF), <0 on error.
+ * Consumes (clears) s_seek_pending in all cases. */
+static int audio_player_apply_seek(TrackEntry *track, AudioSourceSnapshot *source,
+                                   int *fd_ptr, int *handle_ptr,
+                                   AudioStreamBuf *sbuf, int stream_end,
+                                   int *rate_ptr, int *channels_ptr,
+                                   int64_t *played_ptr,
+                                   int *reserved_ptr, int *reserved_bytes_ptr)
+{
+    int target_ms = s_seek_target_ms;
+    int64_t total_bytes = (source->content_length > 0)
+        ? source->content_length : (int64_t)stream_end;
+    int64_t byte_offset;
+    int64_t target_samples;
+    int resync_left;
+    int rc;
+    SceMp3InitArg init_arg;
+
+    s_seek_pending = 0;
+
+    if (!track || track->duration_ms <= 0 || total_bytes <= 0) {
+        return AUDIO_PLAYER_ERR_SOURCE;
+    }
+    if (target_ms < 0) {
+        target_ms = 0;
+    }
+    if ((int64_t)target_ms >= (int64_t)track->duration_ms) {
+        return AUDIO_PLAYER_EOF;
+    }
+    /* CBR approximation; 64-bit math (bytes * ms overflows 32 bit). */
+    byte_offset = (total_bytes * (int64_t)target_ms) / (int64_t)track->duration_ms;
+    if (byte_offset < 0) {
+        byte_offset = 0;
+    }
+    if (byte_offset >= total_bytes) {
+        return AUDIO_PLAYER_EOF;
+    }
+
+    /* Flush decoded-but-unplayed data. Output is synchronous
+     * (sceAudioSRCOutputBlocking), so the only live audio state is the
+     * reserved SRC channel; drop it and let the main loop re-reserve once
+     * the post-seek frame size is known. */
+    if (*reserved_ptr) {
+        release_audio_src_channel();
+        *reserved_ptr = 0;
+        *reserved_bytes_ptr = 0;
+    }
+    if (*handle_ptr >= 0) {
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+    }
+
+    memset(&init_arg, 0, sizeof(init_arg));
+    init_arg.mp3StreamStart = (SceOff)byte_offset;
+    init_arg.mp3StreamEnd = (SceOff)total_bytes;
+    memset(s_mp3_buf, 0, sizeof(s_mp3_buf));
+    memset(s_pcm_buf, 0, sizeof(s_pcm_buf));
+    sceKernelDcacheWritebackRange(s_mp3_buf, sizeof(s_mp3_buf));
+    sceKernelDcacheWritebackRange(s_pcm_buf, sizeof(s_pcm_buf));
+    init_arg.mp3Buf = s_mp3_buf;
+    init_arg.mp3BufSize = sizeof(s_mp3_buf);
+    init_arg.pcmBuf = s_pcm_buf;
+    init_arg.pcmBufSize = sizeof(s_pcm_buf);
+
+    *handle_ptr = sceMp3ReserveMp3Handle(&init_arg);
+    if (*handle_ptr < 0) {
+        return *handle_ptr;
+    }
+    logLine("ap: seek reserve track_id='%s' target_ms=%d byte_offset=%d total=%d\n",
+            track->id, target_ms, (int)byte_offset, (int)total_bytes);
+
+    {
+        int64_t required_bytes = 0;
+        rc = sbuf ? feed_mp3_stream_ram(*handle_ptr, track->id, &required_bytes, sbuf)
+                  : feed_mp3_stream(fd_ptr, *handle_ptr, track->id, &required_bytes);
+        if (rc == 0) {
+            rc = wait_for_more_data(track->id, required_bytes);
+            if (rc == AUDIO_PLAYER_EOF) {
+                sceMp3ReleaseMp3Handle(*handle_ptr);
+                *handle_ptr = -1;
+                return AUDIO_PLAYER_EOF;
+            }
+            if (rc != 0) {
+                sceMp3ReleaseMp3Handle(*handle_ptr);
+                *handle_ptr = -1;
+                return rc;
+            }
+            rc = sbuf ? feed_mp3_stream_ram(*handle_ptr, track->id, &required_bytes, sbuf)
+                      : feed_mp3_stream(fd_ptr, *handle_ptr, track->id, &required_bytes);
+        }
+        if (rc == AUDIO_PLAYER_EOF) {
+            sceMp3ReleaseMp3Handle(*handle_ptr);
+            *handle_ptr = -1;
+            return AUDIO_PLAYER_EOF;
+        }
+        if (rc < 0) {
+            sceMp3ReleaseMp3Handle(*handle_ptr);
+            *handle_ptr = -1;
+            return rc;
+        }
+    }
+
+    rc = sceMp3Init(*handle_ptr);
+    if (rc < 0) {
+        logLine("ap: seek init failed track_id='%s' rc=0x%08X (mid-frame Start?)\n",
+                track->id, rc);
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+        return rc;
+    }
+
+    rc = sceMp3SetLoopNum(*handle_ptr, 0);
+    if (rc < 0) {
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+        return rc;
+    }
+
+    rc = sceMp3GetSamplingRate(*handle_ptr);
+    if (rc < 0) {
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+        return rc;
+    }
+    *rate_ptr = rc;
+
+    rc = sceMp3GetMp3ChannelNum(*handle_ptr);
+    if (rc < 0) {
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+        return rc;
+    }
+    *channels_ptr = rc;
+    set_format_snapshot(*rate_ptr, *channels_ptr);
+
+    target_samples = ((int64_t)target_ms * (int64_t)*rate_ptr) / 1000;
+    *played_ptr = target_samples;
+    set_position_snapshot(target_ms);
+
+    /* Resync probe: rely on sceMp3 frame sync, skip garbage/EOS up to N. */
+    rc = AUDIO_PLAYER_ERR_SOURCE;
+    resync_left = AUDIO_PLAYER_SEEK_RESYNC_FRAMES;
+    while (resync_left > 0) {
+        short *probe_pcm = NULL;
+        int need_data;
+        int decoded;
+        int64_t required_bytes = 0;
+        int feed_rc;
+
+        resync_left--;
+
+        need_data = sceMp3CheckStreamDataNeeded(*handle_ptr);
+        if (need_data < 0) {
+            rc = need_data;
+            logLine("ap: seek probe need_data bad track_id='%s' left=%d rc=0x%08X\n",
+                    track->id, resync_left, need_data);
+            continue;
+        }
+        if (need_data > 0) {
+            feed_rc = sbuf ? feed_mp3_stream_ram(*handle_ptr, track->id, &required_bytes, sbuf)
+                           : feed_mp3_stream(fd_ptr, *handle_ptr, track->id, &required_bytes);
+            if (feed_rc == 0) {
+                feed_rc = wait_for_more_data(track->id, required_bytes);
+                if (feed_rc != 0) {
+                    rc = (feed_rc == AUDIO_PLAYER_EOF) ? AUDIO_PLAYER_EOF : feed_rc;
+                    break;
+                }
+                feed_rc = sbuf ? feed_mp3_stream_ram(*handle_ptr, track->id, &required_bytes, sbuf)
+                               : feed_mp3_stream(fd_ptr, *handle_ptr, track->id, &required_bytes);
+            }
+            if (feed_rc == AUDIO_PLAYER_EOF) {
+                rc = AUDIO_PLAYER_EOF;
+                break;
+            }
+            if (feed_rc < 0) {
+                rc = feed_rc;
+                break;
+            }
+        }
+
+        decoded = sceMp3Decode(*handle_ptr, &probe_pcm);
+        if (decoded > 0) {
+            /* In sync; this one probe frame is discarded (<= ~26 ms gap)
+             * and the main loop outputs subsequent frames normally. */
+            logLine("ap: seek sync ok track_id='%s' target_ms=%d\n",
+                    track->id, target_ms);
+            rc = 0;
+            break;
+        }
+        rc = (decoded == AUDIO_PLAYER_DECODE_EOS || decoded == 0)
+             ? AUDIO_PLAYER_ERR_SOURCE : decoded;
+        logLine("ap: seek probe bad track_id='%s' left=%d rc=0x%08X\n",
+                track->id, resync_left, decoded);
+    }
+    if (rc == AUDIO_PLAYER_EOF) {
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+        return AUDIO_PLAYER_EOF;
+    }
+    if (rc != 0) {
+        sceMp3ReleaseMp3Handle(*handle_ptr);
+        *handle_ptr = -1;
+        logLine("ap: seek resync give-up track_id='%s' rc=0x%08X\n",
+                track->id, rc);
+        return rc;
+    }
+
+    eq_reset();
+    set_active_status(AUDIO_PLAYER_PLAYING, track->id);
+    return 0;
+}
+
 static int audio_player_worker(SceSize args, void *argp)
 {
     TrackEntry track;
@@ -541,6 +915,9 @@ static int audio_player_worker(SceSize args, void *argp)
     int64_t played_samples = 0;
     int loop_num = 0;
     AudioStreamBuf *sbuf = NULL;  /* non-NULL = live RAM stream mode */
+    /* WAVE-REPORT: per-run audible reporting state. */
+    int first_pcm_done = 0;
+    unsigned int worker_generation = 0;
 
     (void)args;
     (void)argp;
@@ -548,6 +925,8 @@ static int audio_player_worker(SceSize args, void *argp)
     memset(&track, 0, sizeof(track));
     memset(&source, 0, sizeof(source));
     memcpy(&track, &g_playback.current_track, sizeof(track));
+    /* WAVE-REPORT: stamp the run with the controller's generation. */
+    worker_generation = s_report_generation;
 
     if (track.id[0] == '\0') {
         error_code = AUDIO_PLAYER_ERR_SOURCE;
@@ -694,6 +1073,29 @@ static int audio_player_worker(SceSize args, void *argp)
             stop_state = 1;
             break;
         }
+        /* SEEK: consume one queued seek per decode iteration. While
+         * paused/buffering the flag stays queued (set by
+         * audio_player_seek_to_ms) and applies here once the worker
+         * reaches the decode loop; at most one already-decoded frame
+         * (~26 ms) may still be output first. */
+        if (s_seek_pending) {
+            int seek_rc = audio_player_apply_seek(&track, &source, &fd, &handle,
+                                                 sbuf, stream_end,
+                                                 &sampling_rate, &num_channels,
+                                                 &played_samples,
+                                                 &audio_reserved, &reserved_bytes);
+            if (seek_rc == AUDIO_PLAYER_EOF) {
+                logLine("ap: eof from seek track_id='%s'\n", track.id);
+                logger_flush();
+                stop_state = 1;
+                break;
+            }
+            if (seek_rc != 0) {
+                error_code = seek_rc;
+                goto cleanup;
+            }
+            continue;
+        }
         int need_data = sceMp3CheckStreamDataNeeded(handle);
         if (need_data < 0) {
             error_code = need_data;
@@ -831,6 +1233,11 @@ static int audio_player_worker(SceSize args, void *argp)
             }
 
             played_samples += bytes_decoded / (2 * num_channels);
+            /* WAVE-REPORT: first really-audible block of this run. */
+            if (!first_pcm_done) {
+                first_pcm_done = 1;
+                audio_report_publish_first_pcm(track.id, worker_generation);
+            }
             if (sampling_rate > 0) {
                 set_position_snapshot((int)((played_samples * 1000) / sampling_rate));
             }
@@ -846,6 +1253,29 @@ static int audio_player_worker(SceSize args, void *argp)
     }
 
 cleanup:
+    /* WAVE-REPORT: terminal snapshot before state cleanup. audible_ms comes
+     * from really-output samples only; pause/buffering never inflates it.
+     * A stop request reads as MANUAL_STOP here — the controller refines it
+     * to NEXT/PREVIOUS/STOP from its own pre-cursor capture. */
+    {
+        int terminal_audible_ms = (sampling_rate > 0)
+            ? (int)((played_samples * 1000) / sampling_rate) : 0;
+        AudioEndReason terminal_reason = AUDIO_END_MANUAL_STOP;
+
+        if (error_code != 0 && !s_stop_requested && !stop_state) {
+            terminal_reason = AUDIO_END_DECODER_ERROR;
+        } else if (!s_stop_requested && stop_state) {
+            terminal_reason = AUDIO_END_NATURAL;
+        } else if (error_code != 0) {
+            terminal_reason = AUDIO_END_DECODER_ERROR;
+        }
+        if (track.id[0]) {
+            audio_report_publish_terminal(track.id, worker_generation,
+                                          terminal_reason,
+                                          terminal_audible_ms,
+                                          first_pcm_done);
+        }
+    }
     if (s_stop_requested && s_state != AUDIO_PLAYER_STOPPING) {
         set_status(AUDIO_PLAYER_STOPPING, track.id[0] ? track.id : NULL, 0);
     }
@@ -903,6 +1333,8 @@ void audio_player_init(void)
     s_pause_requested = 0;
     s_resume_state = AUDIO_PLAYER_PLAYING;
     s_backend_ready = 0;
+    /* SEEK: no queued seek across init. */
+    s_seek_pending = 0;
     s_backend_error = 0;
 
     backend_rc = ensure_backend_ready();
@@ -956,6 +1388,8 @@ int audio_player_start_current(void)
     s_stop_requested = 0;
     s_pause_requested = 0;
     s_resume_state = AUDIO_PLAYER_PLAYING;
+    /* SEEK: a new track starts with no queued seek. */
+    s_seek_pending = 0;
     logLine("ap: start_current accepted track_id='%s'\n", g_playback.current_track.id);
     set_status(AUDIO_PLAYER_OPENING, g_playback.current_track.id, 0);
 
@@ -1045,6 +1479,39 @@ void audio_player_resume(void)
             s_status.track_id, s_status.position_ms);
 }
 
+/* SEEK: request a time-based seek. Never blocks: only queues a flag consumed
+ * by the worker thread, so it is safe to call from the UI thread. See the
+ * header doc for return codes and edge-case behavior. */
+int audio_player_seek_to_ms(int target_ms)
+{
+    AudioPlayerState state;
+
+    if (!s_worker_running) {
+        return -1;
+    }
+    if (s_seek_pending) {
+        return -1;
+    }
+    state = (AudioPlayerState)s_state;
+    switch (state) {
+        case AUDIO_PLAYER_OPENING:
+        case AUDIO_PLAYER_PLAYING:
+        case AUDIO_PLAYER_PAUSED:
+        case AUDIO_PLAYER_BUFFERING:
+            break;
+        default:
+            return -1;
+    }
+    if (target_ms < 0) {
+        target_ms = 0;
+    }
+    s_seek_target_ms = target_ms;
+    s_seek_pending = 1;
+    logLine("ap: seek requested target_ms=%d state=%s\n",
+            target_ms, audio_player_state_name(state));
+    return 0;
+}
+
 void audio_player_stop(void)
 {
     if (!s_worker_running && s_worker_thread < 0) {
@@ -1060,6 +1527,8 @@ void audio_player_stop(void)
             s_status.track_id[0] ? s_status.track_id : "");
     s_stop_requested = 1;
     s_pause_requested = 0;
+    /* SEEK: drop any queued seek so it cannot leak into the next track. */
+    s_seek_pending = 0;
     if (s_state != AUDIO_PLAYER_IDLE &&
         s_state != AUDIO_PLAYER_STOPPED &&
         s_state != AUDIO_PLAYER_FINISHED) {

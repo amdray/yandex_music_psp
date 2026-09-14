@@ -105,10 +105,26 @@ static void draw_marquee_parts(float x, float y, float max_width,
     copies = offset > 0.0f ? 2 : 1;
     for (i = 0; i < copies; ++i) {
         float copy_x = first_x + (float)i * (content_width + MARQUEE_GAP_PX);
-        ui_draw_text(copy_x, y, text, text_color);
+        float raw_skip = x - copy_x;
+        float text_skip = raw_skip > 0.0f ? raw_skip : 0.0f;
+        float text_draw_x = copy_x > x ? copy_x : x;
+        float text_budget = max_width - (text_draw_x - x);
+        if (text_budget > 0.0f) {
+            text_render_window(text_draw_x, y, text, text_color,
+                               text_skip, text_budget);
+        }
         if (suffix_width > 0.0f) {
-            ui_draw_text(copy_x + text_width + separator_width, y,
-                         suffix, suffix_color);
+            float suffix_abs_x = copy_x + text_width + separator_width;
+            float suffix_skip = raw_skip - (text_width + separator_width);
+            float suffix_draw_x = suffix_abs_x > x ? suffix_abs_x : x;
+            float suffix_budget = max_width - (suffix_draw_x - x);
+            if (suffix_skip < 0.0f) {
+                suffix_skip = 0.0f;
+            }
+            if (suffix_budget > 0.0f) {
+                text_render_window(suffix_draw_x, y, suffix, suffix_color,
+                                   suffix_skip, suffix_budget);
+            }
         }
     }
     hal_gpu_set_scissor(0, 0, 480, 272);

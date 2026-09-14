@@ -9,9 +9,11 @@
 #include "services/cover_now_playing.h"
 #include "services/last_play.h"
 #include "services/playback_queue.h"
+#include "services/playback_reporter.h"
 #include "services/token_loader.h"
 #include "services/track_hydrator.h"
 #include "services/net_stack.h"
+#include "services/wave.h"
 
 /* The single global playback state instance. */
 PlaybackState g_playback;
@@ -35,6 +37,185 @@ static int s_error_handled = 0;
 static int s_network_retry_pending = 0;
 static u64 s_network_retry_after_us = 0;
 static u64 s_network_retry_backoff_us = 500000ULL;
+
+/* WAVE-REPORT: playback telemetry context (spec sections 5-8). One stashed
+ * context per started track; audio FIRST_PCM/terminal events become
+ * reporter FIFO entries. Rotor feedback applies to FLOW only; /play-audio
+ * is queued for every track with really-audible output. */
+static PlaybackReportContext s_report_ctx;
+static unsigned int s_report_seq = 0;
+
+static int wave_report_find_flow(const char *track_id, WaveQueueItem *out)
+{
+    WaveQueueItem batch[64];
+    int batch_count;
+    int batch_index;
+
+    if (!track_id || !track_id[0] || !out) {
+        return -1;
+    }
+    batch_count = playback_queue_get_flow_items(batch, 64);
+    for (batch_index = 0; batch_index < batch_count; ++batch_index) {
+        if (strcmp(batch[batch_index].track_id, track_id) == 0) {
+            *out = batch[batch_index];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void wave_report_capture(const TrackEntry *track)
+{
+    PlaybackQueueInfo queue_info;
+    PlaybackQueueSource source = PLAYBACK_QUEUE_SOURCE_NONE;
+    WaveQueueItem flow;
+    int have_flow = 0;
+    unsigned int generation;
+
+    if (!track || !track->id[0]) {
+        return;
+    }
+    /* Same-track restart (pause/buffering/network retry): keep play_id. */
+    if (strcmp(s_report_ctx.track_id, track->id) == 0 &&
+        !s_report_ctx.terminal_reported) {
+        return;
+    }
+    if (playback_queue_get_info(&queue_info) == 0) {
+        source = queue_info.source;
+    }
+    if (source == PLAYBACK_QUEUE_SOURCE_FLOW) {
+        generation = wave_current_generation();
+        if (wave_report_find_flow(track->id, &flow) == 0) {
+            have_flow = 1;
+        }
+    } else {
+        s_report_seq++;
+        if (s_report_seq == 0) {
+            s_report_seq = 1;
+        }
+        generation = s_report_seq;
+    }
+    playback_report_context_start(&s_report_ctx,
+                                  track->id,
+                                  have_flow ? flow.album_id : track->album_id,
+                                  have_flow ? flow.batch_id : "",
+                                  track->duration_ms,
+                                  generation, source);
+    if (playback_reporter_new_play_id(s_report_ctx.play_id,
+                                      sizeof(s_report_ctx.play_id)) != 0) {
+        s_report_ctx.play_id[0] = '\0';
+    }
+    audio_player_set_report_generation(s_report_ctx.generation);
+    logLine("pb: report ctx track='%s' flow=%d play='%s'\n",
+            s_report_ctx.track_id, have_flow, s_report_ctx.play_id);
+}
+
+static void wave_report_poll_first_pcm(void)
+{
+    char pcm_id[40];
+    unsigned int pcm_generation = 0;
+    char token[256];
+    char session_id[64];
+
+    if (audio_player_take_first_pcm_event(pcm_id, sizeof(pcm_id),
+                                          &pcm_generation) != 0) {
+        return;
+    }
+    if (!s_report_ctx.track_id[0] ||
+        strcmp(s_report_ctx.track_id, pcm_id) != 0 ||
+        s_report_ctx.generation != pcm_generation ||
+        s_report_ctx.first_pcm_reported ||
+        !s_report_ctx.play_id[0]) {
+        return;
+    }
+    s_report_ctx.first_pcm_reported = 1;
+    token[0] = '\0';
+    if (token_loader_read(token, sizeof(token)) != 0 || !token[0]) {
+        logLine("pb: report start skipped, no token\n");
+        return;
+    }
+    /* /play-audio for every audible track; trackStarted for FLOW only. */
+    playback_reporter_enqueue_play_audio(&s_report_ctx, token, 0);
+    if (s_report_ctx.active &&
+        s_report_ctx.source == PLAYBACK_QUEUE_SOURCE_FLOW &&
+        wave_get_session_id(session_id, sizeof(session_id)) == 0) {
+        double len_s = (s_report_ctx.duration_ms > 0)
+            ? ((double)s_report_ctx.duration_ms / 1000.0) : 0.0;
+        playback_reporter_enqueue_feedback(PLAYBACK_REPORT_TRACK_STARTED,
+                                           &s_report_ctx, token, session_id,
+                                           0.0, len_s);
+    }
+    memset(token, 0, sizeof(token));
+    logLine("pb: report start queued track='%s'\n", s_report_ctx.track_id);
+    logger_flush();
+}
+
+/* Resolve really-audible ms for a stashed context: prefer the worker's
+ * terminal snapshot on track+generation match, else the last value the
+ * controller saw. *out_had_pcm gates event creation (spec 8.5: nothing
+ * before the first PCM). */
+static void wave_report_terminal_time(const PlaybackReportContext *old,
+                                      int *out_audible_ms, int *out_had_pcm)
+{
+    char snap_id[40];
+    unsigned int snap_generation = 0;
+    AudioEndReason snap_reason = AUDIO_END_MANUAL_STOP;
+    int snap_audible = 0;
+    int snap_had_pcm = 0;
+
+    if (out_audible_ms) {
+        *out_audible_ms = old ? old->audible_ms : 0;
+    }
+    if (out_had_pcm) {
+        *out_had_pcm = old ? old->first_pcm_reported : 0;
+    }
+    if (!old || !old->track_id[0]) {
+        return;
+    }
+    if (audio_player_take_terminal_snapshot(snap_id, sizeof(snap_id),
+                                            &snap_generation, &snap_reason,
+                                            &snap_audible,
+                                            &snap_had_pcm) != 0) {
+        return;
+    }
+    (void)snap_reason; /* the controller branch owns the stop reason */
+    if (strcmp(snap_id, old->track_id) == 0 &&
+        snap_generation == old->generation) {
+        if (out_audible_ms) {
+            *out_audible_ms = snap_audible;
+        }
+        if (out_had_pcm) {
+            *out_had_pcm = snap_had_pcm;
+        }
+    }
+}
+
+static void wave_report_note_old(const PlaybackReportContext *old, int finished)
+{
+    int audible_ms = 0;
+    int had_pcm = 0;
+
+    if (!old || !old->track_id[0] || !old->active ||
+        old->source != PLAYBACK_QUEUE_SOURCE_FLOW) {
+        return;
+    }
+    if (old->first_pcm_reported == 0 || old->terminal_reported) {
+        return;
+    }
+    wave_report_terminal_time(old, &audible_ms, &had_pcm);
+    if (!had_pcm) {
+        return;
+    }
+    if (finished) {
+        wave_note_finished(old->track_id, old->album_id,
+                           audible_ms, old->duration_ms);
+    } else {
+        wave_note_skip(old->track_id, old->album_id,
+                       audible_ms, old->duration_ms);
+    }
+}
+/* SEEK: accumulated relative-seek request (ms) from UI hold handling. */
+static int s_seek_delta_ms = 0;
 
 /* Queue metadata resolution can come back PENDING (id known, entry not in the
  * store yet — deep shuffle jump or evicted record). The controller then asks
@@ -93,6 +274,8 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
                     cur.state == AUDIO_CACHE_READY ? "READY" :
                     (cur.state == AUDIO_CACHE_PROGRESSIVE_READY ? "PROGRESSIVE_READY" : "DOWNLOADING"));
             memcpy(&g_playback.current_track, track, sizeof(TrackEntry));
+            /* WAVE-REPORT: keep (or restart, when terminal) the report ctx. */
+            wave_report_capture(track);
             if (audio_player_start_current() == 0) {
                 return PLAYBACK_INTENT_ACCEPTED;
             }
@@ -107,6 +290,9 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
         return PLAYBACK_INTENT_REJECTED;
     }
 
+    /* WAVE-REPORT: stash the report context before the worker stops/starts
+     * (generation must be set before audio_player_start_current below). */
+    wave_report_capture(track);
     audio_player_stop();
     memcpy(&g_playback.current_track, track, sizeof(TrackEntry));
     if (audio_cache_start(track, s_token) != 0) {
@@ -129,6 +315,9 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
 void playback_controller_init(void)
 {
     memset(&g_playback, 0, sizeof(g_playback));
+    /* WAVE-REPORT: fresh telemetry state. */
+    memset(&s_report_ctx, 0, sizeof(s_report_ctx));
+    s_report_seq = 0;
     s_play_current_requested = 0;
     s_pause_toggle_requested = 0;
     s_stop_playback_requested = 0;
@@ -141,6 +330,8 @@ void playback_controller_init(void)
     s_network_retry_pending = 0;
     s_network_retry_after_us = 0;
     s_network_retry_backoff_us = 500000ULL;
+    /* SEEK: no queued seek across init. */
+    s_seek_delta_ms = 0;
     playback_queue_init();
     audio_player_init();
     logLine("pb: controller init\n");
@@ -159,6 +350,8 @@ void playback_controller_shutdown(void)
     audio_player_shutdown();
     playback_queue_clear();
     memset(&g_playback, 0, sizeof(g_playback));
+    /* WAVE-REPORT: drop stashed telemetry with the controller. */
+    memset(&s_report_ctx, 0, sizeof(s_report_ctx));
     logLine("pb: controller shutdown\n");
 }
 
@@ -172,6 +365,8 @@ int playback_controller_quiesce(void)
     s_cover_prefetch_triggered = 0;
     s_advance_triggered = 0;
     s_network_retry_pending = 0;
+    /* SEEK: drop any queued seek on quiesce. */
+    s_seek_delta_ms = 0;
     return audio_player_quiesce();
 }
 
@@ -216,9 +411,17 @@ void playback_controller_request_stop(void)
     logLine("pb: stop requested\n");
 }
 
+/* SEEK: queue a relative seek; consumed by playback_controller_service(). */
+void playback_controller_request_seek_relative(int delta_ms)
+{
+    s_seek_delta_ms += delta_ms;
+}
+
 static void playback_controller_service_navigation(void)
 {
     TrackEntry target;
+    /* WAVE-REPORT: outgoing context stashed before the cursor moves. */
+    PlaybackReportContext nav_outgoing;
     int direction = s_navigation_requested;
     int rc;
 
@@ -245,6 +448,8 @@ static void playback_controller_service_navigation(void)
     }
 
     s_play_retry_after_us = 0;
+    /* WAVE-REPORT: stash the outgoing track; skip is queued after accept. */
+    nav_outgoing = s_report_ctx;
     if (playback_controller_start_track(&target) != PLAYBACK_INTENT_ACCEPTED) {
         /* The cursor remains unchanged. Do not spin on a permanent failure
          * (missing token, cache refusal); another key press is a fresh intent. */
@@ -271,6 +476,8 @@ static void playback_controller_service_navigation(void)
     s_advance_triggered = 0;
     s_error_skips = 0;
     s_network_retry_backoff_us = 500000ULL;
+    /* WAVE-REPORT: manual next/previous after first PCM → skip. */
+    wave_report_note_old(&nav_outgoing, 0);
     logLine("pb: manual %s committed track_id='%s'\n",
             direction > 0 ? "next" : "previous", target.id);
 }
@@ -284,6 +491,24 @@ void playback_controller_service(void)
         s_network_retry_pending = 0;
         s_advance_triggered = 0;
         audio_player_stop();
+        /* WAVE-REPORT: manual stop after first PCM → skip (snapshot taken
+         * after the worker died, so audible_ms is final). */
+        wave_report_note_old(&s_report_ctx, 0);
+        s_report_ctx.terminal_reported = 1;
+    }
+
+    /* WAVE-REPORT: first really-audible block → /play-audio (+trackStarted). */
+    wave_report_poll_first_pcm();
+
+    /* SEEK: forward one queued relative seek to the player engine. Dropped
+     * when the engine is busy/idle; UI hold repeats re-issue it. */
+    if (s_seek_delta_ms != 0) {
+        AudioPlayerSnapshot seek_snap;
+        int seek_delta = s_seek_delta_ms;
+        s_seek_delta_ms = 0;
+        if (audio_player_get_snapshot(&seek_snap)) {
+            audio_player_seek_to_ms(seek_snap.position_ms + seek_delta);
+        }
     }
 
     if (s_pause_toggle_requested) {
@@ -378,6 +603,8 @@ void playback_controller_service(void)
         g_playback.current_track.id[0] != '\0') {
         s_advance_triggered = 1;
         s_error_skips = 0;  /* трек доигран штатно — серия ошибок прервана */
+        /* WAVE-REPORT: natural EOF → trackFinished before the cursor moves. */
+        wave_report_note_old(&s_report_ctx, 1);
         if (playback_queue_move_next() == 0) {
             TrackEntry next;
             int rc = playback_queue_get_current(&next);
@@ -393,6 +620,8 @@ void playback_controller_service(void)
                 logLine("pb: advance waiting metadata track_id='%s'\n", next.id);
             } else if (s_prefetch_triggered && audio_cache_prefetch_swap() == 0) {
                 memcpy(&g_playback.current_track, &next, sizeof(next));
+                /* WAVE-REPORT: swapped-in track starts a fresh report ctx. */
+                wave_report_capture(&next);
                 audio_player_start_current();
                 logLine("pb: advance from prefetch track_id='%s'\n", next.id);
                 s_prefetch_triggered = 0;
@@ -406,6 +635,9 @@ void playback_controller_service(void)
                 s_advance_triggered = 0;
             }
         } else {
+            /* WAVE-REPORT: natural EOF at queue end still closes the report. */
+            wave_report_note_old(&s_report_ctx, 1);
+            s_report_ctx.terminal_reported = 1;
             logLine("pb: queue end\n");
             s_prefetch_triggered = 0;
             s_cover_prefetch_triggered = 0;
@@ -434,6 +666,10 @@ void playback_controller_service(void)
                         g_playback.current_track.id);
             } else {
                 s_error_skips++;
+                /* WAVE-REPORT: decoder error after first PCM → skip with the
+                 * actual audible time (the worker is already dead, so the
+                 * terminal snapshot is final). */
+                wave_report_note_old(&s_report_ctx, 0);
                 if (s_error_skips <= PB_MAX_CONSECUTIVE_ERROR_SKIPS &&
                     playback_queue_move_next() == 0) {
                     TrackEntry next;

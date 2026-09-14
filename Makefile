@@ -17,6 +17,7 @@ OBJS = src/main.o \
        src/ui/ui_screen_net_info.o \
        src/ui/ui_screen_device_login.o \
        src/ui/ui_screen_wave.o \
+       src/ui/ui_screen_search.o \
        src/ui/ui_screen_eq.o \
        src/hal/hal_input.o \
        src/hal/hal_gpu.o \
@@ -37,6 +38,11 @@ OBJS = src/main.o \
        src/services/ym_api_like.o \
        src/services/ym_api_albums.o \
        src/services/ym_api_wave.o \
+       src/services/ym_api_rotor.o \
+       src/services/ym_api_track_parse.o \
+       src/services/ym_api_search.o \
+       src/services/osk_input.o \
+       src/services/playback_reporter.o \
        src/services/wave.o \
        src/services/album_play.o \
        src/services/eq.o \

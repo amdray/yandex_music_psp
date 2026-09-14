@@ -7,6 +7,7 @@
 #include "services/audio_cache.h"
 #include "services/audio_player.h"
 #include "services/cover_now_playing.h"
+#include "services/last_play.h"
 #include "services/playback_queue.h"
 #include "services/token_loader.h"
 #include "services/track_hydrator.h"
@@ -121,6 +122,7 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
         return PLAYBACK_INTENT_REJECTED;
     }
     memset(s_token, 0, sizeof(s_token));
+    last_play_save();  // трек реально стартовал — запомнили очередь
     return PLAYBACK_INTENT_ACCEPTED;
 }
 

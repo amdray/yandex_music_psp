@@ -4,6 +4,7 @@
 #include "hal/hal_fb.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
+#include "services/last_play.h"
 #include "app/app_state.h"
 #include "core/logger.h"
 #include <pspctrl.h>
@@ -24,6 +25,15 @@ void ui_screen_splash_update(AppState *state, SplashFlow *flow)
 {
     splash_flow_tick(flow, state);
     if (flow->ready) {
+        // Было что играть — продолжаем сразу на плеере, иначе в меню.
+        if (last_play_restore(state) == 0) {
+            logLine("splash: ready -> app_state_reset(NOW_PLAYING) begin\n");
+            logger_flush();
+            app_state_reset(state, SCREEN_NOW_PLAYING);
+            logLine("splash: app_state_reset(NOW_PLAYING) done\n");
+            logger_flush();
+            return;
+        }
         logLine("splash: ready -> app_state_reset(MENU) begin\n");
         logger_flush();
         app_state_reset(state, SCREEN_MENU);

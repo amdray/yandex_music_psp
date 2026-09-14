@@ -17,6 +17,7 @@
 #include "services/video_cover.h"
 #include "services/net_client.h"
 #include "services/net_tls.h"
+#include "services/last_play.h"
 #include "services/net_stack.h"
 #include "services/net_ui_status.h"
 #include "services/playback_controller.h"
@@ -33,6 +34,8 @@
 #include "ui/ui_screen_artist_menu.h"
 #include "ui/ui_screen_net_info.h"
 #include "ui/ui_screen_device_login.h"
+#include "ui/ui_screen_eq.h"
+#include "ui/ui_screen_wave.h"
 #include "ui/ui_common.h"
 
 static void *s_splash_pixels = NULL;
@@ -131,6 +134,7 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
     },
     [SCREEN_ALBUM_LIST] = {
         .name = "album_list",
+        .update = ui_screen_album_list_update,
         .handle_input = ui_screen_album_list_handle_input,
         .render = album_list_render,
     },
@@ -180,6 +184,20 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .update = ui_screen_device_login_update,
         .handle_input = ui_screen_device_login_handle_input,
         .render = ui_screen_device_login_render,
+    },
+    [SCREEN_EQ] = {
+        .name = "eq",
+        .on_enter = ui_screen_eq_on_enter,
+        .on_exit = ui_screen_eq_on_exit,
+        .handle_input = ui_screen_eq_handle_input,
+        .render = ui_screen_eq_render,
+    },
+    [SCREEN_WAVE] = {
+        .name = "wave",
+        .on_enter = ui_screen_wave_on_enter,
+        .on_exit = ui_screen_wave_on_exit,
+        .update = ui_screen_wave_update,
+        .render = ui_screen_wave_render,
     },
 };
 
@@ -356,6 +374,7 @@ int ui_screens_shutdown(void)
     /* Phase one only: close admission and join every consumer. Nothing is
      * deleted or freed unless every join has succeeded. The process exits after
      * this function, so phase two is OS reclamation. */
+    last_play_save();  // чистый выход посреди трека — запомнили
     net_tls_quiesce_begin();
     if (splash_flow_quiesce(&s_splash_flow) < 0) quiesced = 0;
     if (playback_controller_quiesce() < 0) quiesced = 0;
@@ -415,6 +434,7 @@ void ui_screens_render(const AppState *state)
     if (current != SCREEN_SPLASH && current != SCREEN_ARTIST_MENU) {
         ui_common_draw_top_status();
     }
+    ui_common_draw_eq_toast();
     net_ui_status_on_rendered_frame();
 
     ui_draw_end_frame();

@@ -3,6 +3,7 @@
 #include "hal/hal_gfx_config.h"
 #include "fonts/text.h"
 #include "services/locale.h"
+#include "services/eq.h"
 #include "services/system_status.h"
 #include "services/net_ui_status.h"
 #include <pspkernel.h>
@@ -194,4 +195,41 @@ void ui_common_draw_prompts_n(const LocaleKey *keys, int count)
         }
     }
     ui_draw_text(text_x, text_y, prompt, 0xFF888888);
+}
+
+const char *ui_common_eq_preset_name(int preset)
+{
+    switch (preset) {
+    case EQ_PRESET_ROCK:      return locale_get(LOCALE_EQ_ROCK);
+    case EQ_PRESET_POP:       return locale_get(LOCALE_EQ_POP);
+    case EQ_PRESET_JAZZ:      return locale_get(LOCALE_EQ_JAZZ);
+    case EQ_PRESET_CLASSICAL: return locale_get(LOCALE_EQ_CLASSICAL);
+    case EQ_PRESET_BASS:      return locale_get(LOCALE_EQ_BASS);
+    case EQ_PRESET_TREBLE:    return locale_get(LOCALE_EQ_TREBLE);
+    case EQ_PRESET_VOCAL:     return locale_get(LOCALE_EQ_VOCAL);
+    case EQ_PRESET_CUSTOM:    return locale_get(LOCALE_EQ_CUSTOM);
+    case EQ_PRESET_OFF:
+    default:                  return locale_get(LOCALE_EQ_OFF);
+    }
+}
+
+void ui_common_draw_eq_toast(void)
+{
+    char buf[64];
+    float w, x, y = 120.0f;
+    int kind = eq_toast_kind();
+
+    if (kind == 2) {
+        // Предусиление: «VOL +4dB».
+        snprintf(buf, sizeof(buf), "VOL +%ddB", (int)eq_get_preamp_db());
+    } else if (kind == 1) {
+        snprintf(buf, sizeof(buf), "EQ: %s",
+                 ui_common_eq_preset_name(eq_get_preset()));
+    } else {
+        return;
+    }
+    w = text_measure_width(buf);
+    x = ((float)SCREEN_WIDTH - w) * 0.5f;
+    ui_draw_rect(x - 10.0f, y - 6.0f, w + 20.0f, 28.0f, 0xDD1A1A1A);
+    ui_draw_text(x, y, buf, 0xFF00D5FF);
 }

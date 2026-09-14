@@ -5,6 +5,7 @@
 #include "hal/hal_input.h"
 
 void ui_screen_album_list_handle_input(AppState *state, const InputState *input);
+void ui_screen_album_list_update(AppState *state);
 void ui_screen_album_list_render(void);
 
 #endif

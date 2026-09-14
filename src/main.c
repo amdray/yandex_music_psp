@@ -17,6 +17,8 @@
 #include "ui/ui_screens.h"
 #include "services/image_loader.h"
 #include "services/cover_manager.h"
+#include "services/eq.h"
+#include "services/system_status.h"
 #include "services/playback_controller.h"
 #include "services/audio_player.h"
 #include "services/net_client.h"
@@ -156,6 +158,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Эквалайзер: читает config/eq.cfg (нет файла = Off). */
+    eq_init();
+
     LOG_INIT();
     if (exit_on_stage(EXIT_STAGE_AFTER_LOGGER)) {
         return 0;
@@ -247,6 +252,31 @@ int main(int argc, char *argv[])
         u64 now_us;
 
         hal_input_poll(&input);
+
+        /* Кнопка ♪ (NOTE): переключение профилей эквалайзера везде. */
+        if (input.pressed & PSP_CTRL_NOTE) {
+            int p = eq_next_preset();
+            eq_save();
+            logLine("app: NOTE -> eq preset %d\n", p);
+        }
+
+        /* Громкость поверх системного максимума: VOL+ на 30/30 растит
+         * предусиление (+2 дБ, до +12), VOL- сначала сливает его.
+         * (ОС свои шаги тоже делает — это её сторону не отменяет.) */
+        if (input.pressed & (PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)) {
+            SystemStatusSnapshot vs;
+            system_status_get_snapshot(&vs);
+            if (input.pressed & PSP_CTRL_VOLUP) {
+                if (vs.volume_available && vs.volume_level >= 30 &&
+                    eq_get_preamp_db() < EQ_PREAMP_MAX_DB) {
+                    eq_set_preamp_db(eq_get_preamp_db() + EQ_PREAMP_STEP_DB);
+                    eq_save();
+                }
+            } else if (eq_get_preamp_db() > 0.0f) {
+                eq_set_preamp_db(eq_get_preamp_db() - EQ_PREAMP_STEP_DB);
+                eq_save();
+            }
+        }
 
         ui_screens_update(&s_app_state, &input);
         if (net_client_requires_process_exit()) {

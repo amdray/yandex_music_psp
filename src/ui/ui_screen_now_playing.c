@@ -4,6 +4,10 @@
 #include "hal/hal_fb.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
+#include "services/eq.h"
+#include "services/token_loader.h"
+#include "services/wave.h"
+#include "services/ym_api_like.h"
 #include "services/audio_cache.h"
 #include "services/audio_player.h"
 #include "services/cover_now_playing.h"
@@ -17,6 +21,7 @@
 #include <pspctrl.h>
 #include <pspgu.h>
 #include <pspkernel.h>
+#include <pspthreadman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -404,6 +409,100 @@ static int s_last_selected_index = -1;
 static char s_last_loaded_track_id[128] = {0};
 static int s_video_cover_requested = 0;
 
+/* --- Лайк треугольником (фон, без фриза UI) -------------------------------
+ * Метка "*" — локальный паритет на трек (предзагрузки всего сета лайков
+ * нет: ответ на 2500 треков не влезет в RAM). add/remove идемпотентны,
+ * поэтому паритет всегда сходится с сервером независимо от стартового
+ * состояния. Воркер одноразовый, подбирается в update(). */
+static SceUID s_like_tid = -1;
+static char s_like_token[256];
+static int s_like_uid = 0;
+static char s_like_track[40];
+static int s_like_target = 0;
+static char s_like_marked[40];
+static int s_like_marked_on = 0;
+
+static int like_worker(SceSize args, void *argp)
+{
+    YmApiContext ctx;
+
+    (void)args;
+    (void)argp;
+    ctx.oauth_token = s_like_token;
+    ctx.timeout_ms = 0;
+    logLine("like: post id='%s' like=%d\n", s_like_track, s_like_target);
+    if (ym_api_track_like(&ctx, s_like_uid, s_like_track,
+                          s_like_target) == 0) {
+        snprintf(s_like_marked, sizeof(s_like_marked), "%s", s_like_track);
+        s_like_marked_on = s_like_target;
+        logLine("like: ok id='%s' like=%d\n", s_like_track, s_like_target);
+    } else {
+        logLine("like: failed id='%s' like=%d\n", s_like_track, s_like_target);
+    }
+    logger_flush();
+    memset(s_like_token, 0, sizeof(s_like_token));
+    return 0;
+}
+
+static void like_reap(void)
+{
+    SceKernelThreadRunStatus st;
+
+    if (s_like_tid < 0) {
+        return;
+    }
+    st.size = sizeof(st);
+    if (sceKernelReferThreadRunStatus(s_like_tid, &st) == 0 &&
+        st.status == PSP_THREAD_STOPPED) {
+        sceKernelDeleteThread(s_like_tid);
+        s_like_tid = -1;
+    }
+}
+
+static int like_is_on(const char *track_id)
+{
+    return track_id && track_id[0] && s_like_marked_on &&
+           strcmp(s_like_marked, track_id) == 0;
+}
+
+static void like_request_toggle(AppState *state)
+{
+    const char *id = state->now_playing_track.id;
+    char token[256];
+
+    if (!id || !id[0] || state->currentUser.uid <= 0) {
+        return;
+    }
+    like_reap();
+    if (s_like_tid >= 0) {
+        logLine("like: busy, ignored\n");
+        return;  // прошлый POST ещё летит
+    }
+    if (token_loader_read(token, sizeof(token)) != 0) {
+        logLine("like: no token\n");
+        return;
+    }
+    snprintf(s_like_token, sizeof(s_like_token), "%s", token);
+    memset(token, 0, sizeof(token));
+    s_like_uid = state->currentUser.uid;
+    snprintf(s_like_track, sizeof(s_like_track), "%s", id);
+    s_like_target = like_is_on(id) ? 0 : 1;
+    s_like_tid = sceKernelCreateThread("like_worker", like_worker,
+                                       0x18, 32 * 1024, 0, NULL);
+    if (s_like_tid < 0) {
+        logLine("like: create thread failed 0x%08X\n", s_like_tid);
+        memset(s_like_token, 0, sizeof(s_like_token));
+        return;
+    }
+    if (sceKernelStartThread(s_like_tid, 0, NULL) < 0) {
+        logLine("like: start thread failed\n");
+        sceKernelDeleteThread(s_like_tid);
+        s_like_tid = -1;
+        memset(s_like_token, 0, sizeof(s_like_token));
+        return;
+    }
+}
+
 /* Pack the comma-separated artist names into the available column width.
  * Wrapping happens only between artists, so UTF-8 names are never split. */
 static float draw_artist_list(float x, float y, const char *artists,
@@ -459,6 +558,8 @@ void ui_screen_now_playing_update(AppState *state)
     const TrackEntry *track;
     AudioPlayerSnapshot audio;
 
+    like_reap();
+    wave_service();
     /* Keep state->now_playing_track in sync with the controller's current track.
      * Automatic advance (prefetch swap) updates g_playback.current_track but
      * not state->now_playing_track, which is only set on manual track selection. */
@@ -519,6 +620,8 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
 
     if (input->pressed & PSP_CTRL_SQUARE) {
         playback_controller_request_stop();
+    } else if (input->pressed & PSP_CTRL_TRIANGLE) {
+        like_request_toggle(state);
     } else if (input->pressed & PSP_CTRL_START) {
         playback_controller_request_toggle_pause();
     } else if (input->pressed & PSP_CTRL_RIGHT) {
@@ -612,11 +715,17 @@ void ui_screen_now_playing_render(const AppState *state)
     // Draw track info справа от обложки
     float text_y = text_y_start;
     
-    // 1. Название трека
+    // 1. Название трека ("*" — наш локальный паритет лайка)
     if (track->title[0]) {
-        snprintf(title_line, sizeof(title_line), "%s%s",
-                 track->title,
-                 track->explicit_content ? " [E]" : "");
+        if (like_is_on(track->id)) {
+            snprintf(title_line, sizeof(title_line), "* %s%s",
+                     track->title,
+                     track->explicit_content ? " [E]" : "");
+        } else {
+            snprintf(title_line, sizeof(title_line), "%s%s",
+                     track->title,
+                     track->explicit_content ? " [E]" : "");
+        }
         title_line[sizeof(title_line) - 1] = '\0';
         draw_marquee_parts(text_x, text_y, text_width,
                             title_line, text_color,
@@ -653,6 +762,14 @@ void ui_screen_now_playing_render(const AppState *state)
                      audio_player_state_label(player_snapshot.state),
                      text_color_secondary);
         text_y += text_line_height;
+
+        {
+            char eqline[48];
+            snprintf(eqline, sizeof(eqline), "EQ: %s",
+                     ui_common_eq_preset_name(eq_get_preset()));
+            ui_draw_text(text_x, text_y, eqline, text_color_secondary);
+            text_y += text_line_height;
+        }
 
         if (player_snapshot.duration_ms > 0) {
             draw_progress_bar(text_x, text_y,
@@ -695,5 +812,6 @@ void ui_screen_now_playing_render(const AppState *state)
 
     ui_common_draw_prompts(LOCALE_NOW_PLAYING_TOGGLE_PROMPT,
                            LOCALE_NOW_PLAYING_STOP_PROMPT,
+                           LOCALE_NOW_PLAYING_LIKE_PROMPT,
                            LOCALE_TRACK_BACK_PROMPT);
 }

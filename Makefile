@@ -16,6 +16,8 @@ OBJS = src/main.o \
        src/ui/ui_screen_artist_menu.o \
        src/ui/ui_screen_net_info.o \
        src/ui/ui_screen_device_login.o \
+       src/ui/ui_screen_wave.o \
+       src/ui/ui_screen_eq.o \
        src/hal/hal_input.o \
        src/hal/hal_gpu.o \
        src/hal/hal_fb.o \
@@ -31,6 +33,14 @@ OBJS = src/main.o \
        src/services/locale.o \
        src/services/token_loader.o \
        src/services/ya_auth.o \
+       src/services/last_play.o \
+       src/services/ym_api_like.o \
+       src/services/ym_api_albums.o \
+       src/services/ym_api_wave.o \
+       src/services/wave.o \
+       src/services/album_play.o \
+       src/services/eq.o \
+       src/services/qrcodegen.o \
        src/services/splash_flow.o \
        src/services/net_stack.o \
        src/services/net_activity.o \

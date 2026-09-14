@@ -23,4 +23,9 @@ void ui_common_draw_prompts_n(const LocaleKey *keys, int count);
     ui_common_draw_prompts_n((const LocaleKey[]){ __VA_ARGS__ }, \
         (int)(sizeof((const LocaleKey[]){ __VA_ARGS__ }) / sizeof(LocaleKey)))
 
+// Имя пресета эквалайзера (локализовано) + тост «EQ: ...» на 2.5 c
+// после смены (кнопка ♪ или экран). Рисовать каждый кадр поверх всего.
+const char *ui_common_eq_preset_name(int preset);
+void ui_common_draw_eq_toast(void);
+
 #endif

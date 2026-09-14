@@ -11,6 +11,7 @@
 #include "core/logger.h"
 #include "core/fs.h"
 #include "services/ya_auth.h"
+#include "services/qrcodegen.h"
 #include "services/net_client.h"
 #include "services/net_tls.h"
 
@@ -24,9 +25,60 @@ static volatile int s_cancel = 0;
 static volatile int s_applied = 0;
 static volatile int s_tries = 0;
 static volatile int s_lastrc = 0;
-static volatile int s_elapsed = 0;   // секунд с получения кодов
+static volatile unsigned long long s_codes_us = 0;  // когда получены коды
 static UserInfo s_user;
 static SceUID s_tid = -1;
+
+// QR ссылки для телефона (альтернатива ручному вводу адреса).
+// Кодируется один раз при получении кодов, рисуется из s_qr_data.
+#define QR_MAX_VERSION 10
+static uint8_t s_qr_tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+static uint8_t s_qr_data[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
+static int s_qr_size = 0;  // 0 = нет кода
+static char s_qr_text[160];  // полный URL для QR (страница + код)
+
+static void login_qr_encode(const char *text)
+{
+    s_qr_size = 0;
+    if (!text || !text[0]) {
+        return;
+    }
+    if (!qrcodegen_encodeText(text, s_qr_tmp, s_qr_data,
+                              qrcodegen_Ecc_MEDIUM, 1, QR_MAX_VERSION,
+                              qrcodegen_Mask_AUTO, true)) {
+        logLine("login: qr encode failed\n");
+        logger_flush();
+        return;
+    }
+    s_qr_size = qrcodegen_getSize(s_qr_data);
+    logLine("login: qr size=%d\n", s_qr_size);
+    logger_flush();
+}
+static void login_draw_qr(void)
+{
+    int r, c;
+    const int border = 4;
+    const int scale = 2;
+    const float y0 = 48.0f;
+    float box;
+    float x0;
+
+    if (s_qr_size <= 0) {
+        return;
+    }
+    box = (float)((s_qr_size + border * 2) * scale);
+    x0 = 472.0f - box;
+    ui_draw_rect(x0, y0, box, box, 0xFFFFFFFF);
+    for (r = 0; r < s_qr_size; r++) {
+        for (c = 0; c < s_qr_size; c++) {
+            if (qrcodegen_getModule(s_qr_data, c, r)) {
+                ui_draw_rect(x0 + (float)((border + c) * scale),
+                             y0 + (float)((border + r) * scale),
+                             (float)scale, (float)scale, 0xFF000000);
+            }
+        }
+    }
+}
 
 // Сон ломтиками, чтобы выход с экрана не ждал полный interval.
 static void login_sleep_s(int seconds)
@@ -35,6 +87,20 @@ static void login_sleep_s(int seconds)
     for (i = 0; i < seconds * 5 && !s_cancel; i++) {
         sceKernelDelayThread(200000);
     }
+}
+
+// Секунд с получения кодов (по часам — тикает каждый кадр, как у нас).
+static int login_elapsed_s(void)
+{
+    unsigned long long now;
+    if (!s_codes_ready || s_codes_us == 0) {
+        return 0;
+    }
+    now = sceKernelGetSystemTimeWide();
+    if (now < s_codes_us) {
+        return 0;
+    }
+    return (int)((now - s_codes_us) / 1000000ULL);
 }
 
 // Сохранить токен в формате token_loader (YANDEX_TOKEN = "...").
@@ -91,6 +157,7 @@ static int login_worker(SceSize args, void *argp)
 
     // Шаг 1: запрос кодов (как do_login_begin).
     s_codes_ready = 0;
+    s_qr_size = 0;
     r = ya_device_begin(s_device_id, &s_dc);
     if (r != 0) {
         snprintf(s_msg, sizeof(s_msg), "Не вышло (%d) %s", r, s_dc.err);
@@ -101,7 +168,13 @@ static int login_worker(SceSize args, void *argp)
         return 0;
     }
     s_codes_ready = 1;
-    s_elapsed = 0;
+    s_codes_us = sceKernelGetSystemTimeWide();
+    /* QR открывает страницу ввода кода. Полный URL с кодом (?user_code=)
+     * Яндекс игнорирует (проверено на железе) — сервер не отдаёт
+     * verification_uri_complete, поэтому префилла нет. */
+    snprintf(s_qr_text, sizeof(s_qr_text), "%s", s_dc.verify_url);
+    logLine("login: qr url=%s\n", s_qr_text);
+    login_qr_encode(s_qr_text);
     logLine("login: code ready, polling\n");
     logger_flush();
 
@@ -118,9 +191,8 @@ static int login_worker(SceSize args, void *argp)
         if (s_cancel) {
             break;
         }
-        s_elapsed += interval;
         // Коды протухли — дальше сервер скажет expired_token.
-        if (s_dc.expires_in > 0 && s_elapsed >= s_dc.expires_in) {
+        if (s_dc.expires_in > 0 && login_elapsed_s() >= s_dc.expires_in) {
             snprintf(s_msg, sizeof(s_msg), "Время вышло, повтори.");
             s_result = -1;
             break;
@@ -201,9 +273,10 @@ static void login_start_worker(void)
     s_result = -2;
     s_applied = 0;
     s_codes_ready = 0;
+    s_qr_size = 0;
     s_tries = 0;
     s_lastrc = 0;
-    s_elapsed = 0;
+    s_codes_us = 0;
     s_msg[0] = '\0';
     memset(&s_dc, 0, sizeof(s_dc));
     memset(&s_user, 0, sizeof(s_user));
@@ -276,7 +349,7 @@ void ui_screen_device_login_render(const AppState *state)
         ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_REQUEST), 0xFFFFFF00);
     } else if (s_codes_ready) {
         if (s_dc.expires_in > 0) {
-            left = s_dc.expires_in - s_elapsed;
+            left = s_dc.expires_in - login_elapsed_s();
             if (left < 0) {
                 left = 0;
             }
@@ -288,8 +361,9 @@ void ui_screen_device_login_render(const AppState *state)
         snprintf(line, sizeof(line), "%.20s", s_dc.user_code);
         ui_draw_text(100.0f, 116.0f, line, 0xFFFFFF00);
         snprintf(line, sizeof(line), locale_get(LOCALE_LOGIN_LEFT),
-                 left, s_tries, s_lastrc);
+                 left, s_tries);
         ui_draw_text(16.0f, 150.0f, line, 0xFFAAAAAA);
+        login_draw_qr();
     }
     if (s_msg[0]) {
         ui_draw_text(16.0f, 170.0f, s_msg, 0xFFFF4444);

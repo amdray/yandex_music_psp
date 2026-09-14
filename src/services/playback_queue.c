@@ -287,3 +287,52 @@ int playback_queue_get_info(PlaybackQueueInfo *out)
     out->source_id = s_queue.source_id;
     return 0;
 }
+
+int playback_queue_get_ids(ListIndexId *out, int max_count)
+{
+    int n, i;
+
+    if (!out || max_count <= 0 || !s_queue.ids || s_queue.count <= 0) {
+        return -1;
+    }
+    n = (s_queue.count < max_count) ? s_queue.count : max_count;
+    for (i = 0; i < n; i++) {
+        memcpy(out[i], s_queue.ids[i], sizeof(ListIndexId));
+    }
+    return n;
+}
+
+int playback_queue_append_ids(const ListIndexId *ids, int count)
+{
+    ListIndexId *grown_ids;
+    int *grown_order;
+    int new_count, i;
+
+    if (!s_queue.initialized || !ids || count <= 0) {
+        return -1;
+    }
+    if ((size_t)s_queue.count + (size_t)count > 512) {
+        return -1;  // волна не должна расти бесконечно
+    }
+    new_count = s_queue.count + count;
+    grown_ids = (ListIndexId *)realloc(s_queue.ids,
+        (size_t)new_count * sizeof(ListIndexId));
+    grown_order = (int *)realloc(s_queue.order,
+        (size_t)new_count * sizeof(int));
+    if (!grown_ids || !grown_order) {
+        // realloc при неудаче оставляет старые блоки целыми.
+        free(grown_ids);
+        free(grown_order);
+        return -1;
+    }
+    s_queue.ids = grown_ids;
+    s_queue.order = grown_order;
+    for (i = 0; i < count; i++) {
+        memcpy(s_queue.ids[s_queue.count + i], ids[i], sizeof(ListIndexId));
+        s_queue.order[s_queue.order_count + i] = s_queue.count + i;
+    }
+    s_queue.count = new_count;
+    s_queue.order_count = new_count;
+    logLine("pq: append %d ids, count=%d\n", count, new_count);
+    return 0;
+}

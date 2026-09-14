@@ -13,6 +13,7 @@
 #include "core/fs.h"
 #include "core/logger.h"
 #include "services/audio_cache.h"
+#include "services/eq.h"
 #include "services/audio_stream_buf.h"
 #include "services/net_http.h"
 #include "services/net_stack.h"
@@ -613,6 +614,7 @@ static int audio_player_worker(SceSize args, void *argp)
     }
     logLine("ap: sceMp3ReserveMp3Handle ok track_id='%s' handle=%d stream_end=%d\n",
             track.id, handle, stream_end);
+    eq_reset();  // новый трек: старые хвосты фильтров не щёлкают
 
     {
         int64_t required_bytes = 0;
@@ -780,6 +782,15 @@ static int audio_player_worker(SceSize args, void *argp)
             }
 
             sceKernelDcacheInvalidateRange(pcm_ptr, bytes_decoded);
+
+            /* Эквалайзер: правим PCM после декодера, до вывода.
+             * Изменённые строки отдаём обратно через writeback,
+             * иначе SRC-канал прочитает старые данные из RAM. */
+            if (eq_is_active()) {
+                eq_process(pcm_ptr, bytes_decoded / (2 * num_channels),
+                           num_channels, sampling_rate);
+                sceKernelDcacheWritebackInvalidateRange(pcm_ptr, bytes_decoded);
+            }
 
             if (!audio_reserved || reserved_bytes != bytes_decoded) {
                 int sample_count;

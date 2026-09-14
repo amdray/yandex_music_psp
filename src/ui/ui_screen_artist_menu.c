@@ -7,12 +7,17 @@
 #include "app/artist.h"
 #include "core/logger.h"
 #include "fonts/text.h"
+#include "services/album_play.h"
 #include "services/cover_manager.h"
 #include "services/locale.h"
 #include "services/net_client.h"
+#include "services/playback_controller.h"
+#include "services/playback_queue.h"
 #include "services/token_loader.h"
 #include "ui/ui_common.h"
 #include "ui/ui_draw.h"
+#include "ui/ui_screens.h"
+#include "ui/ui_screens.h"
 
 #define ARTIST_MENU_VISIBLE 6
 
@@ -20,6 +25,7 @@ static int s_tab = 0;      /* 0=albums, 1=also_albums */
 static int s_selected = 0;
 static int s_scroll = 0;
 static int s_generation = 0;
+static int s_open_err = 0;
 
 static void poll_artist_brief_result(AppState *state)
 {
@@ -97,8 +103,22 @@ void ui_screen_artist_menu_reset(void)
 
 void ui_screen_artist_menu_update(AppState *state)
 {
+    char first_id[40];
+    int rc;
+
     poll_artist_brief_result(state);
     start_artist_brief_fetch(state);
+    // Открытие альбома докатилось — в очередь и на плеер.
+    rc = album_play_poll(first_id, sizeof(first_id));
+    if (rc == 1) {
+        memset(&state->now_playing_track, 0, sizeof(state->now_playing_track));
+        snprintf(state->now_playing_track.id, sizeof(state->now_playing_track.id),
+                 "%s", first_id);
+        app_state_push(state, SCREEN_NOW_PLAYING);
+        playback_controller_request_play_current();
+    } else if (rc == -1) {
+        s_open_err = 1;
+    }
 }
 
 /* Navigation-gate hook: kick the brief-info load and report readiness
@@ -152,6 +172,58 @@ void ui_screen_artist_menu_handle_input(AppState *state, const InputState *input
             if (s_selected >= s_scroll + ARTIST_MENU_VISIBLE) {
                 s_scroll = s_selected - ARTIST_MENU_VISIBLE + 1;
             }
+        }
+    }
+    if (input->pressed & PSP_CTRL_CROSS) {
+        /* Открыть альбом: треки в очередь, дальше плеер сам. */
+        if (count > 0 && s_selected >= 0 && s_selected < count &&
+            !album_play_busy()) {
+            const ArtistAlbumEntry *list = (s_tab == 0) ? brief->albums
+                                                       : brief->also_albums;
+            int album_id = list[s_selected].album_id;
+            char token[256];
+            if (album_id > 0 &&
+                token_loader_read(token, sizeof(token)) == 0) {
+                logLine("artist_menu: open album_id=%d\n", album_id);
+                album_play_start(token, album_id);
+                memset(token, 0, sizeof(token));
+                s_open_err = 0;
+            }
+        }
+    }
+    if (input->pressed & PSP_CTRL_SQUARE) {
+        /* Играть топ треков исполнителя (popular_tracks из brief-info).
+         * Метаданные подтянет штатный PENDING-механизм очереди. */
+        if (state->artist_brief_loading == 2 &&
+            brief->popular_track_count > 0) {
+            ListIndexId ids[ARTIST_MAX_POPULAR_TRACKS];
+            int n = brief->popular_track_count;
+            int i;
+            if (n > ARTIST_MAX_POPULAR_TRACKS) {
+                n = ARTIST_MAX_POPULAR_TRACKS;
+            }
+            for (i = 0; i < n; i++) {
+                snprintf(ids[i], sizeof(ids[i]), "%d",
+                         brief->popular_tracks[i].track_id);
+            }
+            if (playback_queue_set_from_ids(ids, n, 0,
+                                            PLAYBACK_QUEUE_SOURCE_ARTIST,
+                                            brief->artist_id,
+                                            s_generation) == 0) {
+                logLine("artist_menu: play top n=%d artist_id=%d\n",
+                        n, brief->artist_id);
+                memset(&state->now_playing_track, 0,
+                       sizeof(state->now_playing_track));
+                snprintf(state->now_playing_track.id,
+                         sizeof(state->now_playing_track.id), "%d",
+                         brief->popular_tracks[0].track_id);
+                app_state_push(state, SCREEN_NOW_PLAYING);
+                playback_controller_request_play_current();
+            } else {
+                logLine("artist_menu: queue set failed\n");
+            }
+        } else {
+            logLine("artist_menu: play ignored, no popular tracks\n");
         }
     }
 }
@@ -252,5 +324,6 @@ void ui_screen_artist_menu_render(const AppState *state)
         }
     }
 
-    ui_common_draw_prompts(LOCALE_PLAYLIST_BACK_PROMPT, LOCALE_PLAYLIST_TAB_PROMPT);
+    ui_common_draw_prompts(LOCALE_PLAYLIST_BACK_PROMPT, LOCALE_PLAYLIST_TAB_PROMPT,
+                           LOCALE_ARTIST_PLAY_PROMPT, LOCALE_ALBUM_OPEN_PROMPT);
 }

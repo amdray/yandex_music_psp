@@ -8,7 +8,8 @@ typedef enum {
     PLAYBACK_QUEUE_SOURCE_NONE = 0,
     PLAYBACK_QUEUE_SOURCE_ALBUM,
     PLAYBACK_QUEUE_SOURCE_PLAYLIST,
-    PLAYBACK_QUEUE_SOURCE_FLOW
+    PLAYBACK_QUEUE_SOURCE_FLOW,
+    PLAYBACK_QUEUE_SOURCE_ARTIST
 } PlaybackQueueSource;
 
 typedef enum {
@@ -58,5 +59,11 @@ int playback_queue_move_next(void);
 int playback_queue_move_previous(void);
 
 int playback_queue_get_info(PlaybackQueueInfo *out);
+
+/* Копия id очереди для сохранения (last_play). Возврат: число записанных. */
+int playback_queue_get_ids(ListIndexId *out, int max_count);
+
+/* Дописать id в конец (волна: подгрузка следующей пачки). Возврат 0 = ок. */
+int playback_queue_append_ids(const ListIndexId *ids, int count);
 
 #endif

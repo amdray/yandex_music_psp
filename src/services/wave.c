@@ -491,6 +491,26 @@ void wave_dismiss_screen(void)
     }
 }
 
+void wave_restore_session(const char *session_id, int terminated)
+{
+    if (!session_id || !session_id[0]) {
+        return;
+    }
+    s_generation++;
+    if (s_generation == 0) {
+        s_generation = 1;
+    }
+    memset(&s_session, 0, sizeof(s_session));
+    s_session.active = 1;
+    s_session.generation = s_generation;
+    snprintf(s_session.radio_session_id, sizeof(s_session.radio_session_id),
+             "%s", session_id);
+    s_session.terminated = terminated ? 1 : 0;
+    s_unknown_session = 0;
+    logLine("wave: session restored term=%d\n", s_session.terminated);
+    logger_flush();
+}
+
 int wave_is_active(void)
 {
     return (s_session.active && !s_unknown_session) ? 1 : 0;

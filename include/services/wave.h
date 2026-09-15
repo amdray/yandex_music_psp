@@ -59,6 +59,9 @@ void wave_service(void);
 void wave_reset(void);
 /* Уход с экрана без убийства сессии (см. wave.c). */
 void wave_dismiss_screen(void);
+/* Восстановить сессию после ребута (lastplay v2): активна с данным
+ * radio_session_id, generation свежая. Пустой id игнорируется. */
+void wave_restore_session(const char *session_id, int terminated);
 
 /* Session introspection for the controller/reporter (0 ok, -1 inactive). */
 int wave_is_active(void);

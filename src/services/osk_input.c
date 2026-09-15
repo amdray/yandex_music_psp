@@ -1,16 +1,6 @@
-// Блокирующий ввод через системную OSK, адаптирован из psp_yandex
-// (native/ui.c: ui_input) без зависимостей от приложения.
-//
-// Интеграция с главным циклом: эта функция вызывается из контекста
-// update/input-хендлера (как on_enter/handle_input экранов) — т.е. ВНЕ
-// sceGu-кадра (hal_gpu_begin/end_frame обрамляют только render).
-// Поэтому внутри НЕТ вызовов sceGu: открытый display list был бы
-// повреждён диалогом утилиты. Кадр только один:
-//   sceGuSync(FINISH)      — дождаться GE до передачи дисплея утилите,
-//   sceGuDisplay(GU_FALSE) — отдать экран диалогу,
-//   цикл sceDisplayWaitVblankStart + sceUtilityOskUpdate (как в референсе),
-//   sceGuDisplay(GU_TRUE)  — вернуть экран приложению,
-//   invalidate кэшированного GE-состояния hal (текстуры/ножницы).
+// Блокирующий ввод через системную OSK, как в рабочем psp_yandex
+// (native/ui.c: ui_input): БЕЗ sceGuDisplay — диалог рисует сам поверх
+// текущего кадра. Вызывается из update/input-хендлеров (ВНЕ sceGu-кадра).
 // Вызов внутри кадра запрещён: вернёт -1 (проверка hal_gpu_in_frame()).
 #include "services/osk_input.h"
 
@@ -178,24 +168,23 @@ int osk_input_text(const char *title, const char *initial,
     if (init_rc < 0) {
         return -1;
     }
-    // Отдаём дисплей диалогу на время цикла (состояние — как в hal_gpu_init:
-    // приложение всегда работает с sceGuDisplay(GU_TRUE)).
-    sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
-    sceGuDisplay(GU_FALSE);
+    /* Как в рабочем psp_yandex: БЕЗ sceGuDisplay — гашение дисплея
+     * здесь давало чёрный экран и вечный цикл (и в эмуляторе, и на
+     * железе). Диалог рисует поверх текущего кадра сам. */
     {
         unsigned iter = 0;
-        while (sceUtilityOskGetStatus() != PSP_UTILITY_DIALOG_NONE) {
+        int st = 0;
+        while ((st = sceUtilityOskGetStatus()) != PSP_UTILITY_DIALOG_NONE) {
             sceDisplayWaitVblankStart();
             sceUtilityOskUpdate(1);
             if (++iter % 600 == 0) {
-                logLine("osk: still in dialog iter=%u\n", iter);
+                logLine("osk: still in dialog iter=%u st=%d\n", iter, st);
                 logger_flush();
             }
         }
         logLine("osk: dialog done iter=%u\n", iter);
         logger_flush();
     }
-    sceGuDisplay(GU_TRUE);
     // Утилита могла сменить GE-контекст: сбросить кэшированное состояние hal,
     // чтобы следующий кадр переизлучил его заново.
     hal_gpu_invalidate_tex_state();

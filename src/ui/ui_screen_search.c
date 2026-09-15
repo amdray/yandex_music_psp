@@ -12,6 +12,7 @@
 
 #include "app/app_state.h"
 #include "core/logger.h"
+#include "fonts/text.h"
 #include "services/locale.h"
 #include "services/net_tls.h"
 #include "services/osk_input.h"
@@ -321,9 +322,14 @@ void ui_screen_search_render(const AppState *state)
     (void)state;
     ui_draw_clear(0xFF1A1A1A);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_SEARCH));
-    snprintf(line, sizeof(line), "%.100s",
-             s_has_query ? s_query : "...");
-    ui_draw_text(16.0f, 30.0f, line, 0xFFBBBBBB);
+    if (s_has_query) {
+        // Запрос — справа от заголовка, чтобы не налезать на него.
+        char q[48];
+        float w;
+        snprintf(q, sizeof(q), "%.40s", s_query);
+        w = text_measure_width(q);
+        ui_draw_text(464.0f - w, 24.0f, q, 0xFFBBBBBB);
+    }
 
     if (s_status == 1) {
         ui_draw_text(16.0f, 52.0f, "...", 0xFF00D5FF);

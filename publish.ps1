@@ -9,7 +9,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Out = Join-Path (Split-Path -Parent $Repo) "YMPSP-publish\$Version"
+# Папка рядом с amdray: Desktop\psp\YMPSP-publish\<ver> (вне репозитория).
+$Out = Join-Path (Split-Path -Parent (Split-Path -Parent $Repo)) "YMPSP-publish\$Version"
 
 Write-Host "== build =="
 & C:\tools\msys64\usr\bin\bash.exe -lc 'export PSPDEV=/c/pspdev; export PATH=$PSPDEV/bin:/usr/local/bin:/usr/bin:/bin; cd /c/Users/Tsifrokayf/Desktop/psp/amdray/yandex_music_psp; make'
@@ -28,8 +29,11 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 Write-Host "== source zip (git archive) =="
 $srcZip = Join-Path $Out "YMPSP-src-$Version.zip"
-& C:\tools\msys64\usr\bin\bash.exe -lc "cd /c/Users/Tsifrokayf/Desktop/psp/amdray/yandex_music_psp && git archive --format=zip --output=`"$srcZip`" HEAD"
+$srcZipFs = ($srcZip -replace '\\','/')
+$acmd = 'cd /c/Users/Tsifrokayf/Desktop/psp/amdray/yandex_music_psp && git archive --format=zip --output=' + $srcZipFs + ' HEAD'
+& C:\tools\msys64\usr\bin\bash.exe -lc $acmd
 if ($LASTEXITCODE -ne 0) { throw "git archive failed (uncommitted files?)" }
+if (-not (Test-Path $srcZip)) { throw "src zip missing after git archive" }
 
 Write-Host "== release zip =="
 $relZip = Join-Path $Out "YMPSP-$Version.zip"

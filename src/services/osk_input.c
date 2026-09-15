@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "hal/hal_gpu.h"
+#include "core/logger.h"
 
 #define OSK_INTEXT_MAX 256
 #define OSK_DESC_MAX 64
@@ -171,16 +172,28 @@ int osk_input_text(const char *title, const char *initial,
     params.datacount = 1;
     params.data = &data;
 
-    if (sceUtilityOskInitStart(&params) < 0) {
+    int init_rc = sceUtilityOskInitStart(&params);
+    logLine("osk: init rc=%d\n", init_rc);
+    logger_flush();
+    if (init_rc < 0) {
         return -1;
     }
     // Отдаём дисплей диалогу на время цикла (состояние — как в hal_gpu_init:
     // приложение всегда работает с sceGuDisplay(GU_TRUE)).
     sceGuSync(GU_SYNC_FINISH, GU_SYNC_WHAT_DONE);
     sceGuDisplay(GU_FALSE);
-    while (sceUtilityOskGetStatus() != PSP_UTILITY_DIALOG_NONE) {
-        sceDisplayWaitVblankStart();
-        sceUtilityOskUpdate(1);
+    {
+        unsigned iter = 0;
+        while (sceUtilityOskGetStatus() != PSP_UTILITY_DIALOG_NONE) {
+            sceDisplayWaitVblankStart();
+            sceUtilityOskUpdate(1);
+            if (++iter % 600 == 0) {
+                logLine("osk: still in dialog iter=%u\n", iter);
+                logger_flush();
+            }
+        }
+        logLine("osk: dialog done iter=%u\n", iter);
+        logger_flush();
     }
     sceGuDisplay(GU_TRUE);
     // Утилита могла сменить GE-контекст: сбросить кэшированное состояние hal,
@@ -189,8 +202,12 @@ int osk_input_text(const char *title, const char *initial,
     hal_gpu_invalidate_scissor();
 
     if (data.result != PSP_UTILITY_OSK_RESULT_CHANGED) {
+        logLine("osk: result=%d (not changed)\n", data.result);
+        logger_flush();
         return -2;
     }
     osk_u16_to_u8(outtext, out, out_size);
+    logLine("osk: ok len=%d\n", (int)strlen(out));
+    logger_flush();
     return 0;
 }

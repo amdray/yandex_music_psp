@@ -786,13 +786,6 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
         playback_controller_request_stop();
     } else if (input->pressed & PSP_CTRL_TRIANGLE) {
         like_request_toggle(state);
-    } else if (input->pressed & PSP_CTRL_LTRIGGER) {
-        /* Кнопка ♪ (NOTE) на этом железе молчит — профили крутят L/R. */
-        eq_prev_preset();
-        eq_save();
-    } else if (input->pressed & PSP_CTRL_RTRIGGER) {
-        eq_next_preset();
-        eq_save();
     } else if (input->pressed & PSP_CTRL_START) {
         playback_controller_request_toggle_pause();
     } else if (input->pressed & PSP_CTRL_RIGHT) {
@@ -1049,7 +1042,9 @@ void ui_screen_now_playing_render(const AppState *state)
                (unsigned long long)sceKernelGetSystemTimeWide() < s_hint_until) {
         const char *hint = locale_get(LOCALE_SELECT_HOLD_HINT);
         float w = text_measure_width(hint);
-        ui_draw_text(((float)480 - w) * 0.5f, 200.0f, hint, 0xFF00D5FF);
+        float hx = ((float)480 - w) * 0.5f;
+        ui_draw_rect(hx - 10.0f, 228.0f, w + 20.0f, 24.0f, 0xDD1A1A1A);
+        ui_draw_text(hx, 234.0f, hint, 0xFF00D5FF);
     } else {
         s_hint_until = 0;
     }

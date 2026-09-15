@@ -2,6 +2,7 @@
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
 #include "ui/ui_screens.h"
+#include "ui/ui_wave_carousel.h"
 #include "hal/hal_fb.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
@@ -660,6 +661,7 @@ void ui_screen_now_playing_update(AppState *state)
 
     like_reap();
     wave_service();
+    carousel_update(state);
     /* Keep state->now_playing_track in sync with the controller's current track.
      * Automatic advance (prefetch swap) updates g_playback.current_track but
      * not state->now_playing_track, which is only set on manual track selection. */
@@ -778,11 +780,20 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
         return;  // остальное молчит, пока открыто меню
     }
 
+    if (carousel_is_open()) {
+        carousel_input(state, input);
+        return;
+    }
+
     if (input->pressed & PSP_CTRL_CIRCLE) {
         ui_screens_pop_screen(state);
         return;
     }
-    if (input->pressed & PSP_CTRL_SQUARE) {
+    if (input->pressed & PSP_CTRL_CROSS) {
+        if (state->now_playing_track.id[0]) {
+            carousel_open(state);
+        }
+    } else if (input->pressed & PSP_CTRL_SQUARE) {
         playback_controller_request_stop();
     } else if (input->pressed & PSP_CTRL_TRIANGLE) {
         like_request_toggle(state);
@@ -1048,4 +1059,6 @@ void ui_screen_now_playing_render(const AppState *state)
     } else {
         s_hint_until = 0;
     }
+
+    carousel_render(state);
 }

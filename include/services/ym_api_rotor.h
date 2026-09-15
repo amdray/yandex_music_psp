@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "services/ym_api_types.h"
+#include "services/wave.h"
 #include "app/track.h"
 
 /* Yandex Rotor wave backend (MY_WAVE_INTEGRATION.md sections 1-11, except
@@ -165,5 +166,13 @@ int ym_api_rotor_exchange_music_token(YmApiContext *ctx,
 
 /* Same as above when only the uid is needed. 0 on success. */
 int ym_api_rotor_resolve_uid(YmApiContext *ctx, int *out_uid);
+
+/* GET /albums/{album_id}/similar-entities, keep result.items[] with
+ * type=="wave_agent_item" in server order (cap max_cards, >=0 returned,
+ * negative verdict on error). Cards without wave.seeds are dropped.
+ * Raster/animation URIs are stored verbatim (%% template kept). */
+#define YM_ROTOR_CARDS_MAX 8
+int ym_api_rotor_album_wave_cards(YmApiContext *ctx, int album_id,
+                                  WaveCarouselItem *out_cards, int max_cards);
 
 #endif

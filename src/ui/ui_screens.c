@@ -38,6 +38,7 @@
 #include "ui/ui_screen_wave.h"
 #include "ui/ui_screen_search.h"
 #include "ui/ui_screen_help.h"
+#include "ui/ui_wave_carousel.h"
 #include "ui/ui_common.h"
 
 static void *s_splash_pixels = NULL;
@@ -108,6 +109,7 @@ static void playlist_list_on_exit(AppState *state)
 static void now_playing_on_exit(AppState *state)
 {
     (void)state;
+    carousel_close();
     ui_screen_now_playing_release_video();
 }
 

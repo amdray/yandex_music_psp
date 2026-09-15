@@ -951,3 +951,134 @@ int ym_api_rotor_exchange_music_token(YmApiContext *ctx,
     logger_flush();
     return 0;
 }
+
+static void rotor_copy_text(const cJSON *node, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (cJSON_IsString(node) && node->valuestring) {
+        snprintf(dst, dst_size, "%s", node->valuestring);
+    }
+}
+
+int ym_api_rotor_album_wave_cards(YmApiContext *ctx, int album_id,
+                                  WaveCarouselItem *out_cards, int max_cards)
+{
+    NetHttpResponse resp;
+    char url[160];
+    cJSON *root = NULL, *result, *items;
+    int n = 0, i, count;
+
+    if (rotor_check_context(ctx) != 0 || album_id <= 0 ||
+        !out_cards || max_cards <= 0) {
+        return YM_ROTOR_ERR;
+    }
+    if (max_cards > YM_ROTOR_CARDS_MAX) {
+        max_cards = YM_ROTOR_CARDS_MAX;
+    }
+    snprintf(url, sizeof(url), "%s/albums/%d/similar-entities",
+             ROTOR_HOST, album_id);
+    memset(&resp, 0, sizeof(resp));
+    {
+        int req_rc = http_request(&(HttpRequest){
+            .method = HTTP_GET,
+            .url = url,
+            .token = ctx->oauth_token,
+            .initial_buffer = HTTP_TLS_BUFFER_MEDIUM,
+        }, &resp);
+        if (req_rc != 0) {
+            net_http_response_free(&resp);
+            return rotor_transport_verdict(req_rc);
+        }
+    }
+    if (resp.status_code != 200 || !resp.body || resp.body_size <= 0) {
+        int v = rotor_status_verdict(resp.status_code);
+        net_http_response_free(&resp);
+        return v;
+    }
+    root = cJSON_Parse(resp.body);
+    net_http_response_free(&resp);
+    if (!root) {
+        return YM_ROTOR_ERR;
+    }
+    result = cJSON_GetObjectItemCaseSensitive(root, "result");
+    items = cJSON_IsObject(result)
+        ? cJSON_GetObjectItemCaseSensitive(result, "items") : NULL;
+    if (!cJSON_IsArray(items)) {
+        cJSON_Delete(root);
+        return YM_ROTOR_ERR;
+    }
+    count = cJSON_GetArraySize(items);
+    for (i = 0; i < count && n < max_cards; i++) {
+        cJSON *e = cJSON_GetArrayItem(items, i);
+        cJSON *type, *data, *wave, *agent, *seeds;
+        WaveCarouselItem *o;
+        int si, scount;
+        if (!cJSON_IsObject(e)) {
+            continue;
+        }
+        type = cJSON_GetObjectItemCaseSensitive(e, "type");
+        if (!cJSON_IsString(type) || !type->valuestring ||
+            strcmp(type->valuestring, "wave_agent_item") != 0) {
+            continue;
+        }
+        data = cJSON_GetObjectItemCaseSensitive(e, "data");
+        wave = cJSON_IsObject(data)
+            ? cJSON_GetObjectItemCaseSensitive(data, "wave") : NULL;
+        if (!cJSON_IsObject(wave)) {
+            continue;
+        }
+        seeds = cJSON_GetObjectItemCaseSensitive(wave, "seeds");
+        if (!cJSON_IsArray(seeds) || cJSON_GetArraySize(seeds) <= 0) {
+            continue;  // карточка без seeds не отображается
+        }
+        o = &out_cards[n];
+        memset(o, 0, sizeof(*o));
+        rotor_copy_text(cJSON_GetObjectItemCaseSensitive(wave, "name"),
+                        o->name, sizeof(o->name));
+        rotor_copy_text(cJSON_GetObjectItemCaseSensitive(wave, "description"),
+                        o->description, sizeof(o->description));
+        scount = cJSON_GetArraySize(seeds);
+        if (scount > 4) {
+            scount = 4;
+        }
+        for (si = 0; si < scount; si++) {
+            cJSON *s = cJSON_GetArrayItem(seeds, si);
+            if (cJSON_IsString(s) && s->valuestring) {
+                snprintf(o->seeds[o->seed_count], sizeof(o->seeds[0]),
+                         "%s", s->valuestring);
+                o->seed_count++;
+            }
+        }
+        if (o->seed_count <= 0) {
+            continue;
+        }
+        agent = cJSON_IsObject(data)
+            ? cJSON_GetObjectItemCaseSensitive(data, "agent") : NULL;
+        if (cJSON_IsObject(agent)) {
+            cJSON *cover, *entity;
+            rotor_copy_text(
+                cJSON_GetObjectItemCaseSensitive(agent, "animationUri"),
+                o->animation_uri, sizeof(o->animation_uri));
+            cover = cJSON_GetObjectItemCaseSensitive(agent, "cover");
+            if (cJSON_IsObject(cover)) {
+                rotor_copy_text(
+                    cJSON_GetObjectItemCaseSensitive(cover, "uri"),
+                    o->cover_uri, sizeof(o->cover_uri));
+            }
+            entity = cJSON_GetObjectItemCaseSensitive(agent, "entity");
+            if (cJSON_IsObject(entity)) {
+                rotor_copy_text(
+                    cJSON_GetObjectItemCaseSensitive(entity, "type"),
+                    o->entity_type, sizeof(o->entity_type));
+            }
+        }
+        n++;
+    }
+    cJSON_Delete(root);
+    logLine("ym_rotor: similar cards=%d album=%d\n", n, album_id);
+    logger_flush();
+    return n;
+}

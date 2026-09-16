@@ -11,6 +11,7 @@
 #include "services/wave.h"
 #include "services/ym_api.h"
 #include "services/ym_api_like.h"
+#include "services/ym_api_rotor.h"
 #include "services/audio_cache.h"
 #include "services/audio_player.h"
 #include "services/cover_now_playing.h"
@@ -465,6 +466,16 @@ static int s_like_target = 0;
 static char s_like_marked[40];
 static int s_like_marked_on = 0;
 
+/* Дизлайк (4-я строка дропдауна): библиотечный dislike + переход дальше.
+ * Обычный лайк при этом снимается локально (сервер тоже снимет). */
+static SceUID s_dis_tid = -1;
+static char s_dis_token[256];
+static int s_dis_uid = 0;
+static char s_dis_track[40];
+static volatile int s_dis_done = 0;
+
+static void dis_request_dislike(AppState *state);
+
 static int like_worker(SceSize args, void *argp)
 {
     YmApiContext ctx;
@@ -511,7 +522,7 @@ static int like_is_on(const char *track_id)
 /* Дропдаун на удержание SELECT: качество, эквалайзер, усиление.
  * Короткое нажатие — только подсказка. */
 #define DD_HOLD_US 700000ULL
-#define DD_ROWS 3
+#define DD_ROWS 4
 static int s_dd_open = 0;
 static int s_dd_sel = 0;
 static unsigned long long s_sel_t0 = 0;
@@ -528,7 +539,7 @@ static int s_nav_dir = 0;
 static int s_nav_seeking = 0;
 static unsigned long long s_nav_last = 0;
 
-static void dd_adjust(int dir)
+static void dd_adjust(AppState *state, int dir)
 {
     if (s_dd_sel == 0) {
         const char *q = ym_api_download_quality();
@@ -543,9 +554,11 @@ static void dd_adjust(int dir)
             eq_prev_preset();
         }
         eq_save();
-    } else {
+    } else if (s_dd_sel == 2) {
         eq_set_preamp_db(eq_get_preamp_db() + (float)dir * EQ_PREAMP_STEP_DB);
         eq_save();
+    } else {
+        dis_request_dislike(state);
     }
 }
 
@@ -559,10 +572,13 @@ static void dd_row_text(int row, char *out, int out_size)
         snprintf(out, out_size, "%s: %s",
                  locale_get(LOCALE_EQ_TITLE),
                  ui_common_eq_preset_name(eq_get_preset()));
-    } else {
+    } else if (row == 2) {
         snprintf(out, out_size, "%s: +%ddB",
                  locale_get(LOCALE_DD_GAIN),
                  (int)(eq_get_preamp_db() + 0.5f));
+    } else {
+        snprintf(out, out_size, "%s",
+                 locale_get(LOCALE_DD_DISLIKE));
     }
 }
 
@@ -600,6 +616,83 @@ static void like_request_toggle(AppState *state)
         sceKernelDeleteThread(s_like_tid);
         s_like_tid = -1;
         memset(s_like_token, 0, sizeof(s_like_token));
+        return;
+    }
+}
+
+static int dis_worker(SceSize args, void *argp)
+{
+    YmApiContext ctx;
+
+    (void)args;
+    (void)argp;
+    ctx.oauth_token = s_dis_token;
+    ctx.timeout_ms = 0;
+    logLine("dislike: post id='%s'\n", s_dis_track);
+    if (ym_api_track_dislike(&ctx, s_dis_uid, s_dis_track) == 0) {
+        // Лайк снят и локально (сервер тоже снимет).
+        if (strcmp(s_like_marked, s_dis_track) == 0) {
+            s_like_marked_on = 0;
+        }
+        s_dis_done = 1;
+        logLine("dislike: ok id='%s'\n", s_dis_track);
+    } else {
+        logLine("dislike: failed id='%s'\n", s_dis_track);
+    }
+    logger_flush();
+    memset(s_dis_token, 0, sizeof(s_dis_token));
+    return 0;
+}
+
+static void dis_reap(void)
+{
+    SceKernelThreadRunStatus st;
+
+    if (s_dis_tid < 0) {
+        return;
+    }
+    st.size = sizeof(st);
+    if (sceKernelReferThreadRunStatus(s_dis_tid, &st) == 0 &&
+        st.status == PSP_THREAD_STOPPED) {
+        sceKernelDeleteThread(s_dis_tid);
+        s_dis_tid = -1;
+    }
+}
+
+static void dis_request_dislike(AppState *state)
+{
+    const char *id = state->now_playing_track.id;
+    char token[256];
+
+    if (!id || !id[0] || state->currentUser.uid <= 0) {
+        return;
+    }
+    dis_reap();
+    if (s_dis_tid >= 0) {
+        logLine("dislike: busy, ignored\n");
+        return;
+    }
+    if (token_loader_read(token, sizeof(token)) != 0) {
+        logLine("dislike: no token\n");
+        return;
+    }
+    snprintf(s_dis_token, sizeof(s_dis_token), "%s", token);
+    memset(token, 0, sizeof(token));
+    s_dis_uid = state->currentUser.uid;
+    snprintf(s_dis_track, sizeof(s_dis_track), "%s", id);
+    s_dis_done = 0;
+    s_dis_tid = sceKernelCreateThread("dis_worker", dis_worker,
+                                      0x18, 32 * 1024, 0, NULL);
+    if (s_dis_tid < 0) {
+        logLine("dislike: create thread failed 0x%08X\n", s_dis_tid);
+        memset(s_dis_token, 0, sizeof(s_dis_token));
+        return;
+    }
+    if (sceKernelStartThread(s_dis_tid, 0, NULL) < 0) {
+        logLine("dislike: start thread failed\n");
+        sceKernelDeleteThread(s_dis_tid);
+        s_dis_tid = -1;
+        memset(s_dis_token, 0, sizeof(s_dis_token));
         return;
     }
 }
@@ -660,8 +753,14 @@ void ui_screen_now_playing_update(AppState *state)
     AudioPlayerSnapshot audio;
 
     like_reap();
+    dis_reap();
     wave_service();
     carousel_update(state);
+    // Дизлайк улетел — переходим дальше (как требует спека).
+    if (s_dis_done) {
+        s_dis_done = 0;
+        playback_controller_request_next();
+    }
     /* Keep state->now_playing_track in sync with the controller's current track.
      * Automatic advance (prefetch swap) updates g_playback.current_track but
      * not state->now_playing_track, which is only set on manual track selection. */
@@ -767,11 +866,11 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
             s_dd_sel = (s_dd_sel + 1) % DD_ROWS;
         }
         if (input->pressed & PSP_CTRL_LEFT) {
-            dd_adjust(-1);
+            dd_adjust(state, -1);
         }
         if ((input->pressed & PSP_CTRL_RIGHT) ||
             (input->pressed & PSP_CTRL_CROSS)) {
-            dd_adjust(+1);
+            dd_adjust(state, +1);
         }
         if (input->pressed & PSP_CTRL_CIRCLE) {
             s_dd_open = 0;

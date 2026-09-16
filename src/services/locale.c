@@ -72,6 +72,7 @@ static const char *s_locale_strings[LOCALE_COUNT][LOCALE_LANG_COUNT] = {
     [LOCALE_SELECT_HOLD_HINT] = { "Hold SELECT: menu", "Удерживайте SELECT: меню" },
     [LOCALE_DD_QUALITY] = { "Quality", "Качество" },
     [LOCALE_DD_GAIN] = { "Boost", "Усиление" },
+    [LOCALE_DD_DISLIKE] = { "Dislike", "Не рекомендовать" },
     
     // Albums
     [LOCALE_ALBUM_OPEN_PROMPT] = { "X: open album", "X: открыть альбом" },

@@ -67,6 +67,7 @@ typedef enum {
     LOCALE_SELECT_HOLD_HINT,
     LOCALE_DD_QUALITY,
     LOCALE_DD_GAIN,
+    LOCALE_DD_DISLIKE,
     
     // Albums
     LOCALE_ALBUM_OPEN_PROMPT,

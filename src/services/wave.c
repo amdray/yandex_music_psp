@@ -24,6 +24,29 @@
 #define WAVE_WORKER_PRIORITY 0x18
 #define WAVE_WORKER_STACK (64 * 1024)
 #define WAVE_REFILL_RETRY_US 5000000ULL
+#define WAVE_REFILL_BACKOFF_MAX_US 60000000ULL
+
+/* Растущий бэкофф рефилла (5с -> 60с потолок): дохлая сеть/сдохшая
+ * сессия не должна жечь батарею TLS-хендшейками каждые 5 секунд.
+ * Сброс — при постановке новой задачи и при успехе. */
+static u64 s_refill_backoff_us = 0;
+
+static u64 wave_refill_backoff_next(void)
+{
+    u64 cur;
+
+    if (s_refill_backoff_us < WAVE_REFILL_RETRY_US) {
+        s_refill_backoff_us = WAVE_REFILL_RETRY_US;
+    }
+    cur = s_refill_backoff_us;
+    if (s_refill_backoff_us < WAVE_REFILL_BACKOFF_MAX_US) {
+        s_refill_backoff_us *= 2;
+        if (s_refill_backoff_us > WAVE_REFILL_BACKOFF_MAX_US) {
+            s_refill_backoff_us = WAVE_REFILL_BACKOFF_MAX_US;
+        }
+    }
+    return (u64)sceKernelGetSystemTimeWide() + cur;
+}
 
 static SceUID s_tid = -1;
 static char s_token[256];
@@ -101,10 +124,22 @@ static int wave_worker(SceSize args, void *argp)
 
     (void)args;
     (void)argp;
-    snprintf(token_copy, sizeof(token_copy), "%s", s_token);
+    mode = s_mode;
+    /* Свежий токен из файла, s_token — запасной: после restore
+     * из lastplay s_token пуст, а сессия жива. Без токена — сразу
+     * провал без сети (раньше молча падало в валидации). */
+    if (wave_current_token(token_copy, sizeof(token_copy)) != 0) {
+        logLine("wave: worker no token mode=%d\n", mode);
+        logger_flush();
+        if (mode == 1) {
+            s_state = -1;
+        } else {
+            s_refill_retry_after_us = wave_refill_backoff_next();
+        }
+        return 0;
+    }
     api_ctx.oauth_token = token_copy;
     api_ctx.timeout_ms = 0;
-    mode = s_mode;
 
     if (mode == 1) {
         const char *seeds[YM_ROTOR_SEEDS_MAX];
@@ -166,8 +201,7 @@ static int wave_worker(SceSize args, void *argp)
                 s_refill_ready = 1;
                 logLine("wave: refill unknown session\n");
             } else {
-                s_refill_retry_after_us =
-                    (u64)sceKernelGetSystemTimeWide() + WAVE_REFILL_RETRY_US;
+                s_refill_retry_after_us = wave_refill_backoff_next();
                 logLine("wave: refill failed, backoff\n");
             }
             logger_flush();
@@ -182,6 +216,7 @@ static int wave_worker(SceSize args, void *argp)
         s_refill_unknown = 0;
         s_refill_result_generation = s_refill_generation;
         s_refill_ready = 1;
+        s_refill_backoff_us = 0;
         logLine("wave: refilled %d terminated=%d\n",
                 count, info.terminated);
         logger_flush();
@@ -357,8 +392,7 @@ static void wave_consume_refill(void)
                 }
             } else if (!s_refill_terminated) {
                 logLine("wave: empty batch, backoff\n");
-                s_refill_retry_after_us =
-                    (u64)sceKernelGetSystemTimeWide() + WAVE_REFILL_RETRY_US;
+                s_refill_retry_after_us = wave_refill_backoff_next();
             }
         }
         logger_flush();
@@ -434,14 +468,14 @@ void wave_service(void)
     }
     s_refill_generation = s_generation;
     s_refill_ready = 0;
+    s_refill_backoff_us = 0;  // новая попытка — сначала короткий интервал
     s_mode = 2;
     s_session.refill_in_flight = 1;
     wave_launch_worker();
     if (s_tid < 0) {
         s_mode = 0;
         s_session.refill_in_flight = 0;
-        s_refill_retry_after_us =
-            (u64)sceKernelGetSystemTimeWide() + WAVE_REFILL_RETRY_US;
+        s_refill_retry_after_us = wave_refill_backoff_next();
     }
 }
 

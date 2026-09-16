@@ -8,6 +8,7 @@
 #include "services/audio_player.h"
 #include "services/cover_now_playing.h"
 #include "services/last_play.h"
+#include "services/playback_reporter.h"
 #include "services/playback_queue.h"
 #include "services/playback_reporter.h"
 #include "services/token_loader.h"
@@ -334,6 +335,7 @@ void playback_controller_init(void)
     s_seek_delta_ms = 0;
     playback_queue_init();
     audio_player_init();
+    playback_reporter_init();
     logLine("pb: controller init\n");
 }
 
@@ -348,6 +350,7 @@ void playback_controller_shutdown(void)
     s_advance_triggered = 0;
     s_network_retry_pending = 0;
     audio_player_shutdown();
+    playback_reporter_shutdown();
     playback_queue_clear();
     memset(&g_playback, 0, sizeof(g_playback));
     /* WAVE-REPORT: drop stashed telemetry with the controller. */
@@ -367,6 +370,9 @@ int playback_controller_quiesce(void)
     s_network_retry_pending = 0;
     /* SEEK: drop any queued seek on quiesce. */
     s_seek_delta_ms = 0;
+    if (playback_reporter_quiesce() < 0) {
+        return -1;
+    }
     return audio_player_quiesce();
 }
 

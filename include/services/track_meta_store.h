@@ -21,7 +21,8 @@ void track_meta_store_shutdown(void);
 /* 0 = hit, out filled; -1 = miss or I/O error. */
 int track_meta_store_get(const char *track_id, TrackEntry *out);
 
-/* Insert or refresh entry (key = entry->id). 0 on success. */
+/* Insert or refresh entry (key = entry->id). Unavailable entries live only in
+   the current run's RAM cache because rights may change between runs. */
 int track_meta_store_put(const TrackEntry *entry);
 
 #endif

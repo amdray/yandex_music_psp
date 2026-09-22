@@ -88,7 +88,6 @@ void ui_screen_net_info_render(void)
 
     if (!info.valid) {
         ui_draw_text(16.0f, y, locale_get(LOCALE_NET_INFO_NOT_CONNECTED), 0xFF4444FFu);
-        ui_common_draw_prompts(LOCALE_MENU_BACK_PROMPT);
         return;
     }
 
@@ -113,5 +112,4 @@ void ui_screen_net_info_render(void)
     y = draw_field(y, locale_get(LOCALE_NET_INFO_DNS1),    info.dns1[0]    ? info.dns1    : "-");
     draw_field(y,     locale_get(LOCALE_NET_INFO_DNS2),    info.dns2[0]    ? info.dns2    : "-");
 
-    ui_common_draw_prompts(LOCALE_MENU_BACK_PROMPT);
 }

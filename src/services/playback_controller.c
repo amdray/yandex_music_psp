@@ -261,6 +261,10 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
         logLine("pb: reject invalid track\n");
         return PLAYBACK_INTENT_REJECTED;
     }
+    if (!track->available) {
+        logLine("pb: reject unavailable track_id='%s'\n", track->id);
+        return PLAYBACK_INTENT_REJECTED;
+    }
 
     /* Early-exit if same track already in progress — avoids token disk read. */
     {
@@ -568,14 +572,20 @@ void playback_controller_service(void)
             TrackEntry next;
             int rc = playback_queue_get_next(&next);
             if (rc == PLAYBACK_QUEUE_OK) {
-                char token[256];
-                token[0] = '\0';
-                if (token_loader_read(token, sizeof(token)) == 0) {
-                    audio_cache_prefetch_start(&next, token);
-                    memset(token, 0, sizeof(token));
-                    s_prefetch_triggered = 1;
-                    s_cover_prefetch_triggered = 0;
-                    logLine("pb: prefetch triggered track_id='%s'\n", next.id);
+                if (!next.available) {
+                    s_prefetch_retry_after_us = pb_now_us() + PB_PENDING_RETRY_US;
+                    logLine("pb: prefetch skipped unavailable track_id='%s'\n",
+                            next.id);
+                } else {
+                    char token[256];
+                    token[0] = '\0';
+                    if (token_loader_read(token, sizeof(token)) == 0) {
+                        audio_cache_prefetch_start(&next, token);
+                        memset(token, 0, sizeof(token));
+                        s_prefetch_triggered = 1;
+                        s_cover_prefetch_triggered = 0;
+                        logLine("pb: prefetch triggered track_id='%s'\n", next.id);
+                    }
                 }
             } else if (rc == PLAYBACK_QUEUE_PENDING) {
                 pb_request_track_hydration(next.id);

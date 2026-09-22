@@ -59,10 +59,8 @@ void ui_screen_account_render(const AppState *state)
             } else {
                 ui_draw_text(16.0f, y, locale_get(LOCALE_ACCOUNT_SUBSCRIPTION_INACTIVE), 0xFFFF0000);
             }
-            ui_common_draw_prompts(LOCALE_ACCOUNT_LOGOUT_PROMPT, LOCALE_MENU_BACK_PROMPT);
         } else {
             ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_ACCOUNT_LOAD_ERROR), 0xFFFF4444);
-            ui_common_draw_prompts(LOCALE_ACCOUNT_LOGIN_PROMPT, LOCALE_MENU_BACK_PROMPT);
         }
     }
 }

@@ -4,6 +4,8 @@ OBJS = src/main.o \
        src/app/app_state.o \
        src/ui/ui_screens.o \
        src/ui/ui_draw.o \
+       src/ui/ui_layout.o \
+       src/ui/ui_icon_atlas.o \
        src/ui/ui_common.o \
        src/ui/ui_screen_splash.o \
        src/ui/ui_screen_menu.o \
@@ -87,7 +89,7 @@ PSP_CONFIG ?= psp-config
 PSPSDK ?= $(shell $(PSP_CONFIG) --pspsdk-path)
 RELEASE_DIR = release
 FONT_RESOURCES = $(wildcard fonts/*)
-ASSET_RESOURCES = $(wildcard assets/*)
+ASSET_RESOURCES = $(filter-out assets/icon/%.gif assets/icon/%_preview.png,$(shell find assets -type f))
 PACKAGED_FONT_RESOURCES = $(patsubst fonts/%,$(RELEASE_DIR)/fonts/%,$(FONT_RESOURCES))
 PACKAGED_ASSET_RESOURCES = $(patsubst assets/%,$(RELEASE_DIR)/assets/%,$(ASSET_RESOURCES))
 RELEASE_TOKEN = $(RELEASE_DIR)/config/token.txt
@@ -133,7 +135,7 @@ $(RELEASE_DIR)/fonts/%: fonts/%
 	@cp $< $@
 
 $(RELEASE_DIR)/assets/%: assets/%
-	@mkdir -p $(RELEASE_DIR)/assets
+	@mkdir -p $(dir $@)
 	@cp $< $@
 
 # Rebuild everything

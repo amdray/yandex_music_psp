@@ -201,12 +201,17 @@ static void update_battery(void)
 
     remaining = scePowerGetBatteryRemainCapacity();
     full = scePowerGetBatteryFullCapacity();
-    if (remaining < 0 || full <= 0) {
-        s_status.battery_available = 0;
-        return;
+    if (remaining >= 0 && full > 0) {
+        percent = (int)(((long long)remaining * 100LL + full / 2) / full);
+    } else {
+        /* PPSSPP exposes battery presence but does not implement the capacity
+         * calls. Its life-percent call is available, as it is on a real PSP. */
+        percent = scePowerGetBatteryLifePercent();
+        if (percent < 0 || percent > 100) {
+            s_status.battery_available = 0;
+            return;
+        }
     }
-
-    percent = (int)(((long long)remaining * 100LL + full / 2) / full);
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
 

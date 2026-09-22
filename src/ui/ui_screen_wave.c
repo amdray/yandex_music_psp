@@ -61,5 +61,4 @@ void ui_screen_wave_render(const AppState *state)
     } else {
         ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_WAVE_LOADING), 0xFFBBBBBB);
     }
-    ui_common_draw_prompts(LOCALE_MENU_BACK_PROMPT);
 }

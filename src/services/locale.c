@@ -19,6 +19,7 @@ static const char *s_locale_strings[LOCALE_COUNT][LOCALE_LANG_COUNT] = {
     [LOCALE_SPLASH_AUTH] = { "auth", "авторизация" },
     [LOCALE_SPLASH_TOKEN_ERROR] = { "token error", "ошибка токена" },
     [LOCALE_SPLASH_NET_ERROR] = { "net error", "ошибка сети" },
+    [LOCALE_SPLASH_WLAN_OFF] = { "Turn on the WLAN switch", "Включите переключатель WLAN" },
     [LOCALE_SPLASH_AUTH_ERROR] = { "auth error", "ошибка авторизации" },
     [LOCALE_SPLASH_RETRY_PROMPT] = { "X: retry", "X: повторить" },
     [LOCALE_SPLASH_EXIT_PROMPT] = { "START+SELECT: exit", "START+SELECT: выход" },
@@ -38,8 +39,7 @@ static const char *s_locale_strings[LOCALE_COUNT][LOCALE_LANG_COUNT] = {
     [LOCALE_SCREEN_NOW_PLAYING] = { "Now Playing", "Сейчас играет" },
     [LOCALE_SCREEN_ALBUMS] = { "Albums", "Альбомы" },
     [LOCALE_SCREEN_PLAYLIST_LIST] = { "Playlists", "Плейлисты" },
-    [LOCALE_SCREEN_TRACK_LIST] = { "Track List", "Список треков" },
-    [LOCALE_SCREEN_TRACK_LIST_OF_PLAYLIST] = { "Track List of Playlist %s", "Список треков плейлиста %s" },
+    [LOCALE_SCREEN_PLAYLIST_TITLE] = { "Playlist %s", "Плейлист %s" },
     [LOCALE_SCREEN_ACCOUNT] = { "Account", "Аккаунт" },
     [LOCALE_SCREEN_ARTIST] = { "Artist", "Исполнитель" },
     [LOCALE_ARTIST_PLAY_PROMPT] = { "[]: play top", "[]: играть топ" },
@@ -92,8 +92,9 @@ static const char *s_locale_strings[LOCALE_COUNT][LOCALE_LANG_COUNT] = {
     [LOCALE_TRACK_DOWNLOAD_ERROR]   = { "Download failed",  "Ошибка загрузки" },
 
     // Playlist screen tabs
-    [LOCALE_TAB_MY_PLAYLISTS]    = { "Mine",        "Мои" },
-    [LOCALE_TAB_LIKED_PLAYLISTS] = { "Liked",       "Лайки" },
+    [LOCALE_TAB_MY_PLAYLISTS]    = { "You collected", "Вы собрали" },
+    [LOCALE_TAB_LIKED_PLAYLISTS] = { "You liked",     "Вам понравилось" },
+    [LOCALE_PLAYLIST_MODIFIED]   = { "upd.",          "изм." },
     [LOCALE_PLAYLIST_TAB_PROMPT] = { "L/R: tab",    "L/R: вкладка" },
 
     // Net info screen

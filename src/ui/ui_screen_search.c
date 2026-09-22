@@ -366,5 +366,4 @@ void ui_screen_search_render(const AppState *state)
                          row == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB);
         }
     }
-    ui_common_draw_prompts(LOCALE_TRACK_PLAY_PROMPT, LOCALE_TRACK_BACK_PROMPT);
 }

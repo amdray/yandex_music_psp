@@ -49,8 +49,9 @@ int ym_api_playlist_tracks_build_url(int uid,
 
 /* Hydration: fetch full metadata for up to YM_API_HYDRATE_MAX track ids in one
    POST /tracks (server accepts >=500 per request — the cap here is sized to the
-   UI window, not the API). on_track is called per parsed entry; no-rights items
-   are skipped, so fewer callbacks than ids is normal. out_status as above. */
+   UI window, not the API). on_track is called per resolved entry, including
+   no-rights entries marked available=0. An item without a usable id is skipped,
+   so fewer callbacks than ids is still possible. out_status as above. */
 #define YM_API_HYDRATE_MAX 64
 
 int ym_api_tracks_hydrate(YmApiContext *ctx,

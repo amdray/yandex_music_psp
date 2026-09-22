@@ -240,5 +240,4 @@ void ui_screen_artist_render(const AppState *state)
         ui_draw_text(text_x, y + 16.0f, info, 0xFF888888);
     }
 
-    ui_common_draw_prompts(LOCALE_PLAYLIST_BACK_PROMPT);
 }

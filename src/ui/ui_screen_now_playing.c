@@ -1,6 +1,7 @@
 #include "ui/ui_screen_now_playing.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_layout.h"
 #include "ui/ui_screens.h"
 #include "hal/hal_fb.h"
 #include "hal/hal_gpu.h"
@@ -40,95 +41,12 @@ static u64          s_np_last_us      = 0;
 static char         s_marquee_track[40] = {0};
 static u64          s_marquee_start_us = 0;
 
-#define MARQUEE_HOLD_US 1200000ULL
-#define MARQUEE_SPEED_PX_PER_SEC 24ULL
-#define MARQUEE_GAP_PX 28.0f
-
-static float marquee_offset(float content_width, float viewport_width, u64 now_us)
+static void draw_now_playing_bottom_bar(void)
 {
-    u64 travel_us;
-    u64 cycle_us;
-    u64 phase_us;
-
-    if (content_width <= viewport_width) {
-        return 0.0f;
+    UiLayoutWidget bar;
+    if (ui_layout_get_widget("now_playing", "bottom_bar", &bar) == 0) {
+        ui_draw_rect(bar.x, bar.y, bar.w, bar.h, bar.color);
     }
-
-    travel_us = (u64)(((content_width + MARQUEE_GAP_PX) * 1000000.0f) /
-                      (float)MARQUEE_SPEED_PX_PER_SEC);
-    cycle_us = MARQUEE_HOLD_US + travel_us;
-    phase_us = (now_us - s_marquee_start_us) % cycle_us;
-    if (phase_us < MARQUEE_HOLD_US) {
-        return 0.0f;
-    }
-    return (float)(((phase_us - MARQUEE_HOLD_US) * MARQUEE_SPEED_PX_PER_SEC) /
-                   1000000ULL);
-}
-
-/* Draw one scrolling metadata line. `suffix` may use a quieter color while
- * remaining part of the same marquee as `text`. */
-static void draw_marquee_parts(float x, float y, float max_width,
-                                const char *text, u32 text_color,
-                                const char *suffix, u32 suffix_color,
-                                u64 now_us)
-{
-    float text_width;
-    float separator_width = 0.0f;
-    float suffix_width = 0.0f;
-    float content_width;
-    float offset;
-    float first_x;
-    int copies;
-    int i;
-
-    if (!text || !text[0] || max_width <= 0.0f) {
-        return;
-    }
-
-    text_width = text_measure_width(text);
-    if (suffix && suffix[0]) {
-        separator_width = text_measure_width(" ");
-        suffix_width = text_measure_width(suffix);
-    }
-    content_width = text_width + separator_width + suffix_width;
-    if (content_width <= max_width) {
-        ui_draw_text(x, y, text, text_color);
-        if (suffix_width > 0.0f) {
-            ui_draw_text(x + text_width + separator_width, y,
-                         suffix, suffix_color);
-        }
-        return;
-    }
-
-    offset = marquee_offset(content_width, max_width, now_us);
-    first_x = x - offset;
-    hal_gpu_set_scissor((int)x, 0, (int)(max_width + 0.999f), 272);
-    copies = offset > 0.0f ? 2 : 1;
-    for (i = 0; i < copies; ++i) {
-        float copy_x = first_x + (float)i * (content_width + MARQUEE_GAP_PX);
-        float raw_skip = x - copy_x;
-        float text_skip = raw_skip > 0.0f ? raw_skip : 0.0f;
-        float text_draw_x = copy_x > x ? copy_x : x;
-        float text_budget = max_width - (text_draw_x - x);
-        if (text_budget > 0.0f) {
-            text_render_window(text_draw_x, y, text, text_color,
-                               text_skip, text_budget);
-        }
-        if (suffix_width > 0.0f) {
-            float suffix_abs_x = copy_x + text_width + separator_width;
-            float suffix_skip = raw_skip - (text_width + separator_width);
-            float suffix_draw_x = suffix_abs_x > x ? suffix_abs_x : x;
-            float suffix_budget = max_width - (suffix_draw_x - x);
-            if (suffix_skip < 0.0f) {
-                suffix_skip = 0.0f;
-            }
-            if (suffix_budget > 0.0f) {
-                text_render_window(suffix_draw_x, y, suffix, suffix_color,
-                                   suffix_skip, suffix_budget);
-            }
-        }
-    }
-    hal_gpu_set_scissor(0, 0, 480, 272);
 }
 
 static void np_video_release(void)
@@ -844,8 +762,8 @@ void ui_screen_now_playing_render(const AppState *state)
     
     // Размеры и позиции
     const float cover_size = 200.0f;
-    const float cover_x = 29.0f;  // Отступ слева 29px
-    const float cover_y = 29.0f;  // Отступ сверху 29px (272 - 14 - 200) / 2 = 29
+    const float cover_x = 28.0f;  // Равный отступ слева, сверху и до нижнего бара
+    const float cover_y = 28.0f;
     const float text_x = cover_x + cover_size + 29.0f;  // 29px отступ справа от обложки
     const float text_y_start = cover_y;  // Текст начинается на уровне обложки
     const float text_line_height = 18.0f;
@@ -857,9 +775,7 @@ void ui_screen_now_playing_render(const AppState *state)
     
     if (state->now_playing_track.id[0] == '\0') {
         ui_draw_text(text_x, text_y_start, locale_get(LOCALE_SCREEN_EMPTY), text_color_secondary);
-        ui_common_draw_prompts(LOCALE_NOW_PLAYING_TOGGLE_PROMPT,
-                               LOCALE_NOW_PLAYING_STOP_PROMPT,
-                               LOCALE_TRACK_BACK_PROMPT);
+        draw_now_playing_bottom_bar();
         return;
     }
 
@@ -934,19 +850,19 @@ void ui_screen_now_playing_render(const AppState *state)
                      track->explicit_content ? " [E]" : "");
         }
         title_line[sizeof(title_line) - 1] = '\0';
-        draw_marquee_parts(mx, text_y, mw,
-                            title_line, text_color,
-                            track->version, 0xFF888888,
-                            marquee_now_us);
+        ui_common_draw_marquee(mx, text_y, mw,
+                               title_line, text_color,
+                               track->version, 0xFF888888,
+                               s_marquee_start_us, marquee_now_us);
         text_y += text_line_height;
     }
     
     // 2. Название альбома
     if (track->album[0]) {
-        draw_marquee_parts(text_x, text_y, text_width,
-                            track->album, text_color_secondary,
-                            track->album_version, 0xFF777777,
-                            marquee_now_us);
+        ui_common_draw_marquee(text_x, text_y, text_width,
+                               track->album, text_color_secondary,
+                               track->album_version, 0xFF777777,
+                               s_marquee_start_us, marquee_now_us);
         text_y += text_line_height;
     }
     
@@ -1024,10 +940,7 @@ void ui_screen_now_playing_render(const AppState *state)
         ui_draw_text(text_x, text_y, info_line, text_color_secondary);
     }
 
-    ui_common_draw_prompts(LOCALE_NOW_PLAYING_TOGGLE_PROMPT,
-                           LOCALE_NOW_PLAYING_STOP_PROMPT,
-                           LOCALE_NOW_PLAYING_LIKE_PROMPT,
-                           LOCALE_TRACK_BACK_PROMPT);
+    draw_now_playing_bottom_bar();
 
     /* Подсказка короткого SELECT и дропдаун удержания поверх всего. */
     if (s_dd_open) {

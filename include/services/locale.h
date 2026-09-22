@@ -14,6 +14,7 @@ typedef enum {
     LOCALE_SPLASH_AUTH,
     LOCALE_SPLASH_TOKEN_ERROR,
     LOCALE_SPLASH_NET_ERROR,
+    LOCALE_SPLASH_WLAN_OFF,
     LOCALE_SPLASH_AUTH_ERROR,
     LOCALE_SPLASH_RETRY_PROMPT,
     LOCALE_SPLASH_EXIT_PROMPT,
@@ -33,8 +34,7 @@ typedef enum {
     LOCALE_SCREEN_NOW_PLAYING,
     LOCALE_SCREEN_ALBUMS,
     LOCALE_SCREEN_PLAYLIST_LIST,
-    LOCALE_SCREEN_TRACK_LIST,
-    LOCALE_SCREEN_TRACK_LIST_OF_PLAYLIST,  // "Список треков плейлиста %s"
+    LOCALE_SCREEN_PLAYLIST_TITLE,  // "Плейлист %s"
     LOCALE_SCREEN_ACCOUNT,
     LOCALE_SCREEN_ARTIST,
     LOCALE_ARTIST_PLAY_PROMPT,
@@ -89,6 +89,7 @@ typedef enum {
     // Playlist screen tabs
     LOCALE_TAB_MY_PLAYLISTS,         // tab label: personal playlists
     LOCALE_TAB_LIKED_PLAYLISTS,      // tab label: liked playlists
+    LOCALE_PLAYLIST_MODIFIED,        // compact modified-date context
     LOCALE_PLAYLIST_TAB_PROMPT,      // button hint: L/R switch tab
 
     // Net info screen

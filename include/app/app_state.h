@@ -71,10 +71,7 @@ typedef struct TrackAnchor {
 } TrackAnchor;
 
 typedef struct TrackUiState {
-    int pending_playlist_kind;
     int pending_playlist_selected_index;
-    int track_screen_transition_done;
-    int track_bootstrap_indicator_visible;
     int track_selected;
     int track_scroll;
 } TrackUiState;
@@ -83,6 +80,7 @@ typedef struct TrackBootstrapState {
     int generation;
     int target_playlist_kind;
     char target_uuid[48];  /* uuid of the playlist being loaded / shown */
+    char target_playlist_title[64];
     TrackBootStatus status;
     int loaded_count;
     int error_code;
@@ -117,6 +115,7 @@ typedef struct AppState {
     AppResourceMode resource_mode;
     int menu_index;
     u32 splash_start_ms;
+    u64 ui_now_us;
 
     UserInfo currentUser;
     
@@ -175,8 +174,10 @@ static inline AppResourceMode app_state_get_resource_mode(const AppState *state)
 int app_state_init(AppState *state);
 void app_state_shutdown(AppState *state);
 void app_state_free_tracks(AppState *state);
-void app_state_reset_track_bootstrap(AppState *state, int playlist_kind, int playlist_selected_index,
-                                     const char *playlist_uuid);
+void app_state_reset_track_bootstrap(AppState *state, int playlist_kind,
+                                     int playlist_selected_index,
+                                     const char *playlist_uuid,
+                                     const char *playlist_title);
 void app_state_anchor_save(AppState *state, const char *uuid, const char *track_id, int pos);
 const TrackAnchor *app_state_anchor_find(const AppState *state, const char *uuid);
 void app_state_cancel_track_bootstrap(AppState *state);

@@ -26,6 +26,7 @@
 #include "core/logger.h"
 #include "core/fs.h"
 #include "core/clock.h"
+#include "core/mem_probe.h"
 #include "services/systemctrl_rng.h"
 
 #define LOGGER_PATH "data/logs/app.log"
@@ -53,6 +54,19 @@ static int text_ready = 0;
 static int ui_draw_ready = 0;
 static int ui_screens_ready = 0;
 static int hal_input_ready = 0;
+
+static void log_heap_state(const char *stage)
+{
+    size_t cap = mem_heap_cap();
+    size_t used = mem_heap_used();
+    size_t free_bytes = cap > used ? cap - used : 0;
+
+    logLine("mem: heap stage=%s used=%u free=%u cap=%u\n",
+            stage ? stage : "periodic",
+            (unsigned int)used,
+            (unsigned int)free_bytes,
+            (unsigned int)cap);
+}
 
 typedef enum {
     EXIT_STAGE_NONE = 0,
@@ -87,14 +101,16 @@ static void log_data_paths(void)
     }
 }
 
+static volatile int s_exit_requested = 0;
+
 /* Exit callback - called when user presses HOME button */
 static int exit_callback(int arg1, int arg2, void *common)
 {
     (void)arg1;
     (void)arg2;
     (void)common;
-    /* Workers may still be running. Process exit reclaims the intact graph. */
-    sceKernelExitGame();
+    /* The main thread owns worker quiescence and the final log close. */
+    s_exit_requested = 1;
     return 0;
 }
 
@@ -161,6 +177,7 @@ int main(int argc, char *argv[])
 {
     int exit_code = 1;
     u64 last_log_flush_us = 0;
+    u64 last_heap_log_us = 0;
 
     // Set CWD from argv[0] - required for relative paths to work
     if (argc > 0 && argv[0]) {
@@ -264,7 +281,7 @@ int main(int argc, char *argv[])
     }
     exit_code = 0;
 
-    // Log memory state after all initialization (using safe function)
+    log_heap_state("initialized");
     logLine("app: entering main loop\n");
     logger_flush();
     u64 last_net_poll_us = 0;
@@ -279,14 +296,27 @@ int main(int argc, char *argv[])
 
         hal_input_poll(&input);
 
+        if (s_exit_requested) break;
+
+        if (ui_screens_has_fatal_resource_error()) {
+            ui_screens_render(&s_app_state);
+            now_us = sceKernelGetSystemTimeWide();
+            logger_set_realtime_mode(0);
+            if (last_log_flush_us == 0 ||
+                (now_us - last_log_flush_us) >= 250000ULL) {
+                logger_flush();
+                last_log_flush_us = now_us;
+            }
+            continue;
+        }
+
         /* События питания (сон/пробуждение/переключатель): сразу
          * перепроверяем сеть, а не ждём секундного тика. */
         if (s_power_event) {
             int ev = s_power_event;
             s_power_event = 0;
             logLine("app: power event 0x%08X, net recheck\n", ev);
-            logger_flush();
-            net_client_poll();
+            if (net_client_runtime_started()) net_client_poll();
         }
 
         /* Кнопка ♪ (NOTE): переключение профилей эквалайзера везде. */
@@ -324,11 +354,18 @@ int main(int argc, char *argv[])
         playback_controller_service();
 
         now_us = sceKernelGetSystemTimeWide();
+        s_app_state.ui_now_us = now_us;
+
+        if (last_heap_log_us == 0 || now_us - last_heap_log_us >= 10000000ULL) {
+            log_heap_state("periodic");
+            last_heap_log_us = now_us;
+        }
 
         /* Keep APCTL state current after the splash screen. Previously it was
          * polled only during startup, so a later network transition was
          * invisible and net_client_is_ready() remained stale. */
-        if (last_net_poll_us == 0 || now_us - last_net_poll_us >= 1000000ULL) {
+        if (net_client_runtime_started() &&
+            (last_net_poll_us == 0 || now_us - last_net_poll_us >= 1000000ULL)) {
             net_client_poll();
             last_net_poll_us = now_us;
         }
@@ -387,6 +424,10 @@ cleanup:
         /* ui_screens_shutdown is join-only. Whether every join succeeds or not,
          * no application/network destructor runs in this process. */
         (void)ui_screens_shutdown();
+        logLine("app: shutdown\n");
+        LOG_FLUSH();
+        LOG_SHUTDOWN();
+        fs_shutdown();
         sceKernelExitGame();
         return exit_code;
     }

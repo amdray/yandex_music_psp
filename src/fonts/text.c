@@ -119,6 +119,8 @@ void text_render_window(float x, float y, const char *text,
     size_t out = 0;
     float used = 0.f;
     float skipped = 0.f;
+    float residual;
+    float draw_width;
 
     if (!text || !hal_gpu_in_frame()) {
         return;
@@ -150,12 +152,17 @@ void text_render_window(float x, float y, const char *text,
         p += n;
     }
 
+    residual = skip_px - skipped;
+    if (residual < 0.f) {
+        residual = 0.f;
+    }
+    draw_width = max_width + residual;
     while (*p && out + 4u < sizeof(buf)) {
         uint32_t cp;
         int n = utf8_step(p, &cp);
         CbmfGlyphView gv;
         float adv = (cbmf_get_glyph(f, cp, &gv) == CBMF_OK) ? (float)gv.advance_x : 0.f;
-        if (used + adv > max_width) {
+        if (used >= draw_width) {
             break;
         }
         memcpy(buf + out, p, (size_t)n);
@@ -164,7 +171,7 @@ void text_render_window(float x, float y, const char *text,
         p += n;
     }
     buf[out] = '\0';
-    text_draw((int)x, (int)y, buf, color_abgr);
+    text_draw((int)(x - residual), (int)y, buf, color_abgr);
 }
 
 float text_measure_width(const char *text)

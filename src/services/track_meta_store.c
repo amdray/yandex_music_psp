@@ -4,6 +4,7 @@
 #include <pspkernel.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "core/fs.h"
@@ -44,6 +45,13 @@ static int s_dir_count = 0;
 static uint32_t s_clock = 0;
 static int s_initialized = 0;
 
+/* Rights availability can change between application runs. Keep terminal
+   unavailable responses in RAM so they resolve every window/queue lookup in
+   this run, but never make that state durable on the Memory Stick. */
+static TrackEntry *s_unavailable = NULL;
+static int s_unavailable_count = 0;
+static int s_unavailable_capacity = 0;
+
 static SceLwMutexWorkarea s_mutex;
 static int s_mutex_initialized = 0;
 
@@ -69,6 +77,50 @@ static uint32_t meta_hash(const char *s)
         h *= 16777619u;
     }
     return h;
+}
+
+static int meta_unavailable_find(const char *track_id)
+{
+    int i;
+    for (i = 0; i < s_unavailable_count; ++i) {
+        if (strcmp(s_unavailable[i].id, track_id) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int meta_unavailable_put(const TrackEntry *entry)
+{
+    int pos = meta_unavailable_find(entry->id);
+    if (pos >= 0) {
+        memcpy(&s_unavailable[pos], entry, sizeof(*entry));
+        return 0;
+    }
+    if (s_unavailable_count == s_unavailable_capacity) {
+        int new_capacity = s_unavailable_capacity > 0
+            ? s_unavailable_capacity * 2
+            : 4;
+        TrackEntry *grown = (TrackEntry *)realloc(
+            s_unavailable, (size_t)new_capacity * sizeof(*grown));
+        if (!grown) {
+            logLine("meta_store: unavailable session cache allocation failed\n");
+            return -1;
+        }
+        s_unavailable = grown;
+        s_unavailable_capacity = new_capacity;
+    }
+    memcpy(&s_unavailable[s_unavailable_count++], entry, sizeof(*entry));
+    return 0;
+}
+
+static void meta_unavailable_remove(const char *track_id)
+{
+    int pos = meta_unavailable_find(track_id);
+    if (pos >= 0) {
+        s_unavailable[pos] = s_unavailable[s_unavailable_count - 1];
+        s_unavailable_count--;
+    }
 }
 
 static SceOff meta_slot_offset(int slot)
@@ -249,6 +301,10 @@ void track_meta_store_shutdown(void)
     s_initialized = 0;
     s_dir_count = 0;
     s_slot_count = 0;
+    free(s_unavailable);
+    s_unavailable = NULL;
+    s_unavailable_count = 0;
+    s_unavailable_capacity = 0;
     meta_unlock();
 
     if (s_mutex_initialized) {
@@ -286,7 +342,11 @@ int track_meta_store_get(const char *track_id, TrackEntry *out)
     }
 
     meta_lock();
-    if (meta_ensure_loaded() == 0) {
+    dir_pos = meta_unavailable_find(track_id);
+    if (dir_pos >= 0) {
+        memcpy(out, &s_unavailable[dir_pos], sizeof(*out));
+        rc = 0;
+    } else if (meta_ensure_loaded() == 0) {
         dir_pos = meta_dir_find(meta_hash(track_id), track_id, &rec);
         if (dir_pos >= 0) {
             memcpy(out, &rec.entry, sizeof(*out));
@@ -312,6 +372,12 @@ int track_meta_store_put(const TrackEntry *entry)
     }
 
     meta_lock();
+    if (!entry->available) {
+        rc = meta_unavailable_put(entry);
+        meta_unlock();
+        return rc;
+    }
+    meta_unavailable_remove(entry->id);
     if (meta_ensure_loaded() != 0) {
         meta_unlock();
         return -1;

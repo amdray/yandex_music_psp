@@ -386,7 +386,7 @@ int ym_api_tracks_hydrate(YmApiContext *ctx,
                     break;
                 }
             }
-            /* rc == 1: no-rights/unparseable item — skipped by design. */
+            /* rc == 1: item without a usable id — skipped by design. */
         }
     }
     cJSON_Delete(root);

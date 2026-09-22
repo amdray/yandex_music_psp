@@ -17,10 +17,10 @@ void text_render(float x, float y, const char *text, u32 color_abgr);
 // Render text with clipping at max_width pixels
 void text_render_clipped(float x, float y, const char *text, u32 color_abgr, float max_width);
 
-// Render a horizontal window of the text: drop the first skip_px pixels
-// worth of glyphs (whole glyphs only) and right-clip the remainder to
-// max_width pixels. skip_px<=0 behaves like text_render_clipped.
-// max_width<=0 draws nothing.
+// Render a horizontal window of the text: skip skip_px pixels, including a
+// partial leading glyph, and draw enough content for max_width pixels. The
+// caller's active scissor performs exact edge clipping. skip_px<=0 behaves
+// like text_render_clipped; max_width<=0 draws nothing.
 void text_render_window(float x, float y, const char *text, u32 color_abgr, float skip_px, float max_width);
 
 // Measure text width in pixels

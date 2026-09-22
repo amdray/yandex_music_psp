@@ -27,9 +27,10 @@ void library_playlists_refresh_on_enter(AppState *s);
 int library_open_playlist(AppState *s, const PlaylistEntry *entry, int tab, int selected_index);
 
 /* Гейт перехода в track_list: 1, когда видимое окно у разрешённой входной
- * позиции гидрировано (заполняет *out_pos и *out_count); 0, пока грузится или
- * bootstrap не идёт. Прячет лок стора, разрешение anchor и подкачку окна
- * (токен читается внутри). Аргументы могут быть NULL. */
+ * позиции гидрировано либо плейлист действительно пуст; 0, пока грузится;
+ * -1 при ошибке bootstrap. При успехе заполняет *out_pos и *out_count.
+ * Прячет лок стора, разрешение anchor и подкачку окна (токен читается внутри).
+ * Аргументы могут быть NULL. */
 int library_track_entry_ready(AppState *s, int *out_pos, int *out_count);
 
 #endif

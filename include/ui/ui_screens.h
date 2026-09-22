@@ -8,6 +8,7 @@ void ui_screens_update(AppState *state, const InputState *input);
 void ui_screens_handle_input(AppState *state, const InputState *input);
 void ui_screens_render(const AppState *state);
 int ui_screens_init(void);
+int ui_screens_has_fatal_resource_error(void);
 int ui_screens_shutdown(void);
 
 /* Navigation gate (screen-transition contract): if the target screen declares

@@ -330,6 +330,4 @@ void ui_screen_artist_menu_render(const AppState *state)
         }
     }
 
-    ui_common_draw_prompts(LOCALE_PLAYLIST_BACK_PROMPT, LOCALE_PLAYLIST_TAB_PROMPT,
-                           LOCALE_ARTIST_PLAY_PROMPT, LOCALE_ALBUM_OPEN_PROMPT);
 }

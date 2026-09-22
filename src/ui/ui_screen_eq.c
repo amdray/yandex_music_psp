@@ -113,5 +113,4 @@ void ui_screen_eq_render(const AppState *state)
         y += 15.0f;
     }
 
-    ui_common_draw_prompts(LOCALE_EQ_EDIT_PROMPT, LOCALE_MENU_BACK_PROMPT);
 }

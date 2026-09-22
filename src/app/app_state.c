@@ -102,8 +102,10 @@ void app_state_free_tracks(AppState *state)
     state->track_ui.track_scroll = 0;
 }
 
-void app_state_reset_track_bootstrap(AppState *state, int playlist_kind, int playlist_selected_index,
-                                     const char *playlist_uuid)
+void app_state_reset_track_bootstrap(AppState *state, int playlist_kind,
+                                     int playlist_selected_index,
+                                     const char *playlist_uuid,
+                                     const char *playlist_title)
 {
     assert(state);
     app_state_free_tracks(state);
@@ -114,14 +116,17 @@ void app_state_reset_track_bootstrap(AppState *state, int playlist_kind, int pla
         snprintf(state->track_boot.target_uuid, sizeof(state->track_boot.target_uuid),
                  "%s", playlist_uuid);
     }
+    state->track_boot.target_playlist_title[0] = '\0';
+    if (playlist_title) {
+        snprintf(state->track_boot.target_playlist_title,
+                 sizeof(state->track_boot.target_playlist_title),
+                 "%s", playlist_title);
+    }
     state->track_boot.status = TRACK_BOOT_LOADING;
     state->track_boot.loaded_count = 0;
     state->track_boot.error_code = 0;
 
-    state->track_ui.pending_playlist_kind = playlist_kind;
     state->track_ui.pending_playlist_selected_index = playlist_selected_index;
-    state->track_ui.track_screen_transition_done = 0;
-    state->track_ui.track_bootstrap_indicator_visible = 1;
 }
 
 void app_state_anchor_save(AppState *state, const char *uuid, const char *track_id, int pos)
@@ -176,11 +181,9 @@ void app_state_cancel_track_bootstrap(AppState *state)
     assert(state);
     state->track_boot.generation++;
     state->track_boot.target_playlist_kind = 0;
+    state->track_boot.target_playlist_title[0] = '\0';
     state->track_boot.status = TRACK_BOOT_IDLE;
     state->track_boot.loaded_count = 0;
     state->track_boot.error_code = 0;
-    state->track_ui.pending_playlist_kind = 0;
     state->track_ui.pending_playlist_selected_index = -1;
-    state->track_ui.track_screen_transition_done = 0;
-    state->track_ui.track_bootstrap_indicator_visible = 0;
 }

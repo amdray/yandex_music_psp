@@ -15,16 +15,16 @@
  *
  * Return codes for ym_api_parse_track_from_object():
  *   0  track parsed into *entry;
- *   1  item skipped by design ("error":"no-rights" or unusable id);
+ *   1  item skipped because it has no usable id;
  *   -1 bad arguments or track_obj is not an object.
  *
  * Fixes vs the original static copy:
  *   - numeric "id" nodes are accepted (the old code filled entry->id only
  *     for string ids and left it empty for numeric ones);
  *   - numeric-or-string "albums[0].id" is accepted;
- *   - entry->available defaults to 1 and honors an explicit boolean/number
- *     "available" field (the old code always left it 0; nothing in the tree
- *     reads TrackEntry.available yet, so no caller changes behavior).
+ *   - entry->available defaults to 1, honors an explicit boolean/number
+ *     "available" field, and is forced to 0 for "error":"no-rights". Such an
+ *     item remains a parsed, resolved playlist position rather than a miss.
  *
  * artist_cutout_uri ("artists[].cutoutCover.uri", first non-empty in server
  * order) is intentionally NOT stored in TrackEntry: the headers under

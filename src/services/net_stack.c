@@ -585,14 +585,14 @@ int net_stack_init(const NetTlsNetworkConfig *config)
     s_runtime_stuck = 0;
     supervisor_set_phase(NET_SUPERVISOR_IDLE);
 
-    if (!sceWlanGetSwitchState()) return -1;
+    if (!net_stack_wlan_switch_is_on()) return NET_STACK_ERR_WLAN_OFF;
     if ((rc = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON)) < 0) return rc;
     if ((rc = sceUtilityLoadNetModule(PSP_NET_MODULE_INET)) < 0) goto fail_common;
     log_all_profile_snapshots();
     retry_profile = select_retry_profile(cfg->wifi_profile_id);
     if (retry_profile < 0) {
         logLine("netmgr: no configured Wi-Fi profile\n");
-        rc = -1;
+        rc = NET_STACK_ERR_NO_PROFILE;
         goto fail_inet_module;
     }
     s_last_profile = retry_profile;
@@ -643,6 +643,11 @@ fail_inet_module:
 fail_common:
     sceUtilityUnloadNetModule(PSP_NET_MODULE_COMMON);
     return rc;
+}
+
+int net_stack_wlan_switch_is_on(void)
+{
+    return sceWlanGetSwitchState() != 0;
 }
 
 int net_stack_stop_supervisor(void)

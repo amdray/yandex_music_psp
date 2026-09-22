@@ -87,6 +87,7 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
     cJSON *year_node;
     cJSON *explicit_node;
     cJSON *available_node;
+    int no_rights = 0;
 
     if (!track_obj || !entry) {
         return -1;
@@ -95,13 +96,13 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
         return -1;
     }
 
-    /* API marks region/rights-blocked tracks with "error":"no-rights" and omits
-     * duration/albums for them; we skip such tracks, so the final parsed count
-     * can legitimately be lower than the count reported by the API response. */
+    /* A rights-blocked item is still a resolved playlist position. The API
+     * supplies its id/title/artists but may omit duration and albums, so parse
+     * the available metadata and mark the entry as non-playable. */
     error_node = cJSON_GetObjectItemCaseSensitive(track_obj, "error");
     if (error_node && cJSON_IsString(error_node) && error_node->valuestring) {
         if (strcmp(error_node->valuestring, "no-rights") == 0) {
-            return 1;
+            no_rights = 1;
         }
     }
 
@@ -228,6 +229,9 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
         entry->available = 0;
     } else if (available_node && cJSON_IsNumber(available_node)) {
         entry->available = (available_node->valueint != 0) ? 1 : 0;
+    }
+    if (no_rights) {
+        entry->available = 0;
     }
 
     return 0;

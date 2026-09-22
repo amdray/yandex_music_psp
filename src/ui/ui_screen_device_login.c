@@ -369,5 +369,4 @@ void ui_screen_device_login_render(const AppState *state)
         ui_draw_text(16.0f, 170.0f, s_msg, 0xFFFF4444);
     }
 
-    ui_common_draw_prompts(LOCALE_LOGIN_RETRY_PROMPT, LOCALE_MENU_BACK_PROMPT);
 }

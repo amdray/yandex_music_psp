@@ -1,12 +1,16 @@
 #include "ui/ui_common.h"
 #include "ui/ui_draw.h"
+#include "ui/ui_icon_atlas.h"
+#include "ui/ui_layout.h"
 #include "hal/hal_gfx_config.h"
+#include "hal/hal_gpu.h"
 #include "fonts/text.h"
 #include "services/locale.h"
 #include "services/eq.h"
 #include "services/ym_api.h"
 #include "services/system_status.h"
 #include "services/net_ui_status.h"
+#include "services/audio_player.h"
 #include <pspkernel.h>
 #include <stdio.h>
 #include <string.h>
@@ -14,95 +18,131 @@
 
 void ui_common_draw_header(const char *title)
 {
-    ui_draw_text(16.0f, 24.0f, title, 0xFFFFFFFF);
-    ui_draw_rect(16.0f, 38.0f, 200.0f, 1.0f, 0xFF444444);
-}
+    UiLayoutWidget title_widget;
+    UiLayoutWidget rule_widget;
 
-void ui_common_draw_menu(const MenuItem *items, int count, int selected)
-{
-    int i;
-    float y = 48.0f;
-
-    for (i = 0; i < count; ++i) {
-        const char *text = locale_get(items[i].label);
-        if (i == selected) {
-            ui_draw_rect(12.0f, y - 2.0f, 6.0f, 14.0f, 0xFF00D5FF);
-            ui_draw_text(24.0f, y, text, 0xFFFFFFFF);
-        } else {
-            ui_draw_text(24.0f, y, text, 0xFFBBBBBB);
-        }
-        y += 16.0f;
+    if (ui_layout_get_widget("screen_header", "title", &title_widget) != 0 ||
+        ui_layout_get_widget("screen_header", "title_rule", &rule_widget) != 0)
+        return;
+    if (title_widget.w > 0.0f) {
+        text_render_clipped(title_widget.x, title_widget.y, title,
+                            title_widget.color, title_widget.w);
+    } else {
+        ui_draw_text(title_widget.x, title_widget.y, title,
+                     title_widget.color);
     }
+    ui_draw_rect(rule_widget.x, rule_widget.y, rule_widget.w, rule_widget.h,
+                 rule_widget.color);
 }
 
-void ui_common_draw_battery_status(void)
+u32 ui_common_pulse_color(void)
 {
-    SystemStatusSnapshot status;
-    const float body_x = 446.0f;
-    const float body_y = 3.0f;
-    const float body_w = 24.0f;
-    const float body_h = 10.0f;
-    const float inner_w = body_w - 4.0f;
-    char percent[8];
-    float text_width;
-    float fill_width;
-    u32 fill_color;
+    static unsigned frame;
+    unsigned phase = frame++ % 120U;
+    unsigned wave = phase < 60U ? phase : 119U - phase;
+    unsigned level = 0x77U + wave * 0x88U / 59U;
+    return 0xFF000000U | level | (level << 8) | (level << 16);
+}
 
-    system_status_get_snapshot(&status);
-    if (!status.battery_available) {
+#define UI_MARQUEE_HOLD_US 1200000ULL
+#define UI_MARQUEE_SPEED_PX_PER_SEC 24ULL
+#define UI_MARQUEE_GAP_PX 28.0f
+
+static float ui_common_marquee_offset(float content_width,
+                                      float viewport_width,
+                                      u64 start_us, u64 now_us)
+{
+    u64 travel_us;
+    u64 cycle_us;
+    u64 phase_us;
+    u64 elapsed_us;
+
+    if (content_width <= viewport_width) {
+        return 0.0f;
+    }
+    travel_us = (u64)(((content_width + UI_MARQUEE_GAP_PX) * 1000000.0f) /
+                      (float)UI_MARQUEE_SPEED_PX_PER_SEC);
+    cycle_us = UI_MARQUEE_HOLD_US + travel_us;
+    elapsed_us = now_us >= start_us ? now_us - start_us : 0;
+    phase_us = elapsed_us % cycle_us;
+    if (phase_us < UI_MARQUEE_HOLD_US) {
+        return 0.0f;
+    }
+    return (float)(((phase_us - UI_MARQUEE_HOLD_US) *
+                    UI_MARQUEE_SPEED_PX_PER_SEC) / 1000000ULL);
+}
+
+void ui_common_draw_marquee(float x, float y, float max_width,
+                            const char *text, u32 text_color,
+                            const char *suffix, u32 suffix_color,
+                            u64 start_us, u64 now_us)
+{
+    float text_width;
+    float separator_width = 0.0f;
+    float suffix_width = 0.0f;
+    float content_width;
+    float offset;
+    float first_x;
+    int copies;
+    int i;
+
+    if (!text || !text[0] || max_width <= 0.0f) {
+        return;
+    }
+    text_width = text_measure_width(text);
+    if (suffix && suffix[0]) {
+        separator_width = text_measure_width(" ");
+        suffix_width = text_measure_width(suffix);
+    }
+    content_width = text_width + separator_width + suffix_width;
+    if (content_width <= max_width) {
+        ui_draw_text(x, y, text, text_color);
+        if (suffix_width > 0.0f) {
+            ui_draw_text(x + text_width + separator_width, y,
+                         suffix, suffix_color);
+        }
         return;
     }
 
-    snprintf(percent, sizeof(percent), "%d%%", status.battery_percent);
-    text_width = text_measure_width(percent);
-    ui_draw_text(body_x - text_width - 6.0f, 2.0f, percent, 0xFFBBBBBB);
-
-    ui_draw_rect(body_x, body_y, body_w, 1.0f, 0xFFBBBBBB);
-    ui_draw_rect(body_x, body_y + body_h - 1.0f, body_w, 1.0f, 0xFFBBBBBB);
-    ui_draw_rect(body_x, body_y, 1.0f, body_h, 0xFFBBBBBB);
-    ui_draw_rect(body_x + body_w - 1.0f, body_y, 1.0f, body_h, 0xFFBBBBBB);
-    ui_draw_rect(body_x + body_w, body_y + 3.0f, 2.0f, 4.0f, 0xFFBBBBBB);
-
-    fill_width = inner_w * (float)status.battery_percent / 100.0f;
-    if (status.battery_charging) {
-        fill_color = 0xFF00D5FF;
-    } else if (status.battery_percent <= 15) {
-        fill_color = 0xFF3030FF;
-    } else {
-        fill_color = 0xFF70D070;
-    }
-    if (fill_width > 0.0f) {
-        ui_draw_rect(body_x + 2.0f, body_y + 2.0f,
-                     fill_width, body_h - 4.0f, fill_color);
-    }
-}
-
-static void draw_lock_icon(float x)
-{
-    ui_draw_rect(x, 9.0f, 10.0f, 8.0f, 0xFFBBBBBB);
-    ui_draw_rect(x + 2.0f, 5.0f, 6.0f, 1.0f, 0xFFBBBBBB);
-    ui_draw_rect(x + 1.0f, 6.0f, 1.0f, 4.0f, 0xFFBBBBBB);
-    ui_draw_rect(x + 8.0f, 6.0f, 1.0f, 4.0f, 0xFFBBBBBB);
-}
-
-static void make_elided(const char *src, char *dst, size_t cap, float max_width)
-{
-    size_t len;
-
-    if (!src || !dst || cap == 0) return;
-    snprintf(dst, cap, "%s", src);
-    if (text_measure_width(dst) <= max_width) return;
-
-    len = strlen(dst);
-    while (len > 0) {
-        do { --len; } while (len > 0 && ((unsigned char)dst[len] & 0xC0U) == 0x80U);
-        dst[len] = '\0';
-        if (len + 3 < cap) {
-            memcpy(dst + len, "...", 4);
-            if (text_measure_width(dst) <= max_width) return;
+    offset = ui_common_marquee_offset(content_width, max_width,
+                                      start_us, now_us);
+    first_x = x - offset;
+    hal_gpu_set_scissor((int)x, 0, (int)(max_width + 0.999f), SCREEN_HEIGHT);
+    copies = offset > 0.0f ? 2 : 1;
+    for (i = 0; i < copies; ++i) {
+        float copy_x = first_x + (float)i *
+                                     (content_width + UI_MARQUEE_GAP_PX);
+        float raw_skip = x - copy_x;
+        float text_skip = raw_skip > 0.0f ? raw_skip : 0.0f;
+        float text_draw_x = copy_x > x ? copy_x : x;
+        float text_budget = max_width - (text_draw_x - x);
+        if (text_budget > 0.0f) {
+            text_render_window(text_draw_x, y, text, text_color,
+                               text_skip, text_budget);
+        }
+        if (suffix_width > 0.0f) {
+            float suffix_abs_x = copy_x + text_width + separator_width;
+            float suffix_skip = raw_skip - (text_width + separator_width);
+            float suffix_draw_x = suffix_abs_x > x ? suffix_abs_x : x;
+            float suffix_budget = max_width - (suffix_draw_x - x);
+            if (suffix_skip < 0.0f) {
+                suffix_skip = 0.0f;
+            }
+            if (suffix_budget > 0.0f) {
+                text_render_window(suffix_draw_x, y, suffix, suffix_color,
+                                   suffix_skip, suffix_budget);
+            }
         }
     }
-    dst[0] = '\0';
+    hal_gpu_set_scissor(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+}
+
+static void draw_lock_icon(float x, float y, u32 color)
+{
+    ui_draw_rect(x, y + 7.0f, 10.0f, 8.0f, color);
+    ui_draw_rect(x + 2.0f, y + 3.0f, 6.0f, 1.0f, color);
+    ui_draw_rect(x + 1.0f, y + 4.0f, 1.0f, 4.0f, color);
+    ui_draw_rect(x + 8.0f, y + 4.0f, 1.0f, 4.0f, color);
 }
 
 void ui_common_draw_top_status(void)
@@ -110,21 +150,26 @@ void ui_common_draw_top_status(void)
     static char s_clock_text[6] = "--:--";
     static unsigned long long s_clock_next_us;
     NetUiStatusSnapshot net;
-    char ssid[36];
+    UiLayoutWidget wifi;
+    UiLayoutWidget playback_state;
+    UiLayoutWidget clock;
+    UiLayoutWidget activity_widget;
+    UiLayoutWidget battery_percent;
+    UiLayoutWidget battery;
     const char *activity = NULL;
     float clock_width;
     float clock_x;
-    float bars_x = 2.0f;
     int active_bars = 0;
     int i;
 
+    if (ui_layout_get_widget("status_overlay", "wifi", &wifi) != 0 ||
+        ui_layout_get_widget("status_overlay", "playback_state", &playback_state) != 0 ||
+        ui_layout_get_widget("status_overlay", "clock", &clock) != 0 ||
+        ui_layout_get_widget("status_overlay", "activity", &activity_widget) != 0 ||
+        ui_layout_get_widget("status_overlay", "battery_percent", &battery_percent) != 0 ||
+        ui_layout_get_widget("status_overlay", "battery", &battery) != 0)
+        return;
     net_ui_status_get_snapshot(&net);
-
-    if (net.apctl.valid) {
-        make_elided(net.apctl.ssid, ssid, sizeof(ssid), 168.0f);
-        ui_draw_text(2.0f, 2.0f, ssid, 0xFFBBBBBB);
-        bars_x += text_measure_width(ssid) + 3.0f;
-    }
 
     if (net.strength_valid) {
         unsigned int strength = net.apctl.strength > 99U ? 99U : net.apctl.strength;
@@ -132,9 +177,37 @@ void ui_common_draw_top_status(void)
     }
     for (i = 0; i < 5; ++i) {
         float height = 3.0f + (float)i * 2.0f;
-        ui_draw_rect(bars_x + (float)i * 4.0f, 14.0f - height,
+        ui_draw_rect(wifi.x + (float)i * 4.0f, wifi.y + wifi.h - height,
                      2.0f, height,
-                     i < active_bars ? 0xFF00D5FF : 0xFF555555);
+                     i < active_bars ? wifi.color : 0xFF555555);
+    }
+
+    {
+        const char *icon_name;
+        int icon_width;
+        int icon_height;
+        int icon_x;
+        int icon_y;
+        AudioPlayerState player_state = audio_player_get_state();
+
+        if (player_state == AUDIO_PLAYER_PAUSED) {
+            icon_name = "in_pause";
+        } else if (player_state == AUDIO_PLAYER_STOPPING ||
+                   player_state == AUDIO_PLAYER_STOPPED ||
+                   player_state == AUDIO_PLAYER_FINISHED ||
+                   player_state == AUDIO_PLAYER_ERROR ||
+                   player_state == AUDIO_PLAYER_IDLE) {
+            icon_name = "in_stop";
+        } else {
+            icon_name = "in_play";
+        }
+        if (ui_icon_atlas_get_size(icon_name, &icon_width, &icon_height) == 0) {
+            icon_x = (int)playback_state.x +
+                     ((int)playback_state.w - icon_width) / 2;
+            icon_y = (int)playback_state.y +
+                     ((int)playback_state.h - icon_height + 1) / 2;
+            ui_icon_atlas_draw(icon_name, icon_x, icon_y, playback_state.color);
+        }
     }
 
     {
@@ -150,55 +223,46 @@ void ui_common_draw_top_status(void)
         }
     }
     clock_width = text_measure_width(s_clock_text);
-    clock_x = ((float)SCREEN_WIDTH - clock_width) * 0.5f;
-    if (net.hold) draw_lock_icon(clock_x - 15.0f);
-    ui_draw_text(clock_x, 2.0f, s_clock_text, 0xFFFFFFFF);
+    clock_x = clock.x + (clock.w - clock_width) * 0.5f;
+    if (net.hold) draw_lock_icon(clock_x - 15.0f, clock.y, clock.color);
+    ui_draw_text(clock_x, clock.y, s_clock_text, clock.color);
 
     if (net.state == NET_UI_DISCONNECTED) activity = "OFF";
     else if (net.state == NET_UI_STUCK) activity = "WiFi!";
     else if (net.state == NET_UI_RECOVERING) activity = "WiFi...";
-    else if (net.download_visible) {
-        const char *download_icon = "\xE2\x86\x93"; /* U+2193 DOWNWARDS ARROW */
-        float icon_width = text_measure_width(download_icon);
-        /* Мигает 2 Гц — видно, что идёт загрузка и надо ждать. */
-        if ((sceKernelGetSystemTimeWide() / 500000ULL) % 2ULL == 0ULL) {
-            ui_draw_text(372.0f - icon_width * 0.5f, 2.0f,
-                         download_icon, 0xFFBBBBBB);
-        }
-    }
     if (activity) {
-        text_render_clipped(350.0f, 2.0f, activity, 0xFFBBBBBB, 44.0f);
+        text_render_clipped(activity_widget.x, activity_widget.y, activity,
+                            activity_widget.color, activity_widget.w);
     }
 
-    ui_common_draw_battery_status();
-}
+    {
+        SystemStatusSnapshot status;
+        char percent[8];
+        float percent_width;
+        float body_w = battery.w - 2.0f;
+        float inner_w = body_w - 4.0f;
+        float fill_width;
 
-void ui_common_draw_prompts_n(const LocaleKey *keys, int count)
-{
-    const float prompt_height = 16.0f;
-    const float prompt_y = (float)(SCREEN_HEIGHT - prompt_height);
-    const float text_y = prompt_y;
-    const float text_x = 16.0f;
-    char prompt[128];
-    size_t len = 0;
-    int i;
-
-    ui_draw_rect(0.0f, prompt_y, (float)SCREEN_WIDTH, prompt_height, 0xFF2A2A2A);
-
-    prompt[0] = '\0';
-    for (i = 0; i < count && len < sizeof(prompt) - 1; ++i) {
-        int n = snprintf(prompt + len, sizeof(prompt) - len,
-                         (i == 0) ? "%s" : "  %s", locale_get(keys[i]));
-        if (n < 0) {
-            break;
-        }
-        len += (size_t)n;
-        if (len >= sizeof(prompt)) {  // snprintf truncated: clamp, stop
-            len = sizeof(prompt) - 1;
-            break;
+        system_status_get_snapshot(&status);
+        if (!status.battery_available) return;
+        snprintf(percent, sizeof(percent), "%d%%", status.battery_percent);
+        percent_width = text_measure_width(percent);
+        ui_draw_text(battery_percent.x + battery_percent.w - percent_width,
+                     battery_percent.y, percent, battery_percent.color);
+        ui_draw_rect(battery.x, battery.y, body_w, 1.0f, battery.color);
+        ui_draw_rect(battery.x, battery.y + battery.h - 1.0f,
+                     body_w, 1.0f, battery.color);
+        ui_draw_rect(battery.x, battery.y, 1.0f, battery.h, battery.color);
+        ui_draw_rect(battery.x + body_w - 1.0f, battery.y,
+                     1.0f, battery.h, battery.color);
+        ui_draw_rect(battery.x + body_w, battery.y + 3.0f,
+                     2.0f, 4.0f, battery.color);
+        fill_width = inner_w * (float)status.battery_percent / 100.0f;
+        if (fill_width > 0.0f) {
+            ui_draw_rect(battery.x + 2.0f, battery.y + 2.0f,
+                         fill_width, battery.h - 4.0f, battery.color);
         }
     }
-    ui_draw_text(text_x, text_y, prompt, 0xFF888888);
 }
 
 const char *ui_common_eq_preset_name(int preset)

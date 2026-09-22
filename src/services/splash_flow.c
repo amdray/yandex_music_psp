@@ -8,6 +8,7 @@
 #include "services/locale.h"
 #include "services/token_loader.h"
 #include "services/net_client.h"
+#include "services/net_stack.h"
 #include "services/net_tls.h"
 #include "core/logger.h"
 
@@ -59,60 +60,78 @@ static void cleanup_auth_thread(SplashFlow *flow)
     }
 }
 
+static const char *splash_state_name(SplashState state)
+{
+    static const char *const names[] = {
+        "storage", "cache", "index", "locale", "token", "net_start",
+        "net_wait", "wlan_off", "net_error", "auth_start", "auth_wait",
+        "auth_error", "ready"
+    };
+    return (state >= SPLASH_STATE_STORAGE && state <= SPLASH_STATE_READY)
+        ? names[state] : "invalid";
+}
+
+static const char *splash_state_status(SplashState state)
+{
+    switch (state) {
+    case SPLASH_STATE_STORAGE: return locale_get(LOCALE_SPLASH_STORAGE);
+    case SPLASH_STATE_CACHE: return locale_get(LOCALE_SPLASH_CACHE);
+    case SPLASH_STATE_INDEX: return locale_get(LOCALE_SPLASH_INDEX);
+    case SPLASH_STATE_LOCALE: return locale_get(LOCALE_SPLASH_LOCALE);
+    case SPLASH_STATE_TOKEN: return locale_get(LOCALE_SPLASH_TOKEN);
+    case SPLASH_STATE_NET_START:
+    case SPLASH_STATE_NET_WAIT: return locale_get(LOCALE_SPLASH_NET);
+    case SPLASH_STATE_WLAN_OFF: return locale_get(LOCALE_SPLASH_WLAN_OFF);
+    case SPLASH_STATE_NET_ERROR: return locale_get(LOCALE_SPLASH_NET_ERROR);
+    case SPLASH_STATE_AUTH_START:
+    case SPLASH_STATE_AUTH_WAIT: return locale_get(LOCALE_SPLASH_AUTH);
+    case SPLASH_STATE_AUTH_ERROR: return locale_get(LOCALE_SPLASH_AUTH_ERROR);
+    case SPLASH_STATE_READY: return NULL;
+    }
+    return NULL;
+}
+
+static void splash_set_state(SplashFlow *flow, SplashState next)
+{
+    SplashState previous;
+    if (!flow || flow->state == next) return;
+    previous = flow->state;
+    flow->state = next;
+    flow->status = splash_state_status(next);
+    flow->ready = (next == SPLASH_STATE_READY);
+    logLine("splash: state %s -> %s\n",
+            splash_state_name(previous), splash_state_name(next));
+}
+
 void splash_flow_init(SplashFlow *flow)
 {
-    if (!flow) {
-        return;
-    }
-    flow->status = NULL;  // Will be set in first tick
-    flow->ready = 0;
-    flow->stage = 0;
-    flow->token[0] = '\0';
-    flow->net_started = 0;
-    flow->auth_attempted = 0;
+    if (!flow) return;
+    memset(flow, 0, sizeof(*flow));
+    flow->state = SPLASH_STATE_STORAGE;
+    flow->status = splash_state_status(flow->state);
     flow->auth_thread_id = -1;
-    flow->auth_result = -2;  // -2 = pending (not started / in progress)
-    flow->auth_cancel = 0;
-    flow->error_stage = 0;
-    flow->retry_pending = 0;
-    memset(&flow->auth_user_info, 0, sizeof(UserInfo));
+    flow->auth_result = -2;
+    logLine("splash: state -> %s\n", splash_state_name(flow->state));
 }
 
 int splash_flow_has_error(const SplashFlow *flow)
 {
-    if (!flow) {
-        return 0;
-    }
-    return (flow->error_stage != 0);
+    if (!flow) return 0;
+    return flow->state == SPLASH_STATE_WLAN_OFF ||
+           flow->state == SPLASH_STATE_NET_ERROR ||
+           flow->state == SPLASH_STATE_AUTH_ERROR;
 }
 
-// Applies the stage reset for the pending error_stage. Only safe to call once
-// auth_thread_id is confirmed gone (see splash_flow_retry / splash_flow_tick).
 static void apply_retry_reset(SplashFlow *flow)
 {
-    switch (flow->error_stage) {
-    case 4:
-        // Retry from token stage
-        flow->stage = 4;
-        flow->auth_attempted = 0;
-        break;
-    case 5:
-        /* Retry follows only a fully unwound pre-handler init failure. A
-         * post-handler failure requires top-level process exit instead. */
-        flow->stage = 5;
-        flow->net_started = 0;
-        flow->auth_attempted = 0;
-        break;
-    case 6:
-        // Retry from auth stage
-        flow->stage = 6;
-        flow->auth_attempted = 0;
+    if (flow->state == SPLASH_STATE_AUTH_ERROR) {
         flow->auth_result = -2;
-        break;
+        flow->auth_cancel = 0;
+        splash_set_state(flow, SPLASH_STATE_AUTH_START);
+    } else {
+        flow->wlan_check_at_us = 0;
+        splash_set_state(flow, SPLASH_STATE_NET_START);
     }
-    flow->error_stage = 0;
-    flow->ready = 0;
-    logLine("splash: retry from stage %d\n", flow->stage);
 }
 
 void splash_flow_retry(SplashFlow *flow)
@@ -178,168 +197,115 @@ void splash_flow_tick(SplashFlow *flow, AppState *app)
         apply_retry_reset(flow);
     }
 
-    if (flow->ready) {
-        return;
-    }
+    if (flow->ready) return;
 
-    switch (flow->stage) {
-    case 0:
-        flow->status = locale_get(LOCALE_SPLASH_STORAGE);
-        logLine("splash: status -> %s\n", flow->status);
-        flow->stage++;
+    switch (flow->state) {
+    case SPLASH_STATE_STORAGE:
+        splash_set_state(flow, SPLASH_STATE_CACHE);
         break;
-    case 1:
-        flow->status = locale_get(LOCALE_SPLASH_CACHE);
-        logLine("splash: status -> %s\n", flow->status);
-        flow->stage++;
+    case SPLASH_STATE_CACHE:
+        splash_set_state(flow, SPLASH_STATE_INDEX);
         break;
-    case 2:
-        flow->status = locale_get(LOCALE_SPLASH_INDEX);
-        logLine("splash: status -> %s\n", flow->status);
-        flow->stage++;
+    case SPLASH_STATE_INDEX:
+        splash_set_state(flow, SPLASH_STATE_LOCALE);
         break;
-    case 3:
-        flow->status = locale_get(LOCALE_SPLASH_LOCALE);
-        logLine("splash: status -> %s\n", flow->status);
+    case SPLASH_STATE_LOCALE:
         locale_init("ru");
-        flow->stage++;
+        splash_set_state(flow, SPLASH_STATE_TOKEN);
         break;
-    case 4:
-        flow->status = locale_get(LOCALE_SPLASH_TOKEN);
-        logLine("splash: status -> %s\n", flow->status);
-        if (token_loader_read(flow->token, sizeof(flow->token)) == 0) {
-            flow->stage++;
-        } else {
-            /* Без токена не стоим: дальше сеть, пропуск auth и меню —
-             * войти можно пунктом «Профиль» (ya_auth). */
-            logLine("splash: no token -> menu, login via Profile\n");
+    case SPLASH_STATE_TOKEN:
+        if (token_loader_read(flow->token, sizeof(flow->token)) != 0) {
+            logLine("splash: no token -> guest session\n");
             flow->token[0] = '\0';
-            flow->stage++;
         }
+        splash_set_state(flow, SPLASH_STATE_NET_START);
         break;
-    case 5:
-        flow->status = locale_get(LOCALE_SPLASH_NET);
-        if (!flow->net_started) {
-            /* Первый тик: только обновляем статус, рендерим кадр, init на следующем тике */
-            flow->net_started = 1;
-            logLine("splash: status -> %s\n", flow->status);
-            break;
-        }
+    case SPLASH_STATE_NET_START:
 #ifdef DISABLE_NETWORK_INIT
-        logLine("splash: network disabled for debugging\n");
-        flow->stage++;
+        splash_set_state(flow, SPLASH_STATE_AUTH_START);
 #else
-        if (flow->net_started == 1) {
-            flow->net_started = 2;
-            u64 ni_start = sceKernelGetSystemTimeWide();
-            logLine("splash: net_client_init begin (sync Wi-Fi bring-up)\n");
-            logger_flush();
-            int ni_rc = net_client_init(0);
-            logLine("splash: net_client_init done rc=%d took=%llu ms\n",
-                    ni_rc, (sceKernelGetSystemTimeWide() - ni_start) / 1000);
-            logger_flush();
-            if (ni_rc < 0) {
-                flow->status = locale_get(LOCALE_SPLASH_NET_ERROR);
-                logLine("splash: status -> %s\n", flow->status);
-                flow->error_stage = 5;
-                break;
-            }
-        }
-        net_client_poll();
         {
-            /* Main-thread tick only, so a plain static counter is safe here. */
-            static unsigned int s_net_wait_ticks = 0;
-            s_net_wait_ticks++;
-            if (s_net_wait_ticks == 1 || s_net_wait_ticks % 60 == 0) {
-                logLine("splash: net wait tick=%u ready=%d err=%d\n",
-                        s_net_wait_ticks, net_client_is_ready(), net_client_has_error());
-                logger_flush();
+            int rc = net_client_init(0);
+            if (rc == NET_STACK_ERR_WLAN_OFF) {
+                flow->wlan_check_at_us = sceKernelGetSystemTimeWide() + 250000ULL;
+                splash_set_state(flow, SPLASH_STATE_WLAN_OFF);
+            } else if (rc < 0) {
+                logLine("splash: network start failed rc=%d\n", rc);
+                splash_set_state(flow, SPLASH_STATE_NET_ERROR);
+            } else {
+                splash_set_state(flow, SPLASH_STATE_NET_WAIT);
             }
-        }
-        if (net_client_has_error()) {
-            flow->status = locale_get(LOCALE_SPLASH_NET_ERROR);
-            logLine("splash: status -> %s\n", flow->status);
-            flow->error_stage = 5;
-        } else if (net_client_is_ready()) {
-            logLine("splash: net ready -> auth stage\n");
-            flow->stage++;
         }
 #endif
         break;
-    case 6:
-        if (!flow->token[0]) {
-            /* Токена нет (пришли из меню без входа): auth нечего проверять —
-             * сразу в меню, профиль пуст. Вход — пункт «Профиль». */
-            logLine("splash: empty token -> menu as guest\n");
-            flow->status = NULL;
-            flow->ready = 1;
-            break;
-        }
-        if (!flow->auth_attempted) {
-            logLine("splash: starting auth (stage 6)\n");
-            flow->auth_attempted = 1;
-            flow->status = locale_get(LOCALE_SPLASH_AUTH);
-            logLine("splash: status -> %s\n", flow->status);
-            flow->auth_result = -2;  // in progress
-            
-            // Prepare thread arguments (stored in flow to outlive this block)
-            flow->auth_thread_args.token = flow->token;
-            flow->auth_thread_args.user_info = &flow->auth_user_info;
-            flow->auth_thread_args.result = &flow->auth_result;
-            flow->auth_thread_args.cancel = &flow->auth_cancel;
-            flow->auth_cancel = 0;
-            
-            // Create worker thread
-            flow->auth_thread_id = sceKernelCreateThread("auth_worker", auth_worker_thread,
-                                                         0x18,  // Priority (higher than UI at 0x20)
-                                                         64 * 1024,  // 64KB stack
-                                                         0, NULL);
-            if (flow->auth_thread_id < 0) {
-                logLine("splash: failed to create auth thread 0x%08X\n", flow->auth_thread_id);
-                flow->status = locale_get(LOCALE_SPLASH_AUTH_ERROR);
-                logLine("splash: status -> %s\n", flow->status);
-                flow->auth_result = -1;
-                flow->error_stage = 6;
-            } else {
-                logLine("splash: auth thread created id=%d\n", flow->auth_thread_id);
-                // Start thread
-                int start_ret = sceKernelStartThread(flow->auth_thread_id, sizeof(AuthThreadArgs), &flow->auth_thread_args);
-                if (start_ret < 0) {
-                    logLine("splash: failed to start auth thread 0x%08X\n", start_ret);
-                    sceKernelDeleteThread(flow->auth_thread_id);
-                    flow->auth_thread_id = -1;
-                    flow->status = locale_get(LOCALE_SPLASH_AUTH_ERROR);
-                    logLine("splash: status -> %s\n", flow->status);
-                    flow->auth_result = -1;
-                    flow->error_stage = 6;
-                } else {
-                    logLine("splash: auth thread started successfully\n");
-                }
-            }
-        } else {
-            // Check thread result (auth_result is updated by worker thread)
-            // Field is already volatile, so read is safe
-            int result = flow->auth_result;
-            if (result == 0) {
-                // Success - account status received and parsed successfully
-                // Copy user info to app state
-                memcpy(&app->currentUser, &flow->auth_user_info, sizeof(UserInfo));
-                flow->status = NULL;  // No status needed when ready
-                flow->ready = 1;  // Splash ends after successful account parsing
-                logLine("splash: ready (account parsed successfully)\n");
-                cleanup_auth_thread(flow);
-            } else if (result == -1) {
-                // Error
-                flow->status = locale_get(LOCALE_SPLASH_AUTH_ERROR);
-                logLine("splash: status -> %s\n", flow->status);
-                logLine("splash: auth failed\n");
-                flow->error_stage = 6;
-                cleanup_auth_thread(flow);
-            }
-            // else: still in progress (auth_result == -2), keep showing "auth" status
+    case SPLASH_STATE_NET_WAIT:
+        net_client_poll();
+        if (net_client_has_error()) {
+            splash_set_state(flow, SPLASH_STATE_NET_ERROR);
+        } else if (net_client_is_ready()) {
+            splash_set_state(flow, SPLASH_STATE_AUTH_START);
         }
         break;
-    default:
+    case SPLASH_STATE_WLAN_OFF:
+        {
+            u64 now = sceKernelGetSystemTimeWide();
+            if (now >= flow->wlan_check_at_us) {
+                flow->wlan_check_at_us = now + 250000ULL;
+                if (net_stack_wlan_switch_is_on())
+                    splash_set_state(flow, SPLASH_STATE_NET_START);
+            }
+        }
+        break;
+    case SPLASH_STATE_NET_ERROR:
+    case SPLASH_STATE_AUTH_ERROR:
+        break;
+    case SPLASH_STATE_AUTH_START:
+        if (!flow->token[0]) {
+            logLine("splash: empty token -> menu as guest\n");
+            splash_set_state(flow, SPLASH_STATE_READY);
+            break;
+        }
+        flow->auth_result = -2;
+        flow->auth_cancel = 0;
+        flow->auth_thread_args.token = flow->token;
+        flow->auth_thread_args.user_info = &flow->auth_user_info;
+        flow->auth_thread_args.result = &flow->auth_result;
+        flow->auth_thread_args.cancel = &flow->auth_cancel;
+        flow->auth_thread_id = sceKernelCreateThread("auth_worker", auth_worker_thread,
+                                                     0x18, 64 * 1024, 0, NULL);
+        if (flow->auth_thread_id < 0) {
+            logLine("splash: failed to create auth thread 0x%08X\n",
+                    flow->auth_thread_id);
+            flow->auth_result = -1;
+            splash_set_state(flow, SPLASH_STATE_AUTH_ERROR);
+            break;
+        }
+        {
+            int rc = sceKernelStartThread(flow->auth_thread_id,
+                                          sizeof(AuthThreadArgs),
+                                          &flow->auth_thread_args);
+            if (rc < 0) {
+                logLine("splash: failed to start auth thread 0x%08X\n", rc);
+                sceKernelDeleteThread(flow->auth_thread_id);
+                flow->auth_thread_id = -1;
+                flow->auth_result = -1;
+                splash_set_state(flow, SPLASH_STATE_AUTH_ERROR);
+            } else {
+                splash_set_state(flow, SPLASH_STATE_AUTH_WAIT);
+            }
+        }
+        break;
+    case SPLASH_STATE_AUTH_WAIT:
+        if (flow->auth_result == 0) {
+            memcpy(&app->currentUser, &flow->auth_user_info, sizeof(UserInfo));
+            cleanup_auth_thread(flow);
+            splash_set_state(flow, SPLASH_STATE_READY);
+        } else if (flow->auth_result == -1) {
+            cleanup_auth_thread(flow);
+            splash_set_state(flow, SPLASH_STATE_AUTH_ERROR);
+        }
+        break;
+    case SPLASH_STATE_READY:
         break;
     }
 }

@@ -281,5 +281,4 @@ void ui_screen_album_list_render(void)
     if (s_status_open) {
         ui_draw_text(16.0f, 250.0f, "...", 0xFF00D5FF);
     }
-    ui_common_draw_prompts(LOCALE_ALBUM_OPEN_PROMPT, LOCALE_ALBUM_BACK_PROMPT);
 }

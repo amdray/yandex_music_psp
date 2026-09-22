@@ -79,7 +79,4 @@ void ui_screen_splash_render(const SplashFlow *flow, void *splash_pixels, int sp
     } else {
         ui_draw_text(16.0f, 230.0f, locale_get(LOCALE_SPLASH_INITIALIZING), 0xFFFFFFFF);
     }
-    if (splash_flow_has_error(flow)) {
-        ui_common_draw_prompts(LOCALE_SPLASH_RETRY_PROMPT, LOCALE_SPLASH_EXIT_PROMPT);
-    }
 }

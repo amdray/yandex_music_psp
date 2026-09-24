@@ -19,6 +19,7 @@ OBJS = src/main.o \
        src/ui/ui_screen_wave.o \
        src/ui/ui_screen_search.o \
        src/ui/ui_wave_carousel.o \
+       src/ui/ui_glow_bg.o \
        src/ui/ui_screen_help.o \
        src/ui/ui_screen_eq.o \
        src/hal/hal_input.o \

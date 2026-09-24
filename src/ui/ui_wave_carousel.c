@@ -18,6 +18,7 @@
 #include "services/ym_api_rotor.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_glow_bg.h"
 
 #define CAROUSEL_MAX_CARDS 8
 #define CAROUSEL_VISIBLE 6
@@ -316,8 +317,10 @@ void carousel_render(const AppState *state)
     if (!s_open) {
         return;
     }
-    ui_draw_rect(0.0f, 0.0f, 480.0f, 272.0f, 0xAA000000);
-    ui_draw_rect(bx, by, bw, 30.0f + (float)CAROUSEL_VISIBLE * 24.0f, 0xFF1A1A1A);
+    // Свечение как в Яндексе за панелью карусели.
+    glow_bg_draw(0.0f, 0.0f, 480.0f, 272.0f);
+    ui_draw_rect(0.0f, 0.0f, 480.0f, 272.0f, 0x66000000);
+    ui_draw_rect(bx, by, bw, 30.0f + (float)CAROUSEL_VISIBLE * 24.0f, 0xEE1A1A1A);
     ui_draw_text(bx + 12.0f, by + 8.0f, locale_get(LOCALE_CAROUSEL_TITLE),
                  0xFFFFFFFF);
     start_idx = s_scroll;

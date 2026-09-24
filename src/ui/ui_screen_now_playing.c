@@ -3,6 +3,7 @@
 #include "ui/ui_common.h"
 #include "ui/ui_screens.h"
 #include "ui/ui_wave_carousel.h"
+#include "ui/ui_glow_bg.h"
 #include "hal/hal_fb.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
@@ -944,6 +945,9 @@ void ui_screen_now_playing_render(const AppState *state)
 
     ui_draw_clear(0xFF1A1A1A);
     // Без шапки - обложка и текст занимают весь экран
+
+    // Свечение за контентом — как в Яндекс Музыке (фон любого трека).
+    glow_bg_draw(0.0f, 0.0f, 480.0f, 272.0f);
     
     // Размеры и позиции
     const float cover_size = 200.0f;

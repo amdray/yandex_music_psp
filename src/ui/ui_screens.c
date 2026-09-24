@@ -39,6 +39,7 @@
 #include "ui/ui_screen_search.h"
 #include "ui/ui_screen_help.h"
 #include "ui/ui_wave_carousel.h"
+#include "ui/ui_glow_bg.h"
 #include "ui/ui_common.h"
 
 static void *s_splash_pixels = NULL;
@@ -374,6 +375,7 @@ int ui_screens_init(void)
     splash_flow_init(&s_splash_flow);
     system_status_init();
     net_ui_status_init();
+    glow_bg_init();
 
     audio_cache_init();
     playback_controller_init();
@@ -400,6 +402,7 @@ int ui_screens_shutdown(void)
      * deleted or freed unless every join has succeeded. The process exits after
      * this function, so phase two is OS reclamation. */
     last_play_save();  // чистый выход посреди трека — запомнили
+    glow_bg_free();
     net_tls_quiesce_begin();
     if (splash_flow_quiesce(&s_splash_flow) < 0) quiesced = 0;
     if (playback_controller_quiesce() < 0) quiesced = 0;

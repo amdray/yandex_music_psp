@@ -32,13 +32,13 @@ static unsigned s_frame = 0;
 
 static Blob s_blobs[GLOW_BLOBS] = {
     // Маджента — большое пятно сверху-слева
-    { 80.0f,  45.0f, 78.0f, 255,  30, 150, 0.085f, 0.068f, 0.052f, 0.0f, 1.1f, 0.5f },
+    { 80.0f,  45.0f, 78.0f, 255,  30, 150, 0.340f, 0.272f, 0.208f, 0.0f, 1.1f, 0.5f },
     // Жёлтый — среднее снизу-по-центру
-    { 125.0f, 95.0f, 58.0f, 255, 210,  30, 0.060f, 0.076f, 0.044f, 2.0f, 0.3f, 1.7f },
+    { 125.0f, 95.0f, 58.0f, 255, 210,  30, 0.240f, 0.304f, 0.176f, 2.0f, 0.3f, 1.7f },
     // Оранжевый — маленький акцент справа
-    { 170.0f, 42.0f, 30.0f, 255, 140,  20, 0.096f, 0.052f, 0.068f, 4.0f, 2.2f, 0.9f },
+    { 170.0f, 42.0f, 30.0f, 255, 140,  20, 0.384f, 0.208f, 0.272f, 4.0f, 2.2f, 0.9f },
     // Фиолетовая дымка — огромное слабое пятно
-    { 120.0f, 68.0f, 115.0f, 110,  18,  95, 0.032f, 0.044f, 0.028f, 3.0f, 5.0f, 2.5f },
+    { 120.0f, 68.0f, 115.0f, 110,  18,  95, 0.128f, 0.176f, 0.112f, 3.0f, 5.0f, 2.5f },
 };
 
 typedef struct {
@@ -54,9 +54,9 @@ static void glow_update(void)
     int i, x, y;
 
     for (i = 0; i < GLOW_BLOBS; i++) {
-        bx[i] = s_blobs[i].cx + sinf(t * s_blobs[i].sx + s_blobs[i].px) * 32.0f;
-        by[i] = s_blobs[i].cy + sinf(t * s_blobs[i].sy + s_blobs[i].py) * 22.0f;
-        br[i] = s_blobs[i].r + sinf(t * s_blobs[i].sr + s_blobs[i].pr) * 12.0f;
+        bx[i] = s_blobs[i].cx + sinf(t * s_blobs[i].sx + s_blobs[i].px) * 65.0f;
+        by[i] = s_blobs[i].cy + sinf(t * s_blobs[i].sy + s_blobs[i].py) * 45.0f;
+        br[i] = s_blobs[i].r + sinf(t * s_blobs[i].sr + s_blobs[i].pr) * 22.0f;
         inv_r2[i] = 1.0f / (br[i] * br[i]);
     }
 
@@ -125,10 +125,8 @@ void glow_bg_draw(float x, float y, float w, float h)
     if (!s_buf) {
         return;
     }
-    // Обновление текстуры 30 fps — генерация ~32K пикселей.
-    if ((s_frame & 1) == 0) {
-        glow_update();
-    }
+    // Обновление текстуры каждый кадр.
+    glow_update();
     s_frame++;
 
     sceKernelDcacheWritebackRange(s_buf, (size_t)GLOW_PITCH * GLOW_TEX_H * 4);

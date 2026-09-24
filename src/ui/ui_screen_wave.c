@@ -44,7 +44,7 @@ void ui_screen_wave_update(AppState *state)
         memset(&state->now_playing_track, 0, sizeof(state->now_playing_track));
         snprintf(state->now_playing_track.id, sizeof(state->now_playing_track.id),
                  "%s", first_id);
-        app_state_push(state, SCREEN_NOW_PLAYING);
+        ui_screens_navigate(state, SCREEN_NOW_PLAYING);
         playback_controller_request_play_current();
     } else if (rc == -1) {
         s_error = 1;
@@ -54,11 +54,11 @@ void ui_screen_wave_update(AppState *state)
 void ui_screen_wave_render(const AppState *state)
 {
     (void)state;
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_WAVE));
     if (s_error) {
-        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_WAVE_ERROR), 0xFFFF4444);
+        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_WAVE_ERROR), UI_COLOR_ERROR);
     } else {
-        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_WAVE_LOADING), 0xFFBBBBBB);
+        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_WAVE_LOADING), UI_COLOR_ACTIVE);
     }
 }

@@ -173,7 +173,7 @@ void ui_screen_album_list_update(AppState *state)
         snprintf(state->now_playing_track.id, sizeof(state->now_playing_track.id),
                  "%s", first_id);
         s_status_open = 0;
-        app_state_push(state, SCREEN_NOW_PLAYING);
+        ui_screens_navigate(state, SCREEN_NOW_PLAYING);
         playback_controller_request_play_current();
     } else if (rc == -1) {
         s_status_open = 0;
@@ -222,15 +222,15 @@ void ui_screen_album_list_render(void)
 {
     int i, start_idx, end_idx;
 
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_ALBUMS));
 
     if (s_loading) {
-        ui_draw_text(16.0f, 48.0f, "...", 0xFFBBBBBB);
+        ui_draw_text(16.0f, 48.0f, "...", UI_COLOR_ACTIVE);
         return;
     }
     if (s_error || s_count == 0) {
-        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
         return;
     }
 
@@ -255,16 +255,16 @@ void ui_screen_album_list_render(void)
         char sub[32];
 
         if (i == s_selected) {
-            ui_draw_rect(16.0f, y - 3.0f, 6.0f, 30.0f, 0xFF00D5FF);
+            ui_draw_rect(16.0f, y - 3.0f, 6.0f, 30.0f, UI_COLOR_ACCENT);
         }
         if (!cover_manager_draw_cover(COVER_ENTITY_ALBUM, a->album_id, NULL,
                                       27, (int)y, 30, 30)) {
             if (cover_manager_is_loading(COVER_ENTITY_ALBUM, a->album_id, NULL)) {
-                ui_draw_rect(27.0f, y, 30.0f, 30.0f, 0xFF444444);
+                ui_draw_rect(27.0f, y, 30.0f, 30.0f, UI_COLOR_INACTIVE);
             }
         }
         text_render_clipped(62.0f, y, a->title,
-                            i == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB,
+                            i == s_selected ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE,
                             480.0f - 62.0f - 8.0f);
         if (a->year > 0) {
             snprintf(sub, sizeof(sub), "%d", a->year);
@@ -274,11 +274,11 @@ void ui_screen_album_list_render(void)
             sub[0] = '\0';
         }
         if (sub[0]) {
-            ui_draw_text(62.0f, y + 16.0f, sub, 0xFF888888);
+            ui_draw_text(62.0f, y + 16.0f, sub, UI_COLOR_INACTIVE);
         }
     }
 
     if (s_status_open) {
-        ui_draw_text(16.0f, 250.0f, "...", 0xFF00D5FF);
+        ui_draw_text(16.0f, 250.0f, "...", UI_COLOR_ACCENT);
     }
 }

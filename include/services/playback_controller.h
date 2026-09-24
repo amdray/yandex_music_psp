@@ -32,6 +32,19 @@ void          playback_controller_init(void);
 void          playback_controller_shutdown(void);
 int           playback_controller_quiesce(void);
 void          playback_controller_request_play_current(void);
+/* Start the current queue item and apply one absolute seek after its worker
+ * becomes ready. Used only to restore a persisted playback session. */
+void          playback_controller_request_resume_current(int position_ms);
+/* Restore a persisted session without starting audio. The current queue item
+ * is exposed as paused and resumes from position_ms on the next play intent. */
+void          playback_controller_restore_paused_current(int position_ms);
+/* Resolve the current queue item without starting it. Returns 1 when full
+ * metadata is ready, 0 while hydration is pending, and -1 for no item. */
+int           playback_controller_prepare_current(TrackEntry *out);
+int           playback_controller_has_current(void);
+/* Returns 1 for the persisted paused item (track_id may be NULL), else 0. */
+int           playback_controller_get_restored_pause(const char *track_id,
+                                                      int *position_ms);
 /* Deferred queue navigation. UI code only submits intent; the controller
  * resolves metadata and switches the player/cache from service(). */
 void          playback_controller_request_next(void);

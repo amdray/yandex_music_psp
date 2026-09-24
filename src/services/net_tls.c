@@ -660,7 +660,9 @@ void net_tls_disconnect(NetTlsConnection *conn)
 
     logLine("tls: disconnect fd=%d\n", conn->socket_fd);
     logger_flush();
+    conn->close_notify_active = 1;
     mbedtls_ssl_close_notify(&conn->ssl);
+    conn->close_notify_active = 0;
     tls_conn_cleanup(conn);
     logger_flush();
 }
@@ -780,7 +782,12 @@ static int psp_net_send(void *ctx, const unsigned char *buf, size_t len)
     if (e == EINTR) {
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
-    logLine("tls: send FAILED errno=%d send#%d tid=%d\n", e, cnt, tid);
+    if (conn->close_notify_active) {
+        logLine("tls: close_notify not sent errno=%d send#%d tid=%d\n",
+                e, cnt, tid);
+    } else {
+        logLine("tls: send FAILED errno=%d send#%d tid=%d\n", e, cnt, tid);
+    }
     logger_flush();
     return MBEDTLS_ERR_NET_SEND_FAILED;
 }

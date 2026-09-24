@@ -1,4 +1,4 @@
-// 7-полосный эквалайзер + предусиление, биквады по RBJ cookbook. См. eq.h.
+// 7-полосный эквалайзер, биквады по RBJ cookbook. См. eq.h.
 #include "services/eq.h"
 
 #include <pspkernel.h>
@@ -46,14 +46,13 @@ static const float s_preset_gains[EQ_PRESET_COUNT][EQ_BANDS] = {
 static float s_active[EQ_BANDS];
 static float s_custom[EQ_BANDS];
 static int s_preset = EQ_PRESET_OFF;
-static float s_preamp_db = 0.0f;
 static int s_rate = 0;
 static int s_active_flag = 0;
 static int s_dirty = 1;
 static EqBiquad s_coef[EQ_BANDS];
 static EqState s_state[EQ_BANDS][2];  // [полоса][канал L/R]
 static unsigned long long s_toast_until = 0;
-static int s_toast_kind = 0;  // 1 пресет, 2 преамп
+static int s_toast_kind = 0;  // 1 пресет
 
 float eq_band_freq(int band)
 {
@@ -127,13 +126,11 @@ void eq_reset(void)
 static void refresh_active_flag(void)
 {
     int b;
-    s_active_flag = (s_preamp_db > 0.01f) ? 1 : 0;
-    if (!s_active_flag) {
-        for (b = 0; b < EQ_BANDS; b++) {
-            if (s_active[b] < -0.01f || s_active[b] > 0.01f) {
-                s_active_flag = 1;
-                break;
-            }
+    s_active_flag = 0;
+    for (b = 0; b < EQ_BANDS; b++) {
+        if (s_active[b] < -0.01f || s_active[b] > 0.01f) {
+            s_active_flag = 1;
+            break;
         }
     }
     if (s_active_flag) {
@@ -157,11 +154,6 @@ static void toast(int kind)
 {
     s_toast_kind = kind;
     s_toast_until = sceKernelGetSystemTimeWide() + EQ_TOAST_US;
-}
-
-void eq_notify_quality(void)
-{
-    toast(3);
 }
 
 int eq_set_preset(int preset)
@@ -223,24 +215,6 @@ void eq_get_gains(float out_gains[EQ_BANDS])
     }
 }
 
-void eq_set_preamp_db(float db)
-{
-    if (db < 0.0f) db = 0.0f;
-    if (db > EQ_PREAMP_MAX_DB) db = EQ_PREAMP_MAX_DB;
-    if (db != s_preamp_db) {
-        s_preamp_db = db;
-        refresh_active_flag();
-        toast(2);
-        logLine("eq: preamp %d dB\n", (int)db);
-        logger_flush();
-    }
-}
-
-float eq_get_preamp_db(void)
-{
-    return s_preamp_db;
-}
-
 int eq_is_active(void)
 {
     return s_active_flag;
@@ -263,8 +237,6 @@ int eq_toast_preset(void)
 void eq_process(short *pcm, int frames, int channels, int rate)
 {
     int i, ch, b;
-    float pre;
-
     if (!pcm || frames <= 0 || !s_active_flag) {
         return;
     }
@@ -276,10 +248,9 @@ void eq_process(short *pcm, int frames, int channels, int rate)
     if (s_dirty || rate != s_rate) {
         recompute(rate);
     }
-    pre = powf(10.0f, s_preamp_db / 20.0f);
     for (i = 0; i < frames; i++) {
         for (ch = 0; ch < channels; ch++) {
-            float y = (float)pcm[i * channels + ch] * pre;
+            float y = (float)pcm[i * channels + ch];
             for (b = 0; b < EQ_BANDS; b++) {
                 EqBiquad *c = &s_coef[b];
                 EqState *s = &s_state[b][ch];
@@ -307,11 +278,11 @@ void eq_save(void)
     int w, len;
 
     len = snprintf(buf, sizeof(buf),
-                   "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\npreamp=%d\nquality=%s\n",
+                   "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\nquality=%s\n",
                    s_preset,
                    (int)s_custom[0], (int)s_custom[1], (int)s_custom[2],
                    (int)s_custom[3], (int)s_custom[4], (int)s_custom[5],
-                   (int)s_custom[6], (int)s_preamp_db,
+                   (int)s_custom[6],
                    ym_api_download_quality());
     if (len <= 0 || len >= (int)sizeof(buf)) {
         return;
@@ -332,7 +303,7 @@ void eq_init(void)
 {
     char buf[192];
     SceUID fd;
-    int n, p, pre, b;
+    int n, p, b;
     int g[EQ_BANDS];
     const char *pl;
     char q[8];
@@ -341,7 +312,6 @@ void eq_init(void)
         s_custom[b] = 0.0f;
     }
     s_preset = EQ_PRESET_OFF;
-    s_preamp_db = 0.0f;
     fd = fs_open(EQ_CFG_PATH, PSP_O_RDONLY, 0777);
     if (fd >= 0) {
         n = fs_read(fd, buf, sizeof(buf) - 1);
@@ -360,11 +330,6 @@ void eq_init(void)
                 for (b = 0; b < EQ_BANDS; b++) {
                     s_custom[b] = clamp_db((float)g[b]);
                 }
-            }
-            pl = strstr(buf, "preamp=");
-            if (pl && sscanf(pl, "preamp=%d", &pre) == 1 &&
-                pre >= 0 && pre <= (int)EQ_PREAMP_MAX_DB) {
-                s_preamp_db = (float)pre;
             }
             pl = strstr(buf, "quality=");
             if (pl && sscanf(pl, "quality=%7s", q) == 1) {

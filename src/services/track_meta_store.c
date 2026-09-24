@@ -11,7 +11,7 @@
 #include "core/logger.h"
 
 #define META_STORE_PATH "data/cache/meta/store.bin"
-#define META_STORE_VERSION 2
+#define META_STORE_VERSION 4
 
 /* 4096 slots x ~780 B ≈ 3.1 MB on the Memory Stick when full — comfortably
    covers the whole liked collection (2511 tracks) plus open playlists. */
@@ -79,11 +79,26 @@ static uint32_t meta_hash(const char *s)
     return h;
 }
 
-static int meta_unavailable_find(const char *track_id)
+static uint32_t meta_hash_key(const char *track_id, int album_id)
+{
+    uint32_t h = meta_hash(track_id);
+    unsigned int value = (unsigned int)album_id;
+    int i;
+
+    for (i = 0; i < 4; ++i) {
+        h ^= (uint8_t)(value & 0xFFu);
+        h *= 16777619u;
+        value >>= 8;
+    }
+    return h;
+}
+
+static int meta_unavailable_find(const char *track_id, int album_id)
 {
     int i;
     for (i = 0; i < s_unavailable_count; ++i) {
-        if (strcmp(s_unavailable[i].id, track_id) == 0) {
+        if (strcmp(s_unavailable[i].id, track_id) == 0 &&
+            (album_id == 0 || s_unavailable[i].album_id == album_id)) {
             return i;
         }
     }
@@ -92,7 +107,7 @@ static int meta_unavailable_find(const char *track_id)
 
 static int meta_unavailable_put(const TrackEntry *entry)
 {
-    int pos = meta_unavailable_find(entry->id);
+    int pos = meta_unavailable_find(entry->id, entry->album_id);
     if (pos >= 0) {
         memcpy(&s_unavailable[pos], entry, sizeof(*entry));
         return 0;
@@ -114,9 +129,9 @@ static int meta_unavailable_put(const TrackEntry *entry)
     return 0;
 }
 
-static void meta_unavailable_remove(const char *track_id)
+static void meta_unavailable_remove(const char *track_id, int album_id)
 {
-    int pos = meta_unavailable_find(track_id);
+    int pos = meta_unavailable_find(track_id, album_id);
     if (pos >= 0) {
         s_unavailable[pos] = s_unavailable[s_unavailable_count - 1];
         s_unavailable_count--;
@@ -160,7 +175,8 @@ static int meta_write_record(int slot, const MetaRecord *rec)
     return 0;
 }
 
-static int meta_dir_find(uint32_t hash, const char *track_id, MetaRecord *rec)
+static int meta_dir_find(uint32_t hash, const char *track_id, int album_id,
+                         MetaRecord *rec)
 {
     int i;
     for (i = 0; i < s_dir_count; i++) {
@@ -171,11 +187,34 @@ static int meta_dir_find(uint32_t hash, const char *track_id, MetaRecord *rec)
             continue;
         }
         if (rec->magic == META_RECORD_MAGIC &&
-            strcmp(rec->entry.id, track_id) == 0) {
+            strcmp(rec->entry.id, track_id) == 0 &&
+            rec->entry.album_id == album_id) {
             return i;
         }
     }
     return -1;
+}
+
+static int meta_dir_find_any(const char *track_id, MetaRecord *rec)
+{
+    MetaRecord candidate;
+    uint32_t newest = 0;
+    int newest_pos = -1;
+    int i;
+
+    for (i = 0; i < s_dir_count; ++i) {
+        if (meta_read_record(s_dir[i].slot, &candidate) != 0 ||
+            candidate.magic != META_RECORD_MAGIC ||
+            strcmp(candidate.entry.id, track_id) != 0) {
+            continue;
+        }
+        if (newest_pos < 0 || s_stamps[s_dir[i].slot] > newest) {
+            newest = s_stamps[s_dir[i].slot];
+            newest_pos = i;
+            memcpy(rec, &candidate, sizeof(*rec));
+        }
+    }
+    return newest_pos;
 }
 
 static void meta_dir_remove_slot(int slot)
@@ -270,7 +309,8 @@ static int meta_store_load(void)
         if (rec.stamp > s_clock) {
             s_clock = rec.stamp;
         }
-        s_dir[s_dir_count].hash = meta_hash(rec.entry.id);
+        s_dir[s_dir_count].hash = meta_hash_key(rec.entry.id,
+                                                rec.entry.album_id);
         s_dir[s_dir_count].slot = (uint16_t)slot;
         s_dir_count++;
     }
@@ -331,7 +371,8 @@ static int meta_ensure_loaded(void)
     return 0;
 }
 
-int track_meta_store_get(const char *track_id, TrackEntry *out)
+int track_meta_store_get_for(const char *track_id, int album_id,
+                             TrackEntry *out)
 {
     MetaRecord rec;
     int dir_pos;
@@ -342,12 +383,15 @@ int track_meta_store_get(const char *track_id, TrackEntry *out)
     }
 
     meta_lock();
-    dir_pos = meta_unavailable_find(track_id);
+    dir_pos = meta_unavailable_find(track_id, album_id);
     if (dir_pos >= 0) {
         memcpy(out, &s_unavailable[dir_pos], sizeof(*out));
         rc = 0;
     } else if (meta_ensure_loaded() == 0) {
-        dir_pos = meta_dir_find(meta_hash(track_id), track_id, &rec);
+        dir_pos = album_id != 0
+            ? meta_dir_find(meta_hash_key(track_id, album_id), track_id,
+                            album_id, &rec)
+            : meta_dir_find_any(track_id, &rec);
         if (dir_pos >= 0) {
             memcpy(out, &rec.entry, sizeof(*out));
             /* RAM-only stamp refresh: keeps this session's LRU honest without
@@ -358,6 +402,11 @@ int track_meta_store_get(const char *track_id, TrackEntry *out)
     }
     meta_unlock();
     return rc;
+}
+
+int track_meta_store_get(const char *track_id, TrackEntry *out)
+{
+    return track_meta_store_get_for(track_id, 0, out);
 }
 
 int track_meta_store_put(const TrackEntry *entry)
@@ -377,13 +426,14 @@ int track_meta_store_put(const TrackEntry *entry)
         meta_unlock();
         return rc;
     }
-    meta_unavailable_remove(entry->id);
+    meta_unavailable_remove(entry->id, entry->album_id);
     if (meta_ensure_loaded() != 0) {
         meta_unlock();
         return -1;
     }
 
-    dir_pos = meta_dir_find(meta_hash(entry->id), entry->id, &rec);
+    dir_pos = meta_dir_find(meta_hash_key(entry->id, entry->album_id),
+                            entry->id, entry->album_id, &rec);
     if (dir_pos >= 0) {
         slot = s_dir[dir_pos].slot;
     } else if (s_slot_count < META_STORE_SLOTS) {
@@ -411,7 +461,8 @@ int track_meta_store_put(const TrackEntry *entry)
         }
         s_stamps[slot] = rec.stamp;
         if (dir_pos < 0) {
-            s_dir[s_dir_count].hash = meta_hash(entry->id);
+            s_dir[s_dir_count].hash = meta_hash_key(entry->id,
+                                                    entry->album_id);
             s_dir[s_dir_count].slot = (uint16_t)slot;
             s_dir_count++;
         }

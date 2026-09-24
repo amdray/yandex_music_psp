@@ -150,7 +150,7 @@ void ui_screen_artist_handle_input(AppState *state, const InputState *input)
 
 void ui_screen_artist_render(const AppState *state)
 {
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_ARTIST));
 
     int count = state->liked_artist_count;
@@ -158,7 +158,7 @@ void ui_screen_artist_render(const AppState *state)
     /* The navigation gate guarantees the list is loaded before entry, so the
        only zero-row states left are a load error and a genuinely empty list. */
     if (s_error || count == 0) {
-        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
         return;
     }
 
@@ -212,18 +212,21 @@ void ui_screen_artist_render(const AppState *state)
         const ArtistEntry *ar = &state->liked_artists[i];
 
         if (i == state->artist_selected) {
-            ui_draw_rect(header_x, y - 3.0f, selection_width, item_height - 4.0f, 0xFF00D5FF);
+            ui_draw_rect(header_x, y - 3.0f, selection_width,
+                         item_height - 4.0f, UI_COLOR_ACCENT);
         }
 
         if (!cover_manager_draw_cover(COVER_ENTITY_ARTIST, ar->artist_id, NULL,
                                       (int)thumb_x, (int)y, (int)thumb_size, (int)thumb_size)) {
             if (cover_manager_is_loading(COVER_ENTITY_ARTIST, ar->artist_id, NULL)) {
-                ui_draw_rect(thumb_x, y, thumb_size, thumb_size, 0xFF444444);
+                ui_draw_rect(thumb_x, y, thumb_size, thumb_size,
+                             UI_COLOR_INACTIVE);
             }
         }
 
         text_render_clipped(text_x, y, ar->name,
-                            i == state->artist_selected ? 0xFFFFFFFF : 0xFFBBBBBB,
+                            i == state->artist_selected
+                                ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE,
                             text_max_w);
 
         char info[64];
@@ -237,7 +240,7 @@ void ui_screen_artist_render(const AppState *state)
                      " \xc2\xb7 %d \xd1\x82\xd1\x80\xd0\xb5\xd0\xba",
                      ar->album_count, ar->track_count);
         }
-        ui_draw_text(text_x, y + 16.0f, info, 0xFF888888);
+        ui_draw_text(text_x, y + 16.0f, info, UI_COLOR_INACTIVE);
     }
 
 }

@@ -19,12 +19,11 @@ typedef struct NetUiStatusSnapshot {
     int strength_valid;
     int hold;
     int wlan_on;
-    int download_visible;
+    unsigned int download_alpha;
 } NetUiStatusSnapshot;
 
 void net_ui_status_init(void);
 void net_ui_status_update(int hold, int wlan_on);
-void net_ui_status_on_rendered_frame(void);
 void net_ui_status_get_snapshot(NetUiStatusSnapshot *out);
 int net_ui_status_input_locked(void);
 

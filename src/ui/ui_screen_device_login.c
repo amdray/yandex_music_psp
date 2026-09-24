@@ -340,13 +340,13 @@ void ui_screen_device_login_render(const AppState *state)
     int left = 0;
 
     (void)state;
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_LOGIN_TITLE));
 
     if (s_result == 0) {
-        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_OK), 0xFF00FF00);
+        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_OK), UI_COLOR_ACTIVE);
     } else if (!s_codes_ready && s_result == -2) {
-        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_REQUEST), 0xFFFFFF00);
+        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_REQUEST), UI_COLOR_ACCENT);
     } else if (s_codes_ready) {
         if (s_dc.expires_in > 0) {
             left = s_dc.expires_in - login_elapsed_s();
@@ -354,19 +354,19 @@ void ui_screen_device_login_render(const AppState *state)
                 left = 0;
             }
         }
-        ui_draw_text(16.0f, 52.0f, locale_get(LOCALE_LOGIN_OPEN), 0xFFFFFFFF);
+        ui_draw_text(16.0f, 52.0f, locale_get(LOCALE_LOGIN_OPEN), UI_COLOR_PRIMARY);
         snprintf(line, sizeof(line), "%.60s", s_dc.verify_url);
-        ui_draw_text(16.0f, 68.0f, line, 0xFF00FF00);
-        ui_draw_text(16.0f, 92.0f, locale_get(LOCALE_LOGIN_ENTER_CODE), 0xFFFFFFFF);
+        ui_draw_text(16.0f, 68.0f, line, UI_COLOR_ACTIVE);
+        ui_draw_text(16.0f, 92.0f, locale_get(LOCALE_LOGIN_ENTER_CODE), UI_COLOR_PRIMARY);
         snprintf(line, sizeof(line), "%.20s", s_dc.user_code);
-        ui_draw_text(100.0f, 116.0f, line, 0xFFFFFF00);
+        ui_draw_text(100.0f, 116.0f, line, UI_COLOR_ACCENT);
         snprintf(line, sizeof(line), locale_get(LOCALE_LOGIN_LEFT),
                  left, s_tries);
-        ui_draw_text(16.0f, 150.0f, line, 0xFFAAAAAA);
+        ui_draw_text(16.0f, 150.0f, line, UI_COLOR_ACTIVE);
         login_draw_qr();
     }
     if (s_msg[0]) {
-        ui_draw_text(16.0f, 170.0f, s_msg, 0xFFFF4444);
+        ui_draw_text(16.0f, 170.0f, s_msg, UI_COLOR_ERROR);
     }
 
 }

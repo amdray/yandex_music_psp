@@ -317,7 +317,7 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
         u32 color = s_pending_tab == tab
                         ? ui_common_pulse_color()
                         : (ctx->state->playlist_tab == tab
-                               ? widget->color : 0xFF888888);
+                               ? widget->color : UI_COLOR_INACTIVE);
         playlist_list_tabs_widget(&tabs);
         playlist_list_tab_widget(tab, &tab_geometry);
         ui_draw_text(tabs.x + tab_geometry.x,
@@ -376,7 +376,8 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
             }
         } else if (strcmp(widget->binding,
                           "playlist_list.item_titles") == 0) {
-            u32 color = i == ctx->selected ? widget->color : 0xFFBBBBBB;
+            u32 color = i == ctx->selected
+                            ? widget->color : UI_COLOR_ACTIVE;
             if (ctx->opening_tracks &&
                 i == ctx->state->track_ui.pending_playlist_selected_index) {
                 color = ctx->opening_color;
@@ -421,7 +422,8 @@ void ui_screen_playlist_list_render(const AppState *state)
         context.opening_tracks =
             ui_screens_nav_pending() == SCREEN_TRACK_LIST;
         context.opening_color = context.opening_tracks
-                                    ? ui_common_pulse_color() : 0xFFFFFFFF;
+                                    ? ui_common_pulse_color()
+                                    : UI_COLOR_PRIMARY;
         if (context.selected >= 0 && context.selected < context.count) {
             const char *title = context.list[context.selected].title;
             if (s_marquee_tab != state->playlist_tab ||

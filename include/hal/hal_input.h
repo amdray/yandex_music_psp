@@ -9,6 +9,7 @@
 typedef struct InputState {
     u32 buttons;  /**< Currently held buttons (bitmask of PSP_CTRL_*) */
     u32 pressed;  /**< Buttons just pressed this frame (edge detection) */
+    int note_valid; /**< NOTE state came from the kernel controller sample */
     int hold;
     int wlan_on;
 } InputState;

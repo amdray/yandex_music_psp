@@ -1,7 +1,7 @@
 #ifndef YM_SERVICES_EQ_H
 #define YM_SERVICES_EQ_H
 
-// Программный 7-полосный эквалайзер (биквады RBJ, float) + предусиление.
+// Программный 7-полосный эквалайзер (биквады RBJ, float).
 //
 // Врезка: audio_player вызывает eq_process() для каждого декодированного
 // чанка ПЕРЕД sceAudioSRCOutputBlocking. Потокобезопасность: аудиопоток
@@ -11,8 +11,6 @@
 #define EQ_BANDS 7
 #define EQ_GAIN_MIN_DB (-12.0f)
 #define EQ_GAIN_MAX_DB (+12.0f)
-#define EQ_PREAMP_MAX_DB (+18.0f)
-#define EQ_PREAMP_STEP_DB (2.0f)
 
 typedef enum {
     EQ_PRESET_OFF = 0,
@@ -48,20 +46,14 @@ float eq_get_custom_gain(int band);
 // Активные усиления (для экрана).
 void eq_get_gains(float out_gains[EQ_BANDS]);
 
-// Предусиление к основной громкости, дБ (0..+12). VOL+ на максимуме
-// системной громкости прибавляет, VOL- убавляет.
-void eq_set_preamp_db(float db);
-float eq_get_preamp_db(void);
-
 // Обработка in-place, int16 interleaved. frames = сэмплов на канал.
 // rate = частота трека (44100/48000...), пересчёт при смене.
-// Плоская АЧХ + нулевой преамп = возврат без обработки (бит-перфект).
+// Плоская АЧХ = возврат без обработки (бит-перфект).
 void eq_process(short *pcm, int frames, int channels, int rate);
 int eq_is_active(void);
 
-// Тост после смены: 0 нет, 1 пресет, 2 предусиление, 3 качество.
+// Тост после смены: 0 нет, 1 пресет, 2 качество.
 int eq_toast_kind(void);
 int eq_toast_preset(void);  // пресет при kind==1, иначе -1
-void eq_notify_quality(void);  // показать тост качества (kind 3)
 
 #endif

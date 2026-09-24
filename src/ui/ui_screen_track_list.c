@@ -1,6 +1,7 @@
 #include "ui/ui_screen_track_list.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_screens.h"
 #include "services/locale.h"
 #include "services/cover_manager.h"
 #include "services/library.h"
@@ -260,14 +261,14 @@ void ui_screen_track_list_handle_input(AppState *state, const InputState *input)
 
     if (start_playback) {
         memcpy(&state->now_playing_track, &selected_track, sizeof(TrackEntry));
-        app_state_push(state, SCREEN_NOW_PLAYING);
+        ui_screens_navigate(state, SCREEN_NOW_PLAYING);
         playback_controller_request_play_current();
     }
 }
 
 void ui_screen_track_list_render(const AppState *state)
 {
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     
     // Название фиксируется при открытии плейлиста и не зависит от индекса,
     // который мог измениться после перехода.
@@ -318,7 +319,7 @@ void ui_screen_track_list_render(const AppState *state)
     /* The transition gate guarantees visible rows exist on entry, so the only
        zero-row state left is a genuinely empty playlist. */
     if (visible_count == 0) {
-        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
     } else {
         // Draw track list with thumbnails
         // Layout: header line (X=16) -> 6px selection indicator -> 5px gap -> cover (30x30) -> 5px gap -> text
@@ -340,11 +341,12 @@ void ui_screen_track_list_render(const AppState *state)
             
             // Draw selection indicator (aligned with header line, centered vertically relative to cover)
             if (i == selected_index) {
-                ui_draw_rect(header_x, y - 3.0f, selection_width, item_height - 4.0f, 0xFF00D5FF);
+                ui_draw_rect(header_x, y - 3.0f, selection_width,
+                             item_height - 4.0f, UI_COLOR_ACCENT);
             }
 
             if (!visible_valid[row]) {
-                ui_draw_text(text_x, y, "...", 0xFF777777);
+                ui_draw_text(text_x, y, "...", UI_COLOR_INACTIVE);
                 continue;
             }
 
@@ -352,15 +354,18 @@ void ui_screen_track_list_render(const AppState *state)
                 !cover_manager_draw_cover(COVER_ENTITY_ALBUM, track->album_id, NULL,
                                           (int)thumb_x, (int)y, (int)thumb_size, (int)thumb_size)) {
                 if (cover_manager_is_loading(COVER_ENTITY_ALBUM, track->album_id, NULL)) {
-                    ui_draw_rect(thumb_x, y, thumb_size, thumb_size, 0xFF444444);
+                    ui_draw_rect(thumb_x, y, thumb_size, thumb_size,
+                                 UI_COLOR_INACTIVE);
                 }
             }
             
             // First line: artist - title, with the edition/version de-emphasized.
-            u32 line1_color = !track->available ? 0xFF666666 :
-                              (i == selected_index ? 0xFFFFFFFF : 0xFFBBBBBB);
-            u32 version_color = !track->available ? 0xFF555555 :
-                                (i == selected_index ? 0xFFBBBBBB : 0xFF777777);
+            u32 line1_color = !track->available ? UI_COLOR_INACTIVE :
+                              (i == selected_index
+                                   ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE);
+            u32 version_color = !track->available ? UI_COLOR_INACTIVE :
+                                (i == selected_index
+                                     ? UI_COLOR_ACTIVE : UI_COLOR_INACTIVE);
             char line1[512];  // 96 + 160 + 64 + separators
             if (track->artist[0]) {
                 snprintf(line1, sizeof(line1), "%s - %s", track->artist, track->title);
@@ -423,7 +428,7 @@ void ui_screen_track_list_render(const AppState *state)
                 strncat(line2, locale_get(LOCALE_TRACK_EXPLICIT), sizeof(line2) - strlen(line2) - 1);
             }
             
-            ui_draw_text(text_x, y + 16.0f, line2, 0xFF888888);
+            ui_draw_text(text_x, y + 16.0f, line2, UI_COLOR_INACTIVE);
         }
     }
     

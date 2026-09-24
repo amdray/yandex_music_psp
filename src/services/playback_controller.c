@@ -216,6 +216,15 @@ static void wave_report_note_old(const PlaybackReportContext *old, int finished)
 }
 /* SEEK: accumulated relative-seek request (ms) from UI hold handling. */
 static int s_seek_delta_ms = 0;
+/* One-shot absolute seek bound to the restored track id. It remains pending
+ * through asynchronous metadata hydration and is cleared only after the
+ * audio worker accepts it or another playback intent supersedes it. */
+static int s_resume_seek_pending = 0;
+static int s_resume_position_ms = 0;
+static char s_resume_track_id[40];
+static int s_restored_paused = 0;
+static int s_restored_position_ms = 0;
+static char s_restored_track_id[40];
 
 /* Queue metadata resolution can come back PENDING (id known, entry not in the
  * store yet — deep shuffle jump or evicted record). The controller then asks
@@ -230,16 +239,21 @@ static u64 pb_now_us(void)
     return (u64)sceKernelGetSystemTimeWide();
 }
 
-static void pb_request_track_hydration(const char *track_id)
+static void pb_request_track_hydration(const TrackEntry *track)
 {
     static char s_last_requested[40];
+    static int s_last_requested_album = 0;
     static u64 s_last_requested_us = 0;
     u64 now = pb_now_us();
     char token[256];
 
     /* One request per id, re-issued at most every 3 s so a failed hydration
      * can never wedge playback permanently. */
-    if (strcmp(s_last_requested, track_id) == 0 &&
+    if (!track || !track->id[0]) {
+        return;
+    }
+    if (strcmp(s_last_requested, track->id) == 0 &&
+        s_last_requested_album == track->album_id &&
         (now - s_last_requested_us) < 3000000ULL) {
         return;
     }
@@ -247,12 +261,21 @@ static void pb_request_track_hydration(const char *track_id)
     if (token_loader_read(token, sizeof(token)) != 0) {
         return;
     }
-    track_hydrator_request_track(token, track_id, -1, 0);
+    track_hydrator_request_track(token, track->id, track->album_id, -1, 0);
     memset(token, 0, sizeof(token));
-    strncpy(s_last_requested, track_id, sizeof(s_last_requested) - 1);
+    strncpy(s_last_requested, track->id, sizeof(s_last_requested) - 1);
     s_last_requested[sizeof(s_last_requested) - 1] = '\0';
+    s_last_requested_album = track->album_id;
     s_last_requested_us = now;
-    logLine("pb: hydration requested track_id='%s'\n", track_id);
+    logLine("pb: hydration requested track_id='%s' album_id=%d\n",
+            track->id, track->album_id);
+}
+
+static void pb_clear_restored_pause(void)
+{
+    s_restored_paused = 0;
+    s_restored_position_ms = 0;
+    s_restored_track_id[0] = '\0';
 }
 
 static PlaybackIntentResult playback_controller_start_track(const TrackEntry *track)
@@ -264,6 +287,12 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
     if (!track->available) {
         logLine("pb: reject unavailable track_id='%s'\n", track->id);
         return PLAYBACK_INTENT_REJECTED;
+    }
+    if (s_resume_seek_pending &&
+        strcmp(s_resume_track_id, track->id) != 0) {
+        s_resume_seek_pending = 0;
+        s_resume_position_ms = 0;
+        s_resume_track_id[0] = '\0';
     }
 
     /* Early-exit if same track already in progress — avoids token disk read. */
@@ -312,7 +341,6 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
         return PLAYBACK_INTENT_REJECTED;
     }
     memset(s_token, 0, sizeof(s_token));
-    last_play_save();  // трек реально стартовал — запомнили очередь
     return PLAYBACK_INTENT_ACCEPTED;
 }
 
@@ -336,6 +364,10 @@ void playback_controller_init(void)
     s_network_retry_backoff_us = 500000ULL;
     /* SEEK: no queued seek across init. */
     s_seek_delta_ms = 0;
+    s_resume_seek_pending = 0;
+    s_resume_position_ms = 0;
+    s_resume_track_id[0] = '\0';
+    pb_clear_restored_pause();
     playback_queue_init();
     audio_player_init();
     logLine("pb: controller init\n");
@@ -351,6 +383,10 @@ void playback_controller_shutdown(void)
     s_cover_prefetch_triggered = 0;
     s_advance_triggered = 0;
     s_network_retry_pending = 0;
+    s_resume_seek_pending = 0;
+    s_resume_position_ms = 0;
+    s_resume_track_id[0] = '\0';
+    pb_clear_restored_pause();
     audio_player_shutdown();
     playback_queue_clear();
     memset(&g_playback, 0, sizeof(g_playback));
@@ -371,18 +407,128 @@ int playback_controller_quiesce(void)
     s_network_retry_pending = 0;
     /* SEEK: drop any queued seek on quiesce. */
     s_seek_delta_ms = 0;
+    s_resume_seek_pending = 0;
+    s_resume_position_ms = 0;
+    s_resume_track_id[0] = '\0';
+    pb_clear_restored_pause();
     return audio_player_quiesce();
 }
 
 void playback_controller_request_play_current(void)
 {
+    pb_clear_restored_pause();
+    s_resume_seek_pending = 0;
+    s_resume_position_ms = 0;
+    s_resume_track_id[0] = '\0';
     s_play_current_requested = 1;
     s_navigation_requested = 0;
     logLine("pb: play_current requested\n");
 }
 
+void playback_controller_request_resume_current(int position_ms)
+{
+    TrackEntry track;
+
+    memset(&track, 0, sizeof(track));
+    if (position_ms < 0) position_ms = 0;
+    if (playback_queue_get_current(&track) == PLAYBACK_QUEUE_EMPTY ||
+        !track.id[0]) {
+        return;
+    }
+    pb_clear_restored_pause();
+    s_resume_seek_pending = position_ms > 0;
+    s_resume_position_ms = position_ms;
+    strncpy(s_resume_track_id, track.id, sizeof(s_resume_track_id) - 1);
+    s_resume_track_id[sizeof(s_resume_track_id) - 1] = '\0';
+    s_play_current_requested = 1;
+    s_navigation_requested = 0;
+    s_play_retry_after_us = 0;
+    logLine("pb: resume requested track_id='%s' position_ms=%d\n",
+            s_resume_track_id, s_resume_position_ms);
+}
+
+void playback_controller_restore_paused_current(int position_ms)
+{
+    TrackEntry track;
+    int rc;
+
+    memset(&track, 0, sizeof(track));
+    rc = playback_queue_get_current(&track);
+    if (rc == PLAYBACK_QUEUE_EMPTY || !track.id[0]) {
+        pb_clear_restored_pause();
+        return;
+    }
+    if (position_ms < 0) position_ms = 0;
+    s_play_current_requested = 0;
+    s_resume_seek_pending = 0;
+    s_resume_position_ms = 0;
+    s_resume_track_id[0] = '\0';
+    s_restored_paused = 1;
+    s_restored_position_ms = position_ms;
+    strncpy(s_restored_track_id, track.id,
+            sizeof(s_restored_track_id) - 1);
+    s_restored_track_id[sizeof(s_restored_track_id) - 1] = '\0';
+    if (rc == PLAYBACK_QUEUE_OK) {
+        memcpy(&g_playback.current_track, &track, sizeof(track));
+        if (track.duration_ms > 0 &&
+            s_restored_position_ms > track.duration_ms) {
+            s_restored_position_ms = track.duration_ms;
+        }
+    } else {
+        pb_request_track_hydration(&track);
+    }
+    logLine("pb: restored paused track_id='%s' position_ms=%d metadata=%s\n",
+            s_restored_track_id, s_restored_position_ms,
+            rc == PLAYBACK_QUEUE_OK ? "ready" : "pending");
+}
+
+int playback_controller_prepare_current(TrackEntry *out)
+{
+    TrackEntry track;
+    int rc;
+
+    memset(&track, 0, sizeof(track));
+    rc = playback_queue_get_current(&track);
+    if (rc == PLAYBACK_QUEUE_EMPTY || !track.id[0]) {
+        return -1;
+    }
+    if (rc == PLAYBACK_QUEUE_PENDING) {
+        pb_request_track_hydration(&track);
+        return 0;
+    }
+    memcpy(&g_playback.current_track, &track, sizeof(track));
+    if (s_restored_paused &&
+        strcmp(s_restored_track_id, track.id) == 0 &&
+        track.duration_ms > 0 && s_restored_position_ms > track.duration_ms) {
+        s_restored_position_ms = track.duration_ms;
+    }
+    if (out) memcpy(out, &track, sizeof(track));
+    return 1;
+}
+
+int playback_controller_has_current(void)
+{
+    PlaybackQueueInfo info;
+    return playback_queue_get_info(&info) == 0 && info.count > 0 &&
+           info.current_index >= 0 && info.current_index < info.count;
+}
+
+int playback_controller_get_restored_pause(const char *track_id,
+                                            int *position_ms)
+{
+    if (!s_restored_paused ||
+        (track_id && strcmp(track_id, s_restored_track_id) != 0)) {
+        return 0;
+    }
+    if (position_ms) *position_ms = s_restored_position_ms;
+    return 1;
+}
+
 static void playback_controller_request_navigation(int direction)
 {
+    s_resume_seek_pending = 0;
+    s_resume_position_ms = 0;
+    s_resume_track_id[0] = '\0';
     s_navigation_requested = direction;
     s_play_current_requested = 0;
     s_play_retry_after_us = 0;
@@ -410,6 +556,7 @@ void playback_controller_request_toggle_pause(void)
 
 void playback_controller_request_stop(void)
 {
+    pb_clear_restored_pause();
     s_stop_playback_requested = 1;
     s_pause_toggle_requested = 0;
     logLine("pb: stop requested\n");
@@ -444,7 +591,7 @@ static void playback_controller_service_navigation(void)
         return;
     }
     if (rc == PLAYBACK_QUEUE_PENDING) {
-        pb_request_track_hydration(target.id);
+        pb_request_track_hydration(&target);
         s_play_retry_after_us = pb_now_us() + PB_PENDING_RETRY_US;
         logLine("pb: %s waiting metadata track_id='%s'\n",
                 direction > 0 ? "next" : "previous", target.id);
@@ -472,6 +619,8 @@ static void playback_controller_service_navigation(void)
         s_navigation_requested = 0;
         return;
     }
+    pb_clear_restored_pause();
+    last_play_save();
 
     s_navigation_requested = 0;
     s_prefetch_triggered = 0;
@@ -488,12 +637,22 @@ static void playback_controller_service_navigation(void)
 
 void playback_controller_service(void)
 {
+    if (s_restored_paused &&
+        (g_playback.current_track.id[0] == '\0' ||
+         strcmp(g_playback.current_track.id, s_restored_track_id) != 0 ||
+         g_playback.current_track.title[0] == '\0')) {
+        (void)playback_controller_prepare_current(NULL);
+    }
+
     if (s_stop_playback_requested) {
         s_stop_playback_requested = 0;
         s_play_current_requested = 0;
         s_navigation_requested = 0;
         s_network_retry_pending = 0;
         s_advance_triggered = 0;
+        s_resume_seek_pending = 0;
+        s_resume_position_ms = 0;
+        s_resume_track_id[0] = '\0';
         audio_player_stop();
         /* WAVE-REPORT: manual stop after first PCM → skip (snapshot taken
          * after the worker died, so audible_ms is final). */
@@ -524,7 +683,17 @@ void playback_controller_service(void)
                    state == AUDIO_PLAYER_PLAYING ||
                    state == AUDIO_PLAYER_BUFFERING) {
             audio_player_pause();
+            last_play_save();
         } else if (g_playback.current_track.id[0] != '\0') {
+            if (s_restored_paused &&
+                strcmp(s_restored_track_id,
+                       g_playback.current_track.id) == 0) {
+                s_resume_seek_pending = s_restored_position_ms > 0;
+                s_resume_position_ms = s_restored_position_ms;
+                strncpy(s_resume_track_id, s_restored_track_id,
+                        sizeof(s_resume_track_id) - 1);
+                s_resume_track_id[sizeof(s_resume_track_id) - 1] = '\0';
+            }
             s_play_current_requested = 1;
             s_play_retry_after_us = 0;
         }
@@ -541,6 +710,7 @@ void playback_controller_service(void)
             if (result == PLAYBACK_INTENT_ACCEPTED) {
                 logLine("pb: network recovered, retry track_id='%s'\n",
                         g_playback.current_track.id);
+                if (!s_resume_seek_pending) last_play_save();
                 s_network_retry_pending = 0;
                 s_error_handled = 0;
             } else {
@@ -557,8 +727,24 @@ void playback_controller_service(void)
         PlaybackIntentResult result;
         s_play_current_requested = 0;
         result = playback_controller_play_current();
+        if (result == PLAYBACK_INTENT_ACCEPTED) {
+            pb_clear_restored_pause();
+        }
         if (result != PLAYBACK_INTENT_ACCEPTED) {
             logLine("pb: deferred play_current rejected\n");
+        }
+    }
+
+    if (s_resume_seek_pending) {
+        AudioPlayerSnapshot resume_snapshot;
+        if (audio_player_get_snapshot(&resume_snapshot) &&
+            strcmp(resume_snapshot.track_id, s_resume_track_id) == 0 &&
+            audio_player_seek_to_ms(s_resume_position_ms) == 0) {
+            logLine("pb: resume seek accepted track_id='%s' position_ms=%d\n",
+                    s_resume_track_id, s_resume_position_ms);
+            s_resume_seek_pending = 0;
+            s_resume_position_ms = 0;
+            s_resume_track_id[0] = '\0';
         }
     }
 
@@ -588,7 +774,7 @@ void playback_controller_service(void)
                     }
                 }
             } else if (rc == PLAYBACK_QUEUE_PENDING) {
-                pb_request_track_hydration(next.id);
+                pb_request_track_hydration(&next);
                 s_prefetch_retry_after_us =
                     pb_now_us() + PB_PENDING_RETRY_US;
             }
@@ -618,10 +804,11 @@ void playback_controller_service(void)
         if (playback_queue_move_next() == 0) {
             TrackEntry next;
             int rc = playback_queue_get_current(&next);
+            last_play_save();
             if (rc == PLAYBACK_QUEUE_PENDING) {
                 /* Queue already moved; start via the deferred-play path once
                  * the metadata lands. play_current resets s_advance_triggered. */
-                pb_request_track_hydration(next.id);
+                pb_request_track_hydration(&next);
                 s_play_retry_after_us =
                     pb_now_us() + PB_PENDING_RETRY_US;
                 s_play_current_requested = 1;
@@ -684,12 +871,13 @@ void playback_controller_service(void)
                     playback_queue_move_next() == 0) {
                     TrackEntry next;
                     int rc = playback_queue_get_current(&next);
+                    last_play_save();
                     logLine("pb: error skip %d/%d -> track_id='%s'\n",
                             s_error_skips, PB_MAX_CONSECUTIVE_ERROR_SKIPS, next.id);
                     s_prefetch_triggered = 0;
                     s_cover_prefetch_triggered = 0;
                     if (rc == PLAYBACK_QUEUE_PENDING) {
-                        pb_request_track_hydration(next.id);
+                        pb_request_track_hydration(&next);
                         s_play_retry_after_us =
                             pb_now_us() + PB_PENDING_RETRY_US;
                         s_play_current_requested = 1;
@@ -733,11 +921,12 @@ PlaybackIntentResult playback_controller_play_current(void)
         if (rc == PLAYBACK_QUEUE_PENDING) {
             /* Id known, metadata not in the store yet: hydrate and retry from
              * service() on a slow tick. */
-            pb_request_track_hydration(track.id);
+            pb_request_track_hydration(&track);
             s_play_retry_after_us =
                 pb_now_us() + PB_PENDING_RETRY_US;
             s_play_current_requested = 1;
             logLine("pb: play_current waiting metadata track_id='%s'\n", track.id);
+            if (!s_resume_seek_pending) last_play_save();
             return PLAYBACK_INTENT_ACCEPTED;
         }
         s_play_retry_after_us = 0;
@@ -755,7 +944,13 @@ PlaybackIntentResult playback_controller_play_current(void)
         logLine("pb: play_current queue info unavailable track_id='%s'\n", track.id);
     }
 
-    return playback_controller_start_track(&track);
+    {
+        PlaybackIntentResult result = playback_controller_start_track(&track);
+        if (result == PLAYBACK_INTENT_ACCEPTED && !s_resume_seek_pending) {
+            last_play_save();
+        }
+        return result;
+    }
 }
 
 PlaybackStatus playback_controller_get_status(void)

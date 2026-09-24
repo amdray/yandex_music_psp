@@ -2,6 +2,15 @@
 #define CORE_MEM_PROBE_H
 
 #include <stddef.h>
+#include <psptypes.h>
+
+#define MEM_PROBE_HISTORY_CAPACITY 224
+
+typedef struct MemProbeSample {
+    u32 heap_used;
+    u32 heap_cap;
+    u32 largest_free;
+} MemProbeSample;
 
 /* Heap vs partition — two different pools, measured by two different calls.
  *
@@ -25,5 +34,12 @@ size_t mem_heap_free(void);
  * (sceKernelMaxFreeMemSize). This is headroom for raising the cap, NOT memory
  * that malloc can reach at the current cap. */
 size_t mem_partition_free(void);
+
+/* Samples once per five seconds. Call only from the main thread. */
+void mem_probe_update(u64 now_us);
+
+/* Copies samples oldest first. No allocation and no PSP memory query here. */
+int mem_probe_history_copy(MemProbeSample *out, int capacity);
+int mem_probe_latest(MemProbeSample *out);
 
 #endif /* CORE_MEM_PROBE_H */

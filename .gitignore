@@ -17,10 +17,12 @@ layout_dump.txt
 tools/
 assets/icon/
 devtools/
+design/
 
 # Local project notes (not part of the public repository)
 docs/
 AGENTS.md
+CHANGES_SINCE_GITHUB.md
 
 # Local secrets
 config/token.txt

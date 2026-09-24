@@ -24,6 +24,7 @@ typedef struct {
     // (us, sceKernelGetSystemTimeWide). 0 = не взведён; сброс при прогрессе.
     unsigned long long recv_deadline_us;
     unsigned long long send_deadline_us;
+    int close_notify_active;
 } NetTlsConnection;
 
 /* Stable transport categories propagated through HTTP.  mbedTLS native error

@@ -8,7 +8,6 @@
 
 #include "core/fs.h"
 #include "ui/ui_draw.h"
-#include "services/image_loader.h"
 #include "core/logger.h"
 #include "services/splash_flow.h"
 #include "services/audio_cache.h"
@@ -38,13 +37,11 @@
 #include "ui/ui_screen_wave.h"
 #include "ui/ui_screen_search.h"
 #include "ui/ui_screen_help.h"
+#include "ui/ui_screen_memory.h"
 #include "ui/ui_common.h"
 #include "ui/ui_layout.h"
 #include "ui/ui_icon_atlas.h"
 
-static void *s_splash_pixels = NULL;
-static int s_splash_w = 0;
-static int s_splash_h = 0;
 static SplashFlow s_splash_flow;
 static ScreenId s_last_screen = SCREEN_COUNT;
 static int s_fatal_resource_error = 0;
@@ -89,7 +86,13 @@ static void splash_input(AppState *state, const InputState *input)
 static void splash_render(const AppState *state)
 {
     (void)state;
-    ui_screen_splash_render(&s_splash_flow, s_splash_pixels, s_splash_w, s_splash_h);
+    ui_screen_splash_render(&s_splash_flow);
+}
+
+static void splash_on_exit(AppState *state)
+{
+    (void)state;
+    splash_flow_release_image(&s_splash_flow);
 }
 
 static void album_list_render(const AppState *state)
@@ -122,6 +125,7 @@ static void now_playing_on_exit(AppState *state)
 static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
     [SCREEN_SPLASH] = {
         .name = "splash",
+        .on_exit = splash_on_exit,
         .update = splash_update,
         .handle_input = splash_input,
         .render = splash_render,
@@ -133,12 +137,18 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .render = ui_screen_menu_render,
         .owns_back = 1,
     },
+    [SCREEN_SETTINGS] = {
+        .name = "settings",
+        .handle_input = ui_screen_settings_handle_input,
+        .render = ui_screen_settings_render,
+    },
     [SCREEN_NOW_PLAYING] = {
         .name = "now_playing",
         .on_exit = now_playing_on_exit,
         .update = ui_screen_now_playing_update,
         .handle_input = ui_screen_now_playing_handle_input,
         .render = ui_screen_now_playing_render,
+        .content_ready = ui_screen_now_playing_content_ready,
         .owns_back = 1,  // круг перехватывает дропдаун SELECT
     },
     [SCREEN_ALBUM_LIST] = {
@@ -222,6 +232,10 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
     [SCREEN_HELP] = {
         .name = "help",
         .render = ui_screen_help_render,
+    },
+    [SCREEN_MEMORY] = {
+        .name = "memory",
+        .render = ui_screen_memory_render,
     },
 };
 
@@ -349,7 +363,9 @@ void ui_screens_update(AppState *state, const InputState *input)
 
     if (s_fatal_resource_error) return;
 
-    system_status_update();
+    system_status_update(input &&
+                         (input->buttons &
+                          (PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)));
     net_ui_status_update(input ? input->hold : 0,
                          input ? input->wlan_on : 0);
     screens_sync_lifecycle(state);
@@ -370,12 +386,6 @@ void ui_screens_update(AppState *state, const InputState *input)
 
 int ui_screens_init(void)
 {
-    void *data = NULL;
-    int w = 0;
-    int h = 0;
-    const char *rel_path = "assets/splash.jpg";
-    int loaded = 0;
-
     s_fatal_resource_error = 0;
     s_fatal_resource_path = NULL;
     if (ui_layout_load("assets/ui_layout.txt") != 0) {
@@ -391,26 +401,8 @@ int ui_screens_init(void)
         return 0;
     }
 
-    logLine("ui: splash load try '%s'\n", rel_path);
-    if (image_load_rgba8888(rel_path, &data, &w, &h, NULL) == 0) {
-        loaded = 1;
-    }
-
-    if (loaded) {
-        s_splash_pixels = data;
-        s_splash_w = w;
-        s_splash_h = h;
-        logLine("ui: splash loaded %dx%d\n", w, h);
-        // Log memory after splash load (using safe function)
-        {
-            int maxFree = sceKernelMaxFreeMemSize();
-            logLine("mem: after splash max_free=%d\n", maxFree);
-        }
-    } else {
-        logLine("ui: splash load failed (non-critical)\n");
-    }
-
     splash_flow_init(&s_splash_flow);
+    ui_screen_memory_init();
     system_status_init();
     net_ui_status_init();
 
@@ -505,11 +497,12 @@ void ui_screens_render(const AppState *state)
 
     if (s_fatal_resource_error) {
         char fatal_line[96];
-        ui_draw_clear(0xFF1A1A1A);
+        ui_draw_clear(UI_COLOR_BACKGROUND);
         snprintf(fatal_line, sizeof(fatal_line), "FATAL: %s",
                  s_fatal_resource_path ? s_fatal_resource_path : "UI resource");
-        ui_draw_text(16.0f, 118.0f, fatal_line, 0xFFFFFFFF);
-        ui_draw_text(16.0f, 138.0f, "Reinstall application resources", 0xFFBBBBBB);
+        ui_draw_text(16.0f, 118.0f, fatal_line, UI_COLOR_PRIMARY);
+        ui_draw_text(16.0f, 138.0f, "Reinstall application resources",
+                     UI_COLOR_ACTIVE);
         ui_draw_end_frame();
         return;
     }
@@ -517,7 +510,7 @@ void ui_screens_render(const AppState *state)
     if (desc && desc->render) {
         desc->render(state);
     } else {
-        ui_draw_clear(0xFF1A1A1A);
+        ui_draw_clear(UI_COLOR_BACKGROUND);
         ui_common_draw_header("Unknown");
     }
 
@@ -525,7 +518,6 @@ void ui_screens_render(const AppState *state)
         ui_common_draw_top_status();
     }
     ui_common_draw_eq_toast();
-    net_ui_status_on_rendered_frame();
 
     ui_draw_end_frame();
 }

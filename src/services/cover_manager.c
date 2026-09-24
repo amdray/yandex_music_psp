@@ -11,7 +11,7 @@
 
 #include "core/fs.h"
 #include "core/logger.h"
-#include "hal/hal_fb.h"
+#include "hal/hal_gfx_config.h"
 #include "hal/hal_gpu.h"
 #include "services/cover_cache.h"
 #include "services/cover_storage.h"
@@ -653,8 +653,8 @@ int cover_manager_draw_cover(CoverEntityType entity_type, int entity_id, const c
         return 0;
     }
 
-    void *dst = hal_fb_get_draw_buffer();
-    int dst_stride = hal_fb_get_stride();
+    void *dst = hal_gpu_get_draw_buffer_cpu();
+    int dst_stride = VRAM_BUFFER_WIDTH;
     if (!dst || dst_stride <= 0) {
         return 0;
     }
@@ -662,8 +662,8 @@ int cover_manager_draw_cover(CoverEntityType entity_type, int entity_id, const c
     int copy_w = entry->w < max_w ? entry->w : max_w;
     int copy_h = entry->h < max_h ? entry->h : max_h;
 
-    int fb_w = hal_fb_get_width();
-    int fb_h = hal_fb_get_height();
+    int fb_w = SCREEN_WIDTH;
+    int fb_h = SCREEN_HEIGHT;
     if (dst_x < 0 || dst_y < 0 || dst_x + copy_w > fb_w || dst_y + copy_h > fb_h) {
         return 0;
     }

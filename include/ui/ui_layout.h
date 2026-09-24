@@ -21,6 +21,8 @@ typedef struct UiLayoutWidget {
     float w;
     float h;
     u32 color;
+    u32 secondary_color;
+    u32 background_color;
     char binding[UI_LAYOUT_BINDING_MAX];
     float step;
 } UiLayoutWidget;

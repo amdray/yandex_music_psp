@@ -87,7 +87,7 @@ void ui_screen_eq_render(const AppState *state)
     int i;
 
     (void)state;
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_EQ_TITLE));
     eq_get_gains(gains);
 
@@ -96,9 +96,10 @@ void ui_screen_eq_render(const AppState *state)
              locale_get(LOCALE_EQ_PRESET),
              ui_common_eq_preset_name(eq_get_preset()));
     if (s_sel == 0) {
-        ui_draw_rect(12.0f, y - 2.0f, 6.0f, 14.0f, 0xFF00D5FF);
+        ui_draw_rect(12.0f, y - 2.0f, 6.0f, 14.0f, UI_COLOR_ACCENT);
     }
-    ui_draw_text(24.0f, y, line, s_sel == 0 ? 0xFFFFFFFF : 0xFFBBBBBB);
+    ui_draw_text(24.0f, y, line,
+                 s_sel == 0 ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE);
     y += 20.0f;
 
     // Полосы кастомного профиля (показываем активные дБ).
@@ -106,10 +107,10 @@ void ui_screen_eq_render(const AppState *state)
         eq_band_label(i, band, sizeof(band));
         snprintf(line, sizeof(line), "%-8s %+d dB", band, (int)gains[i]);
         if (s_sel == i + 1) {
-            ui_draw_rect(12.0f, y - 2.0f, 6.0f, 14.0f, 0xFF00D5FF);
+            ui_draw_rect(12.0f, y - 2.0f, 6.0f, 14.0f, UI_COLOR_ACCENT);
         }
         ui_draw_text(24.0f, y, line,
-                     s_sel == i + 1 ? 0xFFFFFFFF : 0xFFBBBBBB);
+                     s_sel == i + 1 ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE);
         y += 15.0f;
     }
 

@@ -13,6 +13,7 @@
 typedef enum ScreenId {
     SCREEN_SPLASH = 0,
     SCREEN_MENU,
+    SCREEN_SETTINGS,
     SCREEN_NOW_PLAYING,
     SCREEN_ALBUM_LIST,
     SCREEN_PLAYLIST_LIST,
@@ -26,6 +27,7 @@ typedef enum ScreenId {
     SCREEN_WAVE,
     SCREEN_SEARCH,
     SCREEN_HELP,
+    SCREEN_MEMORY,
     SCREEN_COUNT
 } ScreenId;
 
@@ -114,6 +116,7 @@ typedef struct AppState {
     int stack_size;
     AppResourceMode resource_mode;
     int menu_index;
+    int settings_index;
     u32 splash_start_ms;
     u64 ui_now_us;
 

@@ -38,6 +38,9 @@
 #define YM_TRACK_PARSE_ERR (-1)
 
 int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry);
+int ym_api_parse_track_from_object_for_album(cJSON *track_obj,
+                                              int preferred_album_id,
+                                              TrackEntry *entry);
 
 /* First non-empty artists[].cutoutCover.uri in server order.
  *   0 found (out filled), 1 absent, -1 bad args or value too long

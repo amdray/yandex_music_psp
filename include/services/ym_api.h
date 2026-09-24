@@ -61,6 +61,13 @@ int ym_api_tracks_hydrate(YmApiContext *ctx,
                           void *user_data,
                           int *out_status);
 
+int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
+                               const TrackRef *refs,
+                               int count,
+                               YmApiTrackCallback on_track,
+                               void *user_data,
+                               int *out_status);
+
 int ym_api_playlist_tracks_parser_init(YmPlaylistTracksParser *parser,
                                        YmApiTrackIdCallback on_track_id,
                                        void *user_data);

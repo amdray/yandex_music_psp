@@ -1,7 +1,8 @@
 #include "ui/ui_screen_splash.h"
 #include "ui/ui_draw.h"
-#include "ui/ui_common.h"
-#include "hal/hal_fb.h"
+#include "ui/ui_layout.h"
+#include "ui/ui_screens.h"
+#include "hal/hal_gfx_config.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
 #include "services/last_play.h"
@@ -10,31 +11,25 @@
 #include <pspctrl.h>
 #include <pspgu.h>
 #include <stdio.h>
-
-void ui_screen_splash_init(void)
-{
-    // Initialization handled in ui_screens_init
-}
-
-void ui_screen_splash_shutdown(void)
-{
-    // Cleanup handled in ui_screens_shutdown
-}
+#include <string.h>
 
 void ui_screen_splash_update(AppState *state, SplashFlow *flow)
 {
     splash_flow_tick(flow, state);
     if (flow->ready) {
-        // Было что играть — продолжаем сразу на плеере, но меню
-        // кладём под него (иначе с плеера некуда выйти по кругу).
-        if (last_play_restore(state) == 0) {
-            logLine("splash: ready -> menu+now_playing begin\n");
+        int autoplay = last_play_autostart_enabled();
+        int restored = last_play_restore(state, autoplay) == 0;
+        if (restored && autoplay) {
+            logLine("splash: ready -> menu+now_playing restored\n");
             logger_flush();
             app_state_reset(state, SCREEN_MENU);
-            app_state_push(state, SCREEN_NOW_PLAYING);
+            ui_screens_navigate(state, SCREEN_NOW_PLAYING);
             logLine("splash: restore stack done\n");
             logger_flush();
             return;
+        }
+        if (restored) {
+            logLine("splash: saved session loaded without autoplay\n");
         }
         logLine("splash: ready -> app_state_reset(MENU) begin\n");
         logger_flush();
@@ -46,37 +41,52 @@ void ui_screen_splash_update(AppState *state, SplashFlow *flow)
 
 void ui_screen_splash_handle_input(AppState *state, const InputState *input, SplashFlow *flow)
 {
+    (void)state;
     // If there's an error, allow retry with X button
     if (splash_flow_has_error(flow)) {
         if (input->pressed & PSP_CTRL_CROSS) {
             splash_flow_retry(flow);
         }
-    } else if (input->pressed && flow->ready) {
-        // If ready, any button goes to menu
-        app_state_reset(state, SCREEN_MENU);
     }
 }
 
-void ui_screen_splash_render(const SplashFlow *flow, void *splash_pixels, int splash_w, int splash_h)
+static void splash_layout_slot(const UiLayoutWidget *widget, void *user_data)
 {
-    if (splash_pixels) {
-        void *dst = hal_fb_get_draw_buffer();
-        int stride = hal_fb_get_stride();
-        int width = hal_fb_get_width();
-        int height = hal_fb_get_height();
-        int copy_w = splash_w < width ? splash_w : width;
-        int copy_h = splash_h < height ? splash_h : height;
+    const SplashFlow *flow = (const SplashFlow *)user_data;
 
-        hal_gpu_flush_cache_range(splash_pixels, (unsigned int)(splash_w * splash_h * 4));
-        hal_gpu_copy_image(GU_PSM_8888, 0, 0, copy_w, copy_h, splash_w, splash_pixels,
-                           0, 0, stride, dst);
-    } else {
-        ui_draw_clear(0xFF1A1A1A);
-        ui_common_draw_header("YMPSP");
+    if (strcmp(widget->binding, "splash.logo") == 0) {
+        int x;
+        int y;
+        int src_stride;
+        if (!flow || !flow->image_pixels || flow->image_w <= 0 ||
+            flow->image_h <= 0 ||
+            flow->image_stride_bytes < flow->image_w * 4) {
+            return;
+        }
+        x = (int)(widget->x + (widget->w - flow->image_w) * 0.5f);
+        y = (int)(widget->y + (widget->h - flow->image_h) * 0.5f);
+        if (x < 0 || y < 0 || x + flow->image_w > SCREEN_WIDTH ||
+            y + flow->image_h > SCREEN_HEIGHT) {
+            return;
+        }
+        void *dst = hal_gpu_get_draw_buffer_cpu();
+        int stride = VRAM_BUFFER_WIDTH;
+        src_stride = flow->image_stride_bytes / 4;
+
+        hal_gpu_flush_cache_range(flow->image_pixels,
+                                  (unsigned int)(flow->image_stride_bytes *
+                                                 flow->image_h));
+        hal_gpu_copy_image(GU_PSM_8888, 0, 0, flow->image_w, flow->image_h,
+                           src_stride, flow->image_pixels, x, y, stride, dst);
+    } else if (strcmp(widget->binding, "splash.status") == 0) {
+        const char *status = flow && flow->status
+                                 ? flow->status
+                                 : locale_get(LOCALE_SPLASH_INITIALIZING);
+        ui_draw_text(widget->x, widget->y, status, widget->color);
     }
-    if (flow->status) {
-        ui_draw_text(16.0f, 230.0f, flow->status, 0xFFFFFFFF);
-    } else {
-        ui_draw_text(16.0f, 230.0f, locale_get(LOCALE_SPLASH_INITIALIZING), 0xFFFFFFFF);
-    }
+}
+
+void ui_screen_splash_render(const SplashFlow *flow)
+{
+    ui_layout_render("splash", NULL, splash_layout_slot, (void *)flow);
 }

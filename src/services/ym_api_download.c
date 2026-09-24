@@ -11,18 +11,19 @@
 #include "services/net_http.h"
 
 #define YM_FILE_INFO_SECRET "kzqU4XhfCaY6B6JTHODeq5"
-#define YM_FILE_INFO_QUALITY "nq"
 #define YM_FILE_INFO_CODECS "mp3"
 #define YM_FILE_INFO_TRANSPORTS "raw"
 
 // Качество MP3: "nq" (192) / "hq" (320), проверено пробой get-file-info.
 // Действует со следующего трека (текущий уже тянется своим URL).
-static char s_quality[8] = "nq";
+/* Both values have static lifetime; an aligned pointer store publishes the
+ * selection without modifying bytes that a download worker may be reading. */
+static const char * volatile s_quality = "nq";
 
 void ym_api_download_set_quality(const char *q)
 {
     if (q && (strcmp(q, "nq") == 0 || strcmp(q, "hq") == 0)) {
-        snprintf(s_quality, sizeof(s_quality), "%s", q);
+        s_quality = strcmp(q, "hq") == 0 ? "hq" : "nq";
         logLine("ym_api_download: quality %s\n", s_quality);
         logger_flush();
     }
@@ -69,6 +70,7 @@ static int ym_url_encode_component(const char *in, char *out, size_t out_size)
 static int ym_download_build_mp3_raw_url(const char *track_id,
                                          char *out_url, size_t out_size)
 {
+    const char *quality = s_quality;
     const mbedtls_md_info_t *md_info;
     time_t now;
     char ts[24];
@@ -93,7 +95,7 @@ static int ym_download_build_mp3_raw_url(const char *track_id,
     ts[sizeof(ts) - 1] = '\0';
 
     snprintf(sign_input, sizeof(sign_input), "%s%s%s%s%s",
-             ts, track_id, s_quality,
+             ts, track_id, quality,
              YM_FILE_INFO_CODECS, YM_FILE_INFO_TRANSPORTS);
     sign_input[sizeof(sign_input) - 1] = '\0';
 
@@ -129,7 +131,7 @@ static int ym_download_build_mp3_raw_url(const char *track_id,
     url_len = snprintf(out_url, out_size,
                        "https://api.music.yandex.net/get-file-info"
                        "?ts=%s&trackId=%s&quality=%s&codecs=%s&sign=%s&transports=%s",
-                       ts, track_id, s_quality, YM_FILE_INFO_CODECS,
+                       ts, track_id, quality, YM_FILE_INFO_CODECS,
                        sign_query, YM_FILE_INFO_TRANSPORTS);
     if (url_len < 0 || (size_t)url_len >= out_size) {
         logLine("ym_api_download: URL truncated need=%d have=%u\n",

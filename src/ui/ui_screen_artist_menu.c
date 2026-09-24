@@ -113,7 +113,7 @@ void ui_screen_artist_menu_update(AppState *state)
         memset(&state->now_playing_track, 0, sizeof(state->now_playing_track));
         snprintf(state->now_playing_track.id, sizeof(state->now_playing_track.id),
                  "%s", first_id);
-        app_state_push(state, SCREEN_NOW_PLAYING);
+        ui_screens_navigate(state, SCREEN_NOW_PLAYING);
         playback_controller_request_play_current();
     } else if (rc == -1) {
         s_open_err = 1;
@@ -216,7 +216,7 @@ void ui_screen_artist_menu_handle_input(AppState *state, const InputState *input
                 snprintf(state->now_playing_track.id,
                          sizeof(state->now_playing_track.id), "%d",
                          brief->popular_tracks[0].track_id);
-                app_state_push(state, SCREEN_NOW_PLAYING);
+                ui_screens_navigate(state, SCREEN_NOW_PLAYING);
                 playback_controller_request_play_current();
             } else {
                 logLine("artist_menu: queue set failed\n");
@@ -229,7 +229,7 @@ void ui_screen_artist_menu_handle_input(AppState *state, const InputState *input
 
 void ui_screen_artist_menu_render(const AppState *state)
 {
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
 
     const ArtistBriefInfo *brief = &state->artist_brief;
     const ArtistEntry *artist = &state->liked_artists[state->artist_selected];
@@ -241,7 +241,7 @@ void ui_screen_artist_menu_render(const AppState *state)
     int artist_id = artist->artist_id;
     if (!cover_manager_draw_cover(COVER_ENTITY_ARTIST, artist_id, "200x200",
                                   (int)cov_x, (int)cov_y, (int)cov_sz, (int)cov_sz)) {
-        ui_draw_rect(cov_x, cov_y, cov_sz, cov_sz, 0xFF333333);
+        ui_draw_rect(cov_x, cov_y, cov_sz, cov_sz, UI_COLOR_INACTIVE);
     }
 
     if (state->artist_brief_loading == 2) {
@@ -249,11 +249,11 @@ void ui_screen_artist_menu_render(const AppState *state)
         snprintf(info, sizeof(info),
                  "\xd0\xa2\xd1\x80\xd0\xb5\xd0\xba\xd0\xbe\xd0\xb2: %d",
                  brief->count_tracks);
-        ui_draw_text(cov_x, cov_y + cov_sz + 4.0f, info, 0xFFBBBBBB);
+        ui_draw_text(cov_x, cov_y + cov_sz + 4.0f, info, UI_COLOR_ACTIVE);
         snprintf(info, sizeof(info),
                  "\xd0\x90\xd0\xbb\xd1\x8c\xd0\xb1\xd0\xbe\xd0\xbc\xd0\xbe\xd0\xb2: %d",
                  brief->count_direct_albums);
-        ui_draw_text(cov_x, cov_y + cov_sz + 18.0f, info, 0xFFBBBBBB);
+        ui_draw_text(cov_x, cov_y + cov_sz + 18.0f, info, UI_COLOR_ACTIVE);
     }
 
     const float col_x = 212.0f;
@@ -263,31 +263,33 @@ void ui_screen_artist_menu_render(const AppState *state)
     const float item_h = 34.0f;
     const float sel_w = 4.0f;
 
-    ui_draw_text(col_x, 4.0f, artist->name, 0xFFFFFFFF);
+    ui_draw_text(col_x, 4.0f, artist->name, UI_COLOR_PRIMARY);
 
     ui_draw_text(col_x, tab_label_y,
                  "\xd0\x90\xd0\xbb\xd1\x8c\xd0\xb1\xd0\xbe\xd0\xbc\xd1\x8b",
-                 s_tab == 0 ? 0xFFFFFFFF : 0xFF888888);
+                 s_tab == 0 ? UI_COLOR_PRIMARY : UI_COLOR_INACTIVE);
     ui_draw_text(col_x + 78.0f, tab_label_y,
                  "\xd0\x94\xd1\x80\xd1\x83\xd0\xb3\xd0\xb8\xd0\xb5",
-                 s_tab == 1 ? 0xFFFFFFFF : 0xFF888888);
+                 s_tab == 1 ? UI_COLOR_PRIMARY : UI_COLOR_INACTIVE);
 
     float active_tab_x = (s_tab == 0) ? col_x : col_x + 78.0f;
-    ui_draw_rect(active_tab_x, tab_label_y + 13.0f, 48.0f, 2.0f, 0xFF00D5FF);
-    ui_draw_rect(col_x, list_y_start - 2.0f, col_w, 1.0f, 0xFF333333);
+    ui_draw_rect(active_tab_x, tab_label_y + 13.0f, 48.0f, 2.0f,
+                 UI_COLOR_ACCENT);
+    ui_draw_rect(col_x, list_y_start - 2.0f, col_w, 1.0f,
+                 UI_COLOR_INACTIVE);
 
     /* The navigation gate guarantees the brief is loaded (or failed) before
        entry — no in-between loading state can be visible here. */
     if (state->artist_brief_loading == -1) {
         ui_draw_text(col_x, list_y_start,
-                     locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+                     locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
     } else {
         const ArtistAlbumEntry *list = (s_tab == 0) ? brief->albums : brief->also_albums;
         int count = (s_tab == 0) ? brief->album_count : brief->also_album_count;
 
         if (count == 0) {
             ui_draw_text(col_x, list_y_start,
-                         locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+                         locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
         } else {
             int start_idx = s_scroll;
             int end_idx = start_idx + ARTIST_MENU_VISIBLE;
@@ -299,14 +301,17 @@ void ui_screen_artist_menu_render(const AppState *state)
                 const ArtistAlbumEntry *alb = &list[i];
 
                 if (i == s_selected) {
-                    ui_draw_rect(col_x, y - 1.0f, sel_w, item_h - 2.0f, 0xFF00D5FF);
+                    ui_draw_rect(col_x, y - 1.0f, sel_w,
+                                 item_h - 2.0f, UI_COLOR_ACCENT);
                 }
 
                 {
                     float title_x = col_x + sel_w + 3.0f;
                     float title_max_w = (col_x + col_w) - title_x;
-                    u32 title_color = i == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB;
-                    u32 version_color = i == s_selected ? 0xFFBBBBBB : 0xFF777777;
+                    u32 title_color = i == s_selected
+                                          ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE;
+                    u32 version_color = i == s_selected
+                                            ? UI_COLOR_ACTIVE : UI_COLOR_INACTIVE;
                     text_render_clipped(title_x, y, alb->title, title_color, title_max_w);
                     if (alb->version[0]) {
                         float title_w = text_measure_width(alb->title);
@@ -324,7 +329,8 @@ void ui_screen_artist_menu_render(const AppState *state)
                 if (alb->year > 0) {
                     char sub[16];
                     snprintf(sub, sizeof(sub), "%d", alb->year);
-                    ui_draw_text(col_x + sel_w + 3.0f, y + 16.0f, sub, 0xFF888888);
+                    ui_draw_text(col_x + sel_w + 3.0f, y + 16.0f, sub,
+                                 UI_COLOR_INACTIVE);
                 }
             }
         }

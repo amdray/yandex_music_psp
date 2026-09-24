@@ -19,13 +19,11 @@
 #include "services/image_loader.h"
 #include "services/cover_manager.h"
 #include "services/eq.h"
-#include "services/system_status.h"
 #include "services/playback_controller.h"
 #include "services/audio_player.h"
 #include "services/net_client.h"
 #include "core/logger.h"
 #include "core/fs.h"
-#include "core/clock.h"
 #include "core/mem_probe.h"
 #include "services/systemctrl_rng.h"
 
@@ -57,9 +55,19 @@ static int hal_input_ready = 0;
 
 static void log_heap_state(const char *stage)
 {
-    size_t cap = mem_heap_cap();
-    size_t used = mem_heap_used();
-    size_t free_bytes = cap > used ? cap - used : 0;
+    MemProbeSample sample;
+    size_t cap;
+    size_t used;
+    size_t free_bytes;
+
+    if (mem_probe_latest(&sample)) {
+        cap = sample.heap_cap;
+        used = sample.heap_used;
+    } else {
+        cap = mem_heap_cap();
+        used = mem_heap_used();
+    }
+    free_bytes = cap > used ? cap - used : 0;
 
     logLine("mem: heap stage=%s used=%u free=%u cap=%u\n",
             stage ? stage : "periodic",
@@ -72,7 +80,6 @@ typedef enum {
     EXIT_STAGE_NONE = 0,
     EXIT_STAGE_AFTER_LOGGER = 1,
     EXIT_STAGE_AFTER_FS = 2,
-    EXIT_STAGE_AFTER_CLOCK = 3,
 } ExitStage;
 
 static int exit_on_stage(ExitStage stage)
@@ -219,20 +226,6 @@ int main(int argc, char *argv[])
         return 0;
     }
 
-    logLine("app: init - clock_init\n");
-    // Initialize system time (required for TLS/SSL certificate validation)
-    if (clock_init() < 0) {
-        logLine("app: FATAL - RTC check failed, TLS/SSL will not work\n");
-        logLine("app: Please check:\n");
-        logLine("app:   1. PSP battery (RTC battery may be dead)\n");
-        logLine("app:   2. Date/Time in PSP settings (must be >= 2024)\n");
-        goto cleanup;
-    }
-    logLine("app: system time initialized\n");
-    if (exit_on_stage(EXIT_STAGE_AFTER_CLOCK)) {
-        return 0;
-    }
-
     logLine("app: init - hal_gpu_init\n");
     LOG_FLUSH();  // Flush before GPU init to see progress
     if (hal_gpu_init() < 0) {
@@ -281,10 +274,12 @@ int main(int argc, char *argv[])
     }
     exit_code = 0;
 
+    mem_probe_update(sceKernelGetSystemTimeWide());
     log_heap_state("initialized");
     logLine("app: entering main loop\n");
     logger_flush();
     u64 last_net_poll_us = 0;
+    u64 note_pressed_us = 0;
     int wd_pos = -1;
     u64 wd_t0 = 0;
     int wd_stage = 0;
@@ -319,30 +314,26 @@ int main(int argc, char *argv[])
             if (net_client_runtime_started()) net_client_poll();
         }
 
-        /* Кнопка ♪ (NOTE): переключение профилей эквалайзера везде. */
-        if (input.pressed & PSP_CTRL_NOTE) {
-            int p = eq_next_preset();
-            eq_save();
-            logLine("app: NOTE -> eq preset %d\n", p);
+        now_us = sceKernelGetSystemTimeWide();
+        /* Короткое нажатие ♪ с отпусканием меняет пресет; длительное
+         * удержание остаётся системной кнопкой звука. */
+        if (!input.note_valid) {
+            note_pressed_us = 0;
+        } else if (input.pressed & PSP_CTRL_NOTE) {
+            note_pressed_us = now_us;
+        } else if (note_pressed_us != 0 && !(input.buttons & PSP_CTRL_NOTE)) {
+            if (now_us - note_pressed_us < 1000000ULL) {
+                int p = eq_next_preset();
+                eq_save();
+                logLine("app: NOTE short -> eq preset %d\n", p);
+            } else {
+                logLine("app: NOTE long hold -> eq unchanged\n");
+            }
+            note_pressed_us = 0;
         }
 
-        /* Громкость поверх системного максимума: VOL+ на 30/30 растит
-         * предусиление (+2 дБ, до +12), VOL- сначала сливает его.
-         * (ОС свои шаги тоже делает — это её сторону не отменяет.) */
-        if (input.pressed & (PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)) {
-            SystemStatusSnapshot vs;
-            system_status_get_snapshot(&vs);
-            if (input.pressed & PSP_CTRL_VOLUP) {
-                if (vs.volume_available && vs.volume_level >= 30 &&
-                    eq_get_preamp_db() < EQ_PREAMP_MAX_DB) {
-                    eq_set_preamp_db(eq_get_preamp_db() + EQ_PREAMP_STEP_DB);
-                    eq_save();
-                }
-            } else if (eq_get_preamp_db() > 0.0f) {
-                eq_set_preamp_db(eq_get_preamp_db() - EQ_PREAMP_STEP_DB);
-                eq_save();
-            }
-        }
+        s_app_state.ui_now_us = now_us;
+        mem_probe_update(now_us);
 
         ui_screens_update(&s_app_state, &input);
         if (net_client_requires_process_exit()) {
@@ -352,9 +343,6 @@ int main(int argc, char *argv[])
         ui_screens_handle_input(&s_app_state, &input);
         ui_screens_render(&s_app_state);
         playback_controller_service();
-
-        now_us = sceKernelGetSystemTimeWide();
-        s_app_state.ui_now_us = now_us;
 
         if (last_heap_log_us == 0 || now_us - last_heap_log_us >= 10000000ULL) {
             log_heap_state("periodic");

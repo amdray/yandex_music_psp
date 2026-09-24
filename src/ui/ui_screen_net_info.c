@@ -25,9 +25,9 @@ static const char *security_name(unsigned int t)
  */
 #define VAL_X   120.0f
 #define ROW_H    16.0f
-#define COL_LABEL 0xFF888888u
-#define COL_VALUE 0xFFFFFFFFu
-#define COL_DIM   0xFFAAAAAau
+#define COL_LABEL UI_COLOR_INACTIVE
+#define COL_VALUE UI_COLOR_PRIMARY
+#define COL_DIM   UI_COLOR_ACTIVE
 
 static float draw_field(float y, const char *label, const char *value)
 {
@@ -54,14 +54,13 @@ static float draw_signal(float y, unsigned int strength)
 
     filled = (float)(strength * (unsigned int)BAR_W) / 99.0f;
 
-    if (strength > 66u)      { bar_color = 0xFF00CC00u; } /* green  */
-    else if (strength > 33u) { bar_color = 0xFF00CCCCu; } /* cyan   */
-    else                     { bar_color = 0xFF4444FFu; } /* red-ish */
+    if (strength > 33u) { bar_color = UI_COLOR_ACTIVE; }
+    else                { bar_color = UI_COLOR_ERROR; }
 
     ui_draw_text(16.0f, y, locale_get(LOCALE_NET_INFO_SIGNAL), COL_LABEL);
 
     /* background */
-    ui_draw_rect(BAR_X, y + 2.0f, BAR_W, BAR_H, 0xFF333333u);
+    ui_draw_rect(BAR_X, y + 2.0f, BAR_W, BAR_H, UI_COLOR_INACTIVE);
     /* filled portion */
     if (filled > 0.0f) {
         ui_draw_rect(BAR_X, y + 2.0f, filled, BAR_H, bar_color);
@@ -80,14 +79,14 @@ void ui_screen_net_info_render(void)
     float y = 48.0f;
     char buf[64];
 
-    ui_draw_clear(0xFF1A1A1Au);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_NET_INFO));
 
     net_ui_status_get_snapshot(&status);
     info = status.apctl;
 
     if (!info.valid) {
-        ui_draw_text(16.0f, y, locale_get(LOCALE_NET_INFO_NOT_CONNECTED), 0xFF4444FFu);
+        ui_draw_text(16.0f, y, locale_get(LOCALE_NET_INFO_NOT_CONNECTED), UI_COLOR_ERROR);
         return;
     }
 
@@ -103,7 +102,7 @@ void ui_screen_net_info_render(void)
     }
 
     /* separator before IP block */
-    ui_draw_rect(16.0f, y, 440.0f, 1.0f, 0xFF333333u);
+    ui_draw_rect(16.0f, y, 440.0f, 1.0f, UI_COLOR_INACTIVE);
     y += 4.0f;
 
     y = draw_field(y, locale_get(LOCALE_NET_INFO_IP),      info.ip[0]      ? info.ip      : "-");

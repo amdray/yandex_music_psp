@@ -226,7 +226,7 @@ static void search_play_at(AppState *state, int index)
     memset(&state->now_playing_track, 0, sizeof(state->now_playing_track));
     snprintf(state->now_playing_track.id,
              sizeof(state->now_playing_track.id), "%s", s_ids[index]);
-    app_state_push(state, SCREEN_NOW_PLAYING);
+    ui_screens_navigate(state, SCREEN_NOW_PLAYING);
     playback_controller_request_play_current();
 }
 
@@ -319,20 +319,20 @@ void ui_screen_search_render(const AppState *state)
     int start_idx, end_idx, row;
 
     (void)state;
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_SEARCH));
     snprintf(line, sizeof(line), "%.100s",
              s_has_query ? s_query : "...");
-    ui_draw_text(16.0f, 30.0f, line, 0xFFBBBBBB);
+    ui_draw_text(16.0f, 30.0f, line, UI_COLOR_ACTIVE);
 
     if (s_status == 1) {
-        ui_draw_text(16.0f, 52.0f, "...", 0xFF00D5FF);
+        ui_draw_text(16.0f, 52.0f, "...", UI_COLOR_ACCENT);
     } else if (s_status == -1 && s_count == 0) {
         ui_draw_text(16.0f, 52.0f,
-                     locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+                     locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
     } else if (s_status == 2 && s_count == 0) {
         ui_draw_text(16.0f, 52.0f,
-                     locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+                     locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
     } else if (s_count > 0) {
         start_idx = s_scroll;
         if (start_idx < 0) {
@@ -348,7 +348,8 @@ void ui_screen_search_render(const AppState *state)
         for (row = start_idx; row < end_idx; row++) {
             float y = 52.0f + (float)(row - start_idx) * 34.0f;
             if (row == s_selected) {
-                ui_draw_rect(16.0f, y - 3.0f, 6.0f, 30.0f, 0xFF00D5FF);
+                ui_draw_rect(16.0f, y - 3.0f, 6.0f, 30.0f,
+                             UI_COLOR_ACCENT);
             }
             if (s_meta_valid[row]) {
                 if (s_meta[row].artist[0]) {
@@ -363,7 +364,8 @@ void ui_screen_search_render(const AppState *state)
                 snprintf(line, sizeof(line), "%d. %s", row + 1, s_ids[row]);
             }
             ui_draw_text(30.0f, y, line,
-                         row == s_selected ? 0xFFFFFFFF : 0xFFBBBBBB);
+                         row == s_selected
+                             ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE);
         }
     }
 }

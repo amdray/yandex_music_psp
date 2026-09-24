@@ -21,11 +21,10 @@ OBJS = src/main.o \
        src/ui/ui_screen_wave.o \
        src/ui/ui_screen_search.o \
        src/ui/ui_screen_help.o \
+       src/ui/ui_screen_memory.o \
        src/ui/ui_screen_eq.o \
        src/hal/hal_input.o \
        src/hal/hal_gpu.o \
-       src/hal/hal_fb.o \
-       src/core/clock.o \
        src/core/fs.o \
        src/core/logger.o \
        src/core/mem_probe.o \
@@ -38,7 +37,9 @@ OBJS = src/main.o \
        src/services/token_loader.o \
        src/services/ya_auth.o \
        src/services/last_play.o \
+       src/services/track_like.o \
        src/services/ym_api_like.o \
+       src/services/ym_api_genres.o \
        src/services/ym_api_albums.o \
        src/services/ym_api_wave.o \
        src/services/ym_api_rotor.o \
@@ -54,6 +55,7 @@ OBJS = src/main.o \
        src/services/net_stack.o \
        src/services/net_activity.o \
        src/services/net_ui_status.o \
+       src/services/time_sync.o \
        src/services/dns_wire.o \
        src/services/dns.o \
        src/services/net_tls.o \
@@ -89,7 +91,7 @@ PSP_CONFIG ?= psp-config
 PSPSDK ?= $(shell $(PSP_CONFIG) --pspsdk-path)
 RELEASE_DIR = release
 FONT_RESOURCES = $(wildcard fonts/*)
-ASSET_RESOURCES = $(filter-out assets/icon/%.gif assets/icon/%_preview.png,$(shell find assets -type f))
+ASSET_RESOURCES = $(filter-out assets/icon/%.gif assets/icon/%.svg assets/icon/%_preview.png assets/icon/in_explicit.png,$(shell find assets -type f))
 PACKAGED_FONT_RESOURCES = $(patsubst fonts/%,$(RELEASE_DIR)/fonts/%,$(FONT_RESOURCES))
 PACKAGED_ASSET_RESOURCES = $(patsubst assets/%,$(RELEASE_DIR)/assets/%,$(ASSET_RESOURCES))
 RELEASE_TOKEN = $(RELEASE_DIR)/config/token.txt
@@ -123,6 +125,7 @@ include $(PSPSDK)/lib/build.mak
 $(RELEASE_DIR)/EBOOT.PBP: $(TARGET).elf PARAM.SFO $(PBP_ICON) $(RELEASE_TOKEN)
 	@mkdir -p $(RELEASE_DIR)
 	@psp-strip $(TARGET).elf -o $(RELEASE_DIR)/$(TARGET)_strip.elf
+	@rm -f $@
 	@pack-pbp $@ PARAM.SFO $(PBP_ICON) NULL NULL NULL NULL $(RELEASE_DIR)/$(TARGET)_strip.elf NULL
 	@rm -f $(RELEASE_DIR)/$(TARGET)_strip.elf
 

@@ -16,7 +16,7 @@ int text_init(void)
         logLine("text: cbmf_fonts_init failed rc=%d\n", rc);
         return -1;
     }
-    logLine("text: UI font immutable atlas ready\n");
+    logLine("text: UI font immutable atlases ready\n");
     return 0;
 }
 
@@ -27,9 +27,15 @@ void text_shutdown(void)
 
 /* Wrap a CBMF draw in the GU state the atlas backend expects: textured, and
    alpha-test discarding the transparent CLUT index (index 0). */
-static void text_draw(int x, int y, const char *text, u32 color_abgr)
+static CbmfFontId text_font_id(TextFont font)
 {
-    CbmfPspRenderer *r = cbmf_fonts_get_renderer();
+    return (CbmfFontId)font;
+}
+
+static void text_draw(TextFont font, int x, int y, const char *text,
+                      u32 color_abgr)
+{
+    CbmfPspRenderer *r = cbmf_fonts_get_renderer(text_font_id(font));
     if (!r) {
         return;
     }
@@ -46,10 +52,16 @@ static void text_draw(int x, int y, const char *text, u32 color_abgr)
 
 void text_render(float x, float y, const char *text, u32 color_abgr)
 {
+    text_render_font(TEXT_FONT_UI, x, y, text, color_abgr);
+}
+
+void text_render_font(TextFont font, float x, float y, const char *text,
+                      u32 color_abgr)
+{
     if (!text || !hal_gpu_in_frame()) {
         return;
     }
-    text_draw((int)x, (int)y, text, color_abgr);
+    text_draw(font, (int)x, (int)y, text, color_abgr);
 }
 
 static int utf8_step(const unsigned char *s, uint32_t *cp)
@@ -75,15 +87,21 @@ static int utf8_step(const unsigned char *s, uint32_t *cp)
 void text_render_clipped(float x, float y, const char *text,
                          u32 color_abgr, float max_width)
 {
+    text_render_clipped_font(TEXT_FONT_UI, x, y, text, color_abgr, max_width);
+}
+
+void text_render_clipped_font(TextFont font, float x, float y, const char *text,
+                              u32 color_abgr, float max_width)
+{
     if (!text || !hal_gpu_in_frame()) {
         return;
     }
     if (max_width <= 0.f) {
-        text_draw((int)x, (int)y, text, color_abgr);
+        text_draw(font, (int)x, (int)y, text, color_abgr);
         return;
     }
 
-    const CbmfFont *f = cbmf_fonts_get_font();
+    const CbmfFont *f = cbmf_fonts_get_font(text_font_id(font));
     if (!f) {
         return;
     }
@@ -107,11 +125,18 @@ void text_render_clipped(float x, float y, const char *text,
         p += n;
     }
     buf[out] = '\0';
-    text_draw((int)x, (int)y, buf, color_abgr);
+    text_draw(font, (int)x, (int)y, buf, color_abgr);
 }
 
 void text_render_window(float x, float y, const char *text,
                         u32 color_abgr, float skip_px, float max_width)
+{
+    text_render_window_font(TEXT_FONT_UI, x, y, text, color_abgr,
+                            skip_px, max_width);
+}
+
+void text_render_window_font(TextFont font, float x, float y, const char *text,
+                             u32 color_abgr, float skip_px, float max_width)
 {
     const CbmfFont *f;
     const unsigned char *p;
@@ -129,11 +154,11 @@ void text_render_window(float x, float y, const char *text,
         return;
     }
     if (skip_px <= 0.f) {
-        text_render_clipped(x, y, text, color_abgr, max_width);
+        text_render_clipped_font(font, x, y, text, color_abgr, max_width);
         return;
     }
 
-    f = cbmf_fonts_get_font();
+    f = cbmf_fonts_get_font(text_font_id(font));
     if (!f) {
         return;
     }
@@ -171,19 +196,30 @@ void text_render_window(float x, float y, const char *text,
         p += n;
     }
     buf[out] = '\0';
-    text_draw((int)(x - residual), (int)y, buf, color_abgr);
+    text_draw(font, (int)(x - residual), (int)y, buf, color_abgr);
 }
 
 float text_measure_width(const char *text)
 {
+    return text_measure_width_font(TEXT_FONT_UI, text);
+}
+
+float text_measure_width_font(TextFont font, const char *text)
+{
     if (!text) {
         return 0.f;
     }
-    const CbmfFont *f = cbmf_fonts_get_font();
+    const CbmfFont *f = cbmf_fonts_get_font(text_font_id(font));
     if (!f) {
         return 0.f;
     }
     int32_t w = 0;
     cbmf_text_width_utf8(f, text, &w);
     return (float)w;
+}
+
+int text_line_height_font(TextFont font)
+{
+    const CbmfFont *f = cbmf_fonts_get_font(text_font_id(font));
+    return f ? (int)f->line_height : 0;
 }

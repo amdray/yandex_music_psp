@@ -1,30 +1,26 @@
 #include "ui/ui_screen_now_playing.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_icon_atlas.h"
 #include "ui/ui_layout.h"
 #include "ui/ui_screens.h"
-#include "hal/hal_fb.h"
+#include "hal/hal_gfx_config.h"
 #include "hal/hal_gpu.h"
 #include "services/locale.h"
-#include "services/eq.h"
-#include "services/token_loader.h"
+#include "services/track_like.h"
 #include "services/wave.h"
-#include "services/ym_api.h"
-#include "services/ym_api_like.h"
 #include "services/audio_cache.h"
 #include "services/audio_player.h"
 #include "services/cover_now_playing.h"
 #include "services/playback_controller.h"
 #include "services/video_player.h"
 #include "services/video_cover.h"
-#include "services/system_status.h"
 #include "core/logger.h"
 #include "app/app_state.h"
 #include "fonts/text.h"
 #include <pspctrl.h>
 #include <pspgu.h>
 #include <pspkernel.h>
-#include <pspthreadman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,11 +37,66 @@ static u64          s_np_last_us      = 0;
 static char         s_marquee_track[40] = {0};
 static u64          s_marquee_start_us = 0;
 
-static void draw_now_playing_bottom_bar(void)
+static void format_sample_rate(int sample_rate, char *out, size_t out_size)
 {
-    UiLayoutWidget bar;
-    if (ui_layout_get_widget("now_playing", "bottom_bar", &bar) == 0) {
-        ui_draw_rect(bar.x, bar.y, bar.w, bar.h, bar.color);
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (sample_rate <= 0) return;
+
+    if ((sample_rate % 1000) == 0) {
+        snprintf(out, out_size, "%d kHz", sample_rate / 1000);
+    } else {
+        snprintf(out, out_size, "%.1f kHz", sample_rate / 1000.0f);
+    }
+}
+
+static void draw_now_playing_bottom_bar(const UiLayoutWidget *status_widget,
+                                        const UiLayoutWidget *mp3,
+                                        const UiLayoutWidget *bitrate_widget,
+                                        const UiLayoutWidget *sample_rate_widget,
+                                        const char *status,
+                                        const AudioPlayerSnapshot *snapshot)
+{
+    if (status_widget) {
+        if (status && status[0]) {
+            float width = text_measure_width(status);
+            ui_draw_text(status_widget->x +
+                             (status_widget->w - width) * 0.5f,
+                         status_widget->y +
+                             (status_widget->h - 14.0f) * 0.5f,
+                         status, status_widget->color);
+        } else if (snapshot) {
+            char bitrate[16];
+            char sample_rate[16];
+            int icon_width = 0;
+            int icon_height = 0;
+
+            bitrate[0] = '\0';
+            if (snapshot->bitrate_kbps > 0) {
+                snprintf(bitrate, sizeof(bitrate), "%d kbps",
+                         snapshot->bitrate_kbps);
+            }
+            format_sample_rate(snapshot->sample_rate,
+                               sample_rate, sizeof(sample_rate));
+
+            if (mp3 &&
+                ui_icon_atlas_get_size("in_mp3", &icon_width,
+                                       &icon_height) == 0) {
+                int icon_x;
+                int icon_y;
+                icon_x = (int)mp3->x + ((int)mp3->w - icon_width) / 2;
+                icon_y = (int)mp3->y + ((int)mp3->h - icon_height) / 2;
+                ui_icon_atlas_draw("in_mp3", icon_x, icon_y, mp3->color);
+            }
+            if (bitrate_widget && bitrate[0]) {
+                ui_draw_text(bitrate_widget->x, bitrate_widget->y,
+                             bitrate, bitrate_widget->color);
+            }
+            if (sample_rate_widget && sample_rate[0]) {
+                ui_draw_text(sample_rate_widget->x, sample_rate_widget->y,
+                             sample_rate, sample_rate_widget->color);
+            }
+        }
     }
 }
 
@@ -179,7 +230,7 @@ static void draw_video_cover_activity(float cover_x, float cover_y, float cover_
     int start = (int)((now_us / 4000ULL) % (u64)perimeter);
     draw_perimeter_piece(cover_x - gap - thickness,
                          cover_y - gap - thickness,
-                         side, start, segment, thickness, 0xFF00D5FF);
+                         side, start, segment, thickness, UI_COLOR_ACCENT);
 }
 
 static void format_duration(int duration_ms, char *out, size_t out_size)
@@ -194,96 +245,61 @@ static void format_duration(int duration_ms, char *out, size_t out_size)
     snprintf(out, out_size, "%d:%02d", minutes, seconds);
 }
 
-static void format_audio_info(const AudioPlayerSnapshot *snapshot, char *out, size_t out_size)
-{
-    char bitrate_str[32];
-    char sample_rate_str[32];
-
-    if (!snapshot || !out || out_size == 0) {
-        return;
-    }
-
-    out[0] = '\0';
-    bitrate_str[0] = '\0';
-    sample_rate_str[0] = '\0';
-
-    if (snapshot->bitrate_kbps > 0) {
-        snprintf(bitrate_str, sizeof(bitrate_str), "MP3 %d kbps", snapshot->bitrate_kbps);
-    }
-
-    if (snapshot->sample_rate > 0) {
-        if ((snapshot->sample_rate % 1000) == 0) {
-            snprintf(sample_rate_str, sizeof(sample_rate_str), "%d kHz", snapshot->sample_rate / 1000);
-        } else {
-            snprintf(sample_rate_str, sizeof(sample_rate_str), "%.1f kHz", snapshot->sample_rate / 1000.0f);
-        }
-    }
-
-    if (bitrate_str[0] && sample_rate_str[0]) {
-        snprintf(out, out_size, "%s · %s", bitrate_str, sample_rate_str);
-    } else if (bitrate_str[0]) {
-        snprintf(out, out_size, "%s", bitrate_str);
-    } else if (sample_rate_str[0]) {
-        snprintf(out, out_size, "%s", sample_rate_str);
-    }
-}
-
-static const char *audio_player_state_label(AudioPlayerState state)
+static const char *audio_player_bottom_status(AudioPlayerState state)
 {
     switch (state) {
-        case AUDIO_PLAYER_OPENING:   return "OPENING";
-        case AUDIO_PLAYER_PLAYING:   return "PLAYING";
-        case AUDIO_PLAYER_PAUSED:    return "PAUSED";
-        case AUDIO_PLAYER_BUFFERING: return "BUFFERING";
-        case AUDIO_PLAYER_STOPPING:  return "STOPPING";
-        case AUDIO_PLAYER_STOPPED:   return "STOPPED";
-        case AUDIO_PLAYER_FINISHED:  return "FINISHED";
-        case AUDIO_PLAYER_ERROR:     return "ERROR";
-        default:                     return "IDLE";
+        case AUDIO_PLAYER_OPENING:   return "Opening";
+        case AUDIO_PLAYER_BUFFERING: return "Buffering";
+        case AUDIO_PLAYER_ERROR:     return "Error";
+        default:                     return NULL;
     }
 }
 
-static void draw_progress_bar(float x, float y,
-                              float width, float height,
-                              const AudioPlayerSnapshot *snapshot,
-                              const AudioCacheStatus *cache_status,
-                              const char *track_id,
-                              u32 playback_color,
-                              u32 buffer_color,
-                              u32 bg_color,
-                              u32 text_color)
+static void draw_progress_time(const UiLayoutWidget *widget,
+                               const AudioPlayerSnapshot *snapshot)
+{
+    int clamped_position_ms;
+    char elapsed_str[16];
+    char total_str[16];
+    float total_width;
+
+    if (!widget || !snapshot || snapshot->duration_ms <= 0) return;
+
+    clamped_position_ms = snapshot->position_ms;
+    if (clamped_position_ms < 0) clamped_position_ms = 0;
+    if (clamped_position_ms > snapshot->duration_ms)
+        clamped_position_ms = snapshot->duration_ms;
+
+    format_duration(clamped_position_ms, elapsed_str, sizeof(elapsed_str));
+    format_duration(snapshot->duration_ms, total_str, sizeof(total_str));
+    total_width = text_measure_width(total_str);
+    ui_draw_text(widget->x, widget->y, elapsed_str, widget->color);
+    ui_draw_text(widget->x + widget->w - total_width, widget->y,
+                 total_str, widget->color);
+}
+
+static void draw_progress_fill(const UiLayoutWidget *widget,
+                               const AudioPlayerSnapshot *snapshot,
+                               const AudioCacheStatus *cache_status,
+                               const char *track_id)
 {
     int clamped_position_ms;
     float progress;
     float filled_width;
     float buffered_progress = 0.0f;
-    float buffered_width = 0.0f;
-    char elapsed_str[16];
-    char total_str[16];
-    float total_width;
-    float total_x;
+    float buffered_width;
 
-    if (!snapshot || snapshot->duration_ms <= 0) {
-        return;
-    }
+    if (!widget || !snapshot || snapshot->duration_ms <= 0) return;
 
     clamped_position_ms = snapshot->position_ms;
-    if (clamped_position_ms < 0) {
-        clamped_position_ms = 0;
-    }
-    if (clamped_position_ms > snapshot->duration_ms) {
+    if (clamped_position_ms < 0) clamped_position_ms = 0;
+    if (clamped_position_ms > snapshot->duration_ms)
         clamped_position_ms = snapshot->duration_ms;
-    }
 
     progress = (float)clamped_position_ms / (float)snapshot->duration_ms;
-    if (progress < 0.0f) {
-        progress = 0.0f;
-    }
-    if (progress > 1.0f) {
-        progress = 1.0f;
-    }
-
-    filled_width = width * progress;
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+    filled_width = widget->w * progress;
 
     if (cache_status && track_id && strcmp(cache_status->track_id, track_id) == 0) {
         if (cache_status->content_length > 0 && cache_status->downloaded_bytes > 0) {
@@ -292,51 +308,20 @@ static void draw_progress_bar(float x, float y,
         } else if (cache_status->complete || cache_status->state == AUDIO_CACHE_READY) {
             buffered_progress = 1.0f;
         }
-        if (buffered_progress < 0.0f) {
-            buffered_progress = 0.0f;
-        }
-        if (buffered_progress > 1.0f) {
-            buffered_progress = 1.0f;
-        }
+        if (buffered_progress < 0.0f) buffered_progress = 0.0f;
+        if (buffered_progress > 1.0f) buffered_progress = 1.0f;
     }
+    buffered_width = widget->w * buffered_progress;
 
-    buffered_width = width * buffered_progress;
-
-    format_duration(clamped_position_ms, elapsed_str, sizeof(elapsed_str));
-    format_duration(snapshot->duration_ms, total_str, sizeof(total_str));
-    total_width = text_measure_width(total_str);
-    total_x = x + width - total_width;
-
-    ui_draw_text(x, y, elapsed_str, text_color);
-    ui_draw_text(total_x, y, total_str, text_color);
-    ui_draw_rect(x, y + 14.0f, width, height, bg_color);
+    ui_draw_rect(widget->x, widget->y, widget->w, widget->h,
+                 widget->background_color);
     if (buffered_width > 0.0f) {
-        ui_draw_rect(x, y + 14.0f, buffered_width, height, buffer_color);
+        ui_draw_rect(widget->x, widget->y, buffered_width, widget->h,
+                     widget->secondary_color);
     }
     if (filled_width > 0.0f) {
-        ui_draw_rect(x, y + 14.0f, filled_width, height, playback_color);
-    }
-}
-
-static void draw_volume_bar(float x, float y, float width, float height)
-{
-    SystemStatusSnapshot status;
-    const int segments = 30;
-    const float segment_width = 5.0f;
-    const float gap = 1.0f;
-    const float scale_width = segment_width * segments + gap * (segments - 1);
-    const float scale_x = x + (width - scale_width) * 0.5f;
-    int i;
-
-    system_status_get_snapshot(&status);
-    if (!status.volume_available) {
-        return;
-    }
-
-    for (i = 0; i < segments; ++i) {
-        u32 color = i < status.volume_level ? 0xFF00D5FF : 0xFF3A3A3A;
-        ui_draw_rect(scale_x + i * (segment_width + gap), y,
-                     segment_width, height, color);
+        ui_draw_rect(widget->x, widget->y, filled_width, widget->h,
+                     widget->color);
     }
 }
 
@@ -345,95 +330,6 @@ static int s_last_selected_index = -1;
 static char s_last_loaded_track_id[128] = {0};
 static char s_last_cover_uri[96] = {0};
 static int s_video_cover_requested = 0;
-
-/* Сердце лайка: всегда видно, красное = в лайках, серое = нет.
- * Геометрия 5x5, масштаб 2 (10x10 px). */
-static void draw_like_heart(float x, float y, int liked)
-{
-    static const char rows[5][6] = {
-        "XX XX",
-        "XXXXX",
-        "XXXXX",
-        " XXX ",
-        "  X  ",
-    };
-    u32 color = liked ? 0xFF0000FF : 0xFF444444;
-    int r, c;
-    for (r = 0; r < 5; r++) {
-        for (c = 0; c < 5; c++) {
-            if (rows[r][c] == 'X') {
-                ui_draw_rect(x + (float)(c * 2), y + (float)(r * 2),
-                             2.0f, 2.0f, color);
-            }
-        }
-    }
-}
-
-/* --- Лайк треугольником (фон, без фриза UI) -------------------------------
- * Метка "*" — локальный паритет на трек (предзагрузки всего сета лайков
- * нет: ответ на 2500 треков не влезет в RAM). add/remove идемпотентны,
- * поэтому паритет всегда сходится с сервером независимо от стартового
- * состояния. Воркер одноразовый, подбирается в update(). */
-static SceUID s_like_tid = -1;
-static char s_like_token[256];
-static int s_like_uid = 0;
-static char s_like_track[40];
-static int s_like_target = 0;
-static char s_like_marked[40];
-static int s_like_marked_on = 0;
-
-static int like_worker(SceSize args, void *argp)
-{
-    YmApiContext ctx;
-
-    (void)args;
-    (void)argp;
-    ctx.oauth_token = s_like_token;
-    ctx.timeout_ms = 0;
-    logLine("like: post id='%s' like=%d\n", s_like_track, s_like_target);
-    if (ym_api_track_like(&ctx, s_like_uid, s_like_track,
-                          s_like_target) == 0) {
-        snprintf(s_like_marked, sizeof(s_like_marked), "%s", s_like_track);
-        s_like_marked_on = s_like_target;
-        logLine("like: ok id='%s' like=%d\n", s_like_track, s_like_target);
-    } else {
-        logLine("like: failed id='%s' like=%d\n", s_like_track, s_like_target);
-    }
-    logger_flush();
-    memset(s_like_token, 0, sizeof(s_like_token));
-    return 0;
-}
-
-static void like_reap(void)
-{
-    SceKernelThreadRunStatus st;
-
-    if (s_like_tid < 0) {
-        return;
-    }
-    st.size = sizeof(st);
-    if (sceKernelReferThreadRunStatus(s_like_tid, &st) == 0 &&
-        st.status == PSP_THREAD_STOPPED) {
-        sceKernelDeleteThread(s_like_tid);
-        s_like_tid = -1;
-    }
-}
-
-static int like_is_on(const char *track_id)
-{
-    return track_id && track_id[0] && s_like_marked_on &&
-           strcmp(s_like_marked, track_id) == 0;
-}
-
-/* Дропдаун на удержание SELECT: качество, эквалайзер, усиление.
- * Короткое нажатие — только подсказка. */
-#define DD_HOLD_US 700000ULL
-#define DD_ROWS 3
-static int s_dd_open = 0;
-static int s_dd_sel = 0;
-static unsigned long long s_sel_t0 = 0;
-static int s_sel_fired = 0;
-static unsigned long long s_hint_until = 0;
 
 /* Холд влево/вправо = перемотка, тап = соседний трек.
  * Тап срабатывает на отпускании (до 450 мс), иначе seek-повторы. */
@@ -445,130 +341,19 @@ static int s_nav_dir = 0;
 static int s_nav_seeking = 0;
 static unsigned long long s_nav_last = 0;
 
-static void dd_adjust(int dir)
+int ui_screen_now_playing_content_ready(AppState *state)
 {
-    if (s_dd_sel == 0) {
-        const char *q = ym_api_download_quality();
-        ym_api_download_set_quality(strcmp(q, "hq") == 0 ? "nq" : "hq");
-        eq_save();
-        eq_notify_quality();
-        logLine("now_playing: dd quality -> %s\n", ym_api_download_quality());
-    } else if (s_dd_sel == 1) {
-        if (dir > 0) {
-            eq_next_preset();
-        } else {
-            eq_prev_preset();
-        }
-        eq_save();
-    } else {
-        eq_set_preamp_db(eq_get_preamp_db() + (float)dir * EQ_PREAMP_STEP_DB);
-        eq_save();
+    TrackEntry track;
+    int ready;
+
+    if (!state) return -1;
+    ready = playback_controller_prepare_current(&track);
+    if (ready > 0) {
+        memcpy(&state->now_playing_track, &track, sizeof(track));
     }
+    return ready;
 }
 
-static void dd_row_text(int row, char *out, int out_size)
-{
-    if (row == 0) {
-        snprintf(out, out_size, "%s: %s",
-                 locale_get(LOCALE_DD_QUALITY),
-                 strcmp(ym_api_download_quality(), "hq") == 0 ? "320" : "192");
-    } else if (row == 1) {
-        snprintf(out, out_size, "%s: %s",
-                 locale_get(LOCALE_EQ_TITLE),
-                 ui_common_eq_preset_name(eq_get_preset()));
-    } else {
-        snprintf(out, out_size, "%s: +%ddB",
-                 locale_get(LOCALE_DD_GAIN),
-                 (int)(eq_get_preamp_db() + 0.5f));
-    }
-}
-
-static void like_request_toggle(AppState *state)
-{
-    const char *id = state->now_playing_track.id;
-    char token[256];
-
-    if (!id || !id[0] || state->currentUser.uid <= 0) {
-        return;
-    }
-    like_reap();
-    if (s_like_tid >= 0) {
-        logLine("like: busy, ignored\n");
-        return;  // прошлый POST ещё летит
-    }
-    if (token_loader_read(token, sizeof(token)) != 0) {
-        logLine("like: no token\n");
-        return;
-    }
-    snprintf(s_like_token, sizeof(s_like_token), "%s", token);
-    memset(token, 0, sizeof(token));
-    s_like_uid = state->currentUser.uid;
-    snprintf(s_like_track, sizeof(s_like_track), "%s", id);
-    s_like_target = like_is_on(id) ? 0 : 1;
-    s_like_tid = sceKernelCreateThread("like_worker", like_worker,
-                                       0x18, 32 * 1024, 0, NULL);
-    if (s_like_tid < 0) {
-        logLine("like: create thread failed 0x%08X\n", s_like_tid);
-        memset(s_like_token, 0, sizeof(s_like_token));
-        return;
-    }
-    if (sceKernelStartThread(s_like_tid, 0, NULL) < 0) {
-        logLine("like: start thread failed\n");
-        sceKernelDeleteThread(s_like_tid);
-        s_like_tid = -1;
-        memset(s_like_token, 0, sizeof(s_like_token));
-        return;
-    }
-}
-
-/* Pack the comma-separated artist names into the available column width.
- * Wrapping happens only between artists, so UTF-8 names are never split. */
-static float draw_artist_list(float x, float y, const char *artists,
-                              u32 color, float max_width, float line_height)
-{
-    const char *cursor = artists;
-    char line[sizeof(((TrackEntry *)0)->artist)];
-    size_t line_len = 0;
-
-    line[0] = '\0';
-    while (cursor && *cursor) {
-        const char *delimiter = strstr(cursor, ", ");
-        size_t name_len = delimiter ? (size_t)(delimiter - cursor) : strlen(cursor);
-        char candidate[sizeof(line)];
-        int written;
-
-        if (line_len == 0) {
-            written = snprintf(candidate, sizeof(candidate), "%.*s",
-                               (int)name_len, cursor);
-        } else {
-            written = snprintf(candidate, sizeof(candidate), "%s, %.*s",
-                               line, (int)name_len, cursor);
-        }
-        if (written < 0) break;
-        candidate[sizeof(candidate) - 1] = '\0';
-
-        if (line_len > 0 && text_measure_width(candidate) > max_width) {
-            text_render_clipped(x, y, line, color, max_width);
-            y += line_height;
-            written = snprintf(line, sizeof(line), "%.*s", (int)name_len, cursor);
-            if (written < 0) break;
-            line[sizeof(line) - 1] = '\0';
-            line_len = strlen(line);
-        } else {
-            strncpy(line, candidate, sizeof(line) - 1);
-            line[sizeof(line) - 1] = '\0';
-            line_len = strlen(line);
-        }
-
-        cursor = delimiter ? delimiter + 2 : NULL;
-    }
-
-    if (line_len > 0) {
-        text_render_clipped(x, y, line, color, max_width);
-        y += line_height;
-    }
-    return y;
-}
 // Pointer caching: кэшируем указатель на обложку, чтобы не искать в кеше каждый кадр
 
 void ui_screen_now_playing_update(AppState *state)
@@ -576,7 +361,7 @@ void ui_screen_now_playing_update(AppState *state)
     const TrackEntry *track;
     AudioPlayerSnapshot audio;
 
-    like_reap();
+    track_like_poll();
     wave_service();
     /* Keep state->now_playing_track in sync with the controller's current track.
      * Automatic advance (prefetch swap) updates g_playback.current_track but
@@ -624,8 +409,11 @@ void ui_screen_now_playing_update(AppState *state)
             logLine("np: late cover request track_id='%s'\n", track->id);
         }
 
-        /* Wake the ordinary-cover worker only when the audio state permits it. */
-        cover_now_playing_process_pending();
+        /* A restored paused session has no audio worker to open this gate, so
+         * its current cover may run immediately. Ordinary playback still
+         * keeps cover I/O behind the first submitted audio block. */
+        cover_now_playing_process_pending(
+            playback_controller_get_restored_pause(track->id, NULL));
 
         /* Video conversion is strictly lower priority: playback must already
          * be running, and the ordinary-cover attempt must be complete. An
@@ -651,51 +439,6 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
 {
     unsigned long long now = sceKernelGetSystemTimeWide();
 
-    /* SELECT: удержание открывает дропдаун, короткое — подсказка. */
-    if (input->pressed & PSP_CTRL_SELECT) {
-        s_sel_t0 = now;
-        s_sel_fired = 0;
-    }
-    if (s_sel_t0 != 0) {
-        if (input->buttons & PSP_CTRL_SELECT) {
-            if (!s_sel_fired && !s_dd_open &&
-                now - s_sel_t0 >= DD_HOLD_US) {
-                s_dd_open = 1;
-                s_dd_sel = 0;
-                s_sel_fired = 1;
-                s_hint_until = 0;
-                logLine("now_playing: dropdown open\n");
-            }
-        } else {
-            if (!s_sel_fired && !s_dd_open) {
-                s_hint_until = now + 2000000ULL;
-            }
-            s_sel_t0 = 0;
-            s_sel_fired = 0;
-        }
-    }
-
-    if (s_dd_open) {
-        if (input->pressed & PSP_CTRL_UP) {
-            s_dd_sel = (s_dd_sel + DD_ROWS - 1) % DD_ROWS;
-        }
-        if (input->pressed & PSP_CTRL_DOWN) {
-            s_dd_sel = (s_dd_sel + 1) % DD_ROWS;
-        }
-        if (input->pressed & PSP_CTRL_LEFT) {
-            dd_adjust(-1);
-        }
-        if ((input->pressed & PSP_CTRL_RIGHT) ||
-            (input->pressed & PSP_CTRL_CROSS)) {
-            dd_adjust(+1);
-        }
-        if (input->pressed & PSP_CTRL_CIRCLE) {
-            s_dd_open = 0;
-            logLine("now_playing: dropdown close\n");
-        }
-        return;  // остальное молчит, пока открыто меню
-    }
-
     if (input->pressed & PSP_CTRL_CIRCLE) {
         ui_screens_pop_screen(state);
         return;
@@ -703,14 +446,8 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
     if (input->pressed & PSP_CTRL_SQUARE) {
         playback_controller_request_stop();
     } else if (input->pressed & PSP_CTRL_TRIANGLE) {
-        like_request_toggle(state);
-    } else if (input->pressed & PSP_CTRL_LTRIGGER) {
-        /* Кнопка ♪ (NOTE) на этом железе молчит — профили крутят L/R. */
-        eq_prev_preset();
-        eq_save();
-    } else if (input->pressed & PSP_CTRL_RTRIGGER) {
-        eq_next_preset();
-        eq_save();
+        track_like_request_toggle(state->currentUser.uid,
+                                  state->now_playing_track.id);
     } else if (input->pressed & PSP_CTRL_START) {
         playback_controller_request_toggle_pause();
     } else if (input->pressed & PSP_CTRL_RIGHT) {
@@ -756,26 +493,49 @@ void ui_screen_now_playing_render(const AppState *state)
 {
     AudioPlayerSnapshot player_snapshot;
     AudioCacheStatus cache_status;
+    const char *bottom_status = NULL;
+    UiLayoutWidget cover_widget;
+    UiLayoutWidget title_widget;
+    UiLayoutWidget album_widget;
+    UiLayoutWidget artists_widget;
+    UiLayoutWidget progress_time_widget;
+    UiLayoutWidget progress_bar_widget;
+    UiLayoutWidget metadata_widget;
+    UiLayoutWidget like_widget;
+    UiLayoutWidget bottom_status_widget;
+    UiLayoutWidget bottom_mp3_widget;
+    UiLayoutWidget bottom_bitrate_widget;
+    UiLayoutWidget bottom_sample_rate_widget;
 
-    ui_draw_clear(0xFF1A1A1A);
-    // Без шапки - обложка и текст занимают весь экран
-    
-    // Размеры и позиции
-    const float cover_size = 200.0f;
-    const float cover_x = 28.0f;  // Равный отступ слева, сверху и до нижнего бара
-    const float cover_y = 28.0f;
-    const float text_x = cover_x + cover_size + 29.0f;  // 29px отступ справа от обложки
-    const float text_y_start = cover_y;  // Текст начинается на уровне обложки
-    const float text_line_height = 18.0f;
-    const u32 text_color = 0xFFFFFFFF;
-    const u32 text_color_secondary = 0xFFBBBBBB;
-    const float progress_width = 190.0f;
-    const float progress_height = 6.0f;
-    const float text_width = 480.0f - text_x - 8.0f;
+    if (ui_layout_get_widget("now_playing", "cover", &cover_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "title", &title_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "album", &album_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "artists", &artists_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "progress_time",
+                             &progress_time_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "progress_bar",
+                             &progress_bar_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "metadata", &metadata_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "like", &like_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "bottom_status",
+                             &bottom_status_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "bottom_mp3",
+                             &bottom_mp3_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "bottom_bitrate",
+                             &bottom_bitrate_widget) != 0 ||
+        ui_layout_get_widget("now_playing", "bottom_sample_rate",
+                             &bottom_sample_rate_widget) != 0) {
+        return;
+    }
+    (void)ui_layout_render("now_playing", NULL, NULL, NULL);
     
     if (state->now_playing_track.id[0] == '\0') {
-        ui_draw_text(text_x, text_y_start, locale_get(LOCALE_SCREEN_EMPTY), text_color_secondary);
-        draw_now_playing_bottom_bar();
+        ui_draw_text(title_widget.x, title_widget.y,
+                     locale_get(LOCALE_SCREEN_EMPTY), album_widget.color);
+        draw_now_playing_bottom_bar(&bottom_status_widget,
+                                    &bottom_mp3_widget,
+                                    &bottom_bitrate_widget,
+                                    &bottom_sample_rate_widget, NULL, NULL);
         return;
     }
 
@@ -785,8 +545,20 @@ void ui_screen_now_playing_render(const AppState *state)
     audio_cache_get_status(&cache_status);
     
     const TrackEntry *track = &state->now_playing_track;
-    char title_line[192];
     u64 marquee_now_us = sceKernelGetSystemTimeWide();
+
+    if (strcmp(player_snapshot.track_id, track->id) != 0) {
+        int paused_position_ms;
+        if (playback_controller_get_restored_pause(track->id,
+                                                   &paused_position_ms)) {
+            memset(&player_snapshot, 0, sizeof(player_snapshot));
+            player_snapshot.state = AUDIO_PLAYER_PAUSED;
+            player_snapshot.position_ms = paused_position_ms;
+            player_snapshot.duration_ms = track->duration_ms;
+            snprintf(player_snapshot.track_id,
+                     sizeof(player_snapshot.track_id), "%s", track->id);
+        }
+    }
 
     if (strcmp(s_marquee_track, track->id) != 0) {
         snprintf(s_marquee_track, sizeof(s_marquee_track), "%s", track->id);
@@ -796,18 +568,20 @@ void ui_screen_now_playing_render(const AppState *state)
     // Draw cover (200x200) - используем кэшированный указатель (без поиска в кеше каждый кадр)
     const NowPlayingCover *cover =
         cover_now_playing_get_for(track->album_id, track->cover_uri);
-    if (np_video_draw(track, cover_x, cover_y, cover_size)) {
+    if (np_video_draw(track, cover_widget.x, cover_widget.y, cover_widget.w)) {
         // Cover video drawn; static cover skipped this frame.
     } else if (cover && cover->rgba_data) {
-        void *dst = hal_fb_get_draw_buffer();
-        int dst_stride = hal_fb_get_stride();
-        int dst_w = hal_fb_get_width();
-        int dst_h = hal_fb_get_height();
+        void *dst = hal_gpu_get_draw_buffer_cpu();
+        int dst_stride = VRAM_BUFFER_WIDTH;
+        int dst_w = SCREEN_WIDTH;
+        int dst_h = SCREEN_HEIGHT;
         
-        int dst_x = (int)cover_x;
-        int dst_y = (int)cover_y;
-        int copy_w = (cover->w < (int)cover_size) ? cover->w : (int)cover_size;
-        int copy_h = (cover->h < (int)cover_size) ? cover->h : (int)cover_size;
+        int dst_x = (int)cover_widget.x;
+        int dst_y = (int)cover_widget.y;
+        int copy_w = (cover->w < (int)cover_widget.w)
+                         ? cover->w : (int)cover_widget.w;
+        int copy_h = (cover->h < (int)cover_widget.h)
+                         ? cover->h : (int)cover_widget.h;
         
         if (dst_x >= 0 && dst_y >= 0 && dst_x + copy_w <= dst_w && dst_y + copy_h <= dst_h) {
             int src_stride_pixels = cover->stride_bytes / 4;
@@ -819,151 +593,85 @@ void ui_screen_now_playing_render(const AppState *state)
         }
     } else if (track->album_id != 0 && cover_now_playing_is_loading()) {
         // Draw placeholder only if cover is actually loading
-        ui_draw_rect(cover_x, cover_y, cover_size, cover_size, 0xFF444444);
+        ui_draw_rect(cover_widget.x, cover_widget.y,
+                     cover_widget.w, cover_widget.h, UI_COLOR_INACTIVE);
     }
     {
         VideoCoverState video_state = video_cover_state_for(
             track->id, track->background_video_uri);
         if (video_state == VIDEO_COVER_CONVERTING ||
             video_state == VIDEO_COVER_DOWNLOADING) {
-            draw_video_cover_activity(cover_x, cover_y, cover_size);
+            draw_video_cover_activity(cover_widget.x, cover_widget.y,
+                                      cover_widget.w);
         }
     }
     // Если обложка не загружается (не запрашивалась или ошибка) - не показываем placeholder
     
-    // Draw track info справа от обложки
-    float text_y = text_y_start;
-    
-    // 1. Название трека ("*" + сердце — наш локальный паритет лайка)
+    // 1. Название трека
     if (track->title[0]) {
-        int liked = like_is_on(track->id);
-        float mx = text_x + 14.0f;
-        float mw = text_width - 14.0f;
-        draw_like_heart(text_x, text_y, liked);
-        if (liked) {
-            snprintf(title_line, sizeof(title_line), "* %s%s",
-                     track->title,
-                     track->explicit_content ? " [E]" : "");
-        } else {
-            snprintf(title_line, sizeof(title_line), "%s%s",
-                     track->title,
-                     track->explicit_content ? " [E]" : "");
-        }
-        title_line[sizeof(title_line) - 1] = '\0';
-        ui_common_draw_marquee(mx, text_y, mw,
-                               title_line, text_color,
-                               track->version, 0xFF888888,
-                               s_marquee_start_us, marquee_now_us);
-        text_y += text_line_height;
+        ui_common_draw_marquee_font_icon(
+            TEXT_FONT_UI16, title_widget.x, title_widget.y, title_widget.w,
+            track->title, title_widget.color,
+            track->explicit_content ? "in_explicit" : NULL,
+            title_widget.color, -2,
+            track->version, UI_COLOR_INACTIVE,
+            s_marquee_start_us, marquee_now_us);
     }
     
     // 2. Название альбома
     if (track->album[0]) {
-        ui_common_draw_marquee(text_x, text_y, text_width,
-                               track->album, text_color_secondary,
-                               track->album_version, 0xFF777777,
+        ui_common_draw_marquee(album_widget.x, album_widget.y, album_widget.w,
+                               track->album, album_widget.color,
+                               track->album_version, UI_COLOR_INACTIVE,
                                s_marquee_start_us, marquee_now_us);
-        text_y += text_line_height;
     }
     
     // 3. Исполнитель трека
     if (track->artist[0]) {
-        text_y = draw_artist_list(text_x, text_y, track->artist,
-                                  text_color_secondary, text_width,
-                                  text_line_height);
+        ui_common_draw_marquee(artists_widget.x, artists_widget.y,
+                               artists_widget.w,
+                               track->artist, artists_widget.color,
+                               NULL, 0,
+                               s_marquee_start_us, marquee_now_us);
     }
 
     if (strcmp(player_snapshot.track_id, track->id) == 0) {
-        char audio_info[64];
-        format_audio_info(&player_snapshot, audio_info, sizeof(audio_info));
-        if (audio_info[0]) {
-            ui_draw_text(text_x, text_y, audio_info, text_color_secondary);
-            text_y += text_line_height;
-        }
-
-        ui_draw_text(text_x, text_y,
-                     audio_player_state_label(player_snapshot.state),
-                     text_color_secondary);
-        text_y += text_line_height;
-
-        {
-            char eqline[48];
-            float pre = eq_get_preamp_db();
-            if (pre > 0.0f) {
-                snprintf(eqline, sizeof(eqline), "EQ: %s +%ddB",
-                         ui_common_eq_preset_name(eq_get_preset()),
-                         (int)(pre + 0.5f));
-            } else {
-                snprintf(eqline, sizeof(eqline), "EQ: %s",
-                         ui_common_eq_preset_name(eq_get_preset()));
-            }
-            ui_draw_text(text_x, text_y, eqline, text_color_secondary);
-            text_y += text_line_height;
-        }
+        bottom_status = audio_player_bottom_status(player_snapshot.state);
 
         if (player_snapshot.duration_ms > 0) {
-            draw_progress_bar(text_x, text_y,
-                              progress_width, progress_height,
-                              &player_snapshot,
-                              &cache_status,
-                              track->id,
-                              0xFF00D5FF,
-                              0xFF4E7F66,
-                              0xFF3A3A3A,
-                              text_color_secondary);
-            text_y += 28.0f;
-
-            draw_volume_bar(text_x, text_y,
-                            progress_width, progress_height);
-            text_y += 14.0f;
+            draw_progress_time(&progress_time_widget, &player_snapshot);
+            draw_progress_fill(&progress_bar_widget, &player_snapshot,
+                               &cache_status, track->id);
         }
     }
     
-    // 5. Дополнительная информация: год, жанр
-    char info_line[256];
-    int has_year = (track->year > 0);
-
-    if (has_year) {
-        snprintf(info_line, sizeof(info_line), "%d", track->year);
-    } else {
-        info_line[0] = '\0';
-    }
-
+    // 5. Жанр
     if (track->genre[0]) {
-        if (has_year) {
-            strncat(info_line, " ", sizeof(info_line) - strlen(info_line) - 1);
+        text_render_clipped(metadata_widget.x, metadata_widget.y,
+                            track->genre, metadata_widget.color,
+                            metadata_widget.w);
+    }
+
+    {
+        int icon_width;
+        int icon_height;
+        if (ui_icon_atlas_get_size("in_bookmark", &icon_width,
+                                   &icon_height) == 0) {
+            int icon_x = (int)like_widget.x +
+                         ((int)like_widget.w - icon_width) / 2;
+            int icon_y = (int)like_widget.y +
+                         ((int)like_widget.h - icon_height + 1) / 2;
+            u32 color = track_like_is_on(track->id)
+                            ? like_widget.color : UI_COLOR_INACTIVE;
+            ui_icon_atlas_draw("in_bookmark", icon_x, icon_y, color);
         }
-        strncat(info_line, track->genre, sizeof(info_line) - strlen(info_line) - 1);
     }
 
-    if (info_line[0]) {
-        ui_draw_text(text_x, text_y, info_line, text_color_secondary);
-    }
+    draw_now_playing_bottom_bar(
+        &bottom_status_widget, &bottom_mp3_widget,
+        &bottom_bitrate_widget,
+        &bottom_sample_rate_widget,
+        bottom_status,
+        strcmp(player_snapshot.track_id, track->id) == 0 ? &player_snapshot : NULL);
 
-    draw_now_playing_bottom_bar();
-
-    /* Подсказка короткого SELECT и дропдаун удержания поверх всего. */
-    if (s_dd_open) {
-        char row[96];
-        float bx = 90.0f, bw = 300.0f, by = 84.0f;
-        int i;
-        ui_draw_rect(0.0f, 0.0f, 480.0f, 272.0f, 0xAA000000);
-        ui_draw_rect(bx, by, bw, 3.0f * 22.0f + 12.0f, 0xFF1A1A1A);
-        for (i = 0; i < DD_ROWS; i++) {
-            float ry = by + 6.0f + (float)i * 22.0f;
-            if (i == s_dd_sel) {
-                ui_draw_rect(bx + 6.0f, ry - 2.0f, 6.0f, 14.0f, 0xFF00D5FF);
-            }
-            dd_row_text(i, row, sizeof(row));
-            ui_draw_text(bx + 18.0f, ry, row,
-                         i == s_dd_sel ? 0xFFFFFFFF : 0xFFBBBBBB);
-        }
-    } else if (s_hint_until != 0 &&
-               (unsigned long long)sceKernelGetSystemTimeWide() < s_hint_until) {
-        const char *hint = locale_get(LOCALE_SELECT_HOLD_HINT);
-        float w = text_measure_width(hint);
-        ui_draw_text(((float)480 - w) * 0.5f, 200.0f, hint, 0xFF00D5FF);
-    } else {
-        s_hint_until = 0;
-    }
 }

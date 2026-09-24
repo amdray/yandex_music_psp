@@ -120,13 +120,13 @@ static int parse_widget_type(const char *text, UiLayoutWidgetType *out)
 
 static int parse_widget(char *value, UiLayoutScreen *screen, int line_number)
 {
-    char *f[9];
+    char *f[11];
     int count;
     UiLayoutWidget *widget;
     char *end;
 
-    count = split_fields(value, f, 9);
-    if (count < 8 || count > 9 || s_widget_count >= UI_LAYOUT_WIDGET_MAX) {
+    count = split_fields(value, f, 11);
+    if (count < 8 || count > 11 || s_widget_count >= UI_LAYOUT_WIDGET_MAX) {
         logLine("layout: bad widget line=%d fields=%d\n", line_number, count);
         return -1;
     }
@@ -148,9 +148,17 @@ static int parse_widget(char *value, UiLayoutScreen *screen, int line_number)
     widget->h = (float)strtod(f[5], &end);
     if (!end || *end) return -1;
     widget->step = 0.0f;
-    if (count == 9 && f[8][0]) {
+    if (count >= 9 && f[8][0]) {
         widget->step = (float)strtod(f[8], &end);
         if (!end || *end) return -1;
+    }
+    if (count >= 10 && f[9][0] &&
+        parse_color(f[9], &widget->secondary_color) != 0) {
+        return -1;
+    }
+    if (count >= 11 && f[10][0] &&
+        parse_color(f[10], &widget->background_color) != 0) {
+        return -1;
     }
     s_widget_count++;
     screen->widget_count++;
@@ -181,15 +189,20 @@ static int validate_required_widgets(void)
     static const RequiredWidget required[] = {
         { "status_overlay", "wifi", UI_LAYOUT_WIDGET_SLOT, "status.wifi", 0 },
         { "status_overlay", "playback_state", UI_LAYOUT_WIDGET_SLOT, "status.playback_state", 0 },
+        { "status_overlay", "network_activity", UI_LAYOUT_WIDGET_SLOT, "status.network_activity", 0 },
+        { "status_overlay", "eq_profile", UI_LAYOUT_WIDGET_SLOT, "status.eq_profile", 0 },
         { "status_overlay", "clock", UI_LAYOUT_WIDGET_SLOT, "status.clock", 0 },
-        { "status_overlay", "activity", UI_LAYOUT_WIDGET_SLOT, "status.activity", 0 },
+        { "status_overlay", "volume", UI_LAYOUT_WIDGET_SLOT, "status.volume", 0 },
         { "status_overlay", "battery_percent", UI_LAYOUT_WIDGET_SLOT, "status.battery_percent", 0 },
         { "status_overlay", "battery", UI_LAYOUT_WIDGET_SLOT, "status.battery", 0 },
         { "screen_header", "title", UI_LAYOUT_WIDGET_SLOT, "screen_header.title", 0 },
         { "screen_header", "title_rule", UI_LAYOUT_WIDGET_RECT, "none", 0 },
         { "menu", "items", UI_LAYOUT_WIDGET_SLOT, "menu.items", 1 },
         { "menu", "selection", UI_LAYOUT_WIDGET_SLOT, "menu.selection", 0 },
-        { "help", "rows", UI_LAYOUT_WIDGET_SLOT, "help.rows", 1 },
+        { "help", "buttons", UI_LAYOUT_WIDGET_SLOT, "help.buttons", 1 },
+        { "help", "descriptions", UI_LAYOUT_WIDGET_SLOT, "help.descriptions", 1 },
+        { "memory", "graph", UI_LAYOUT_WIDGET_SLOT, "memory.graph", 0 },
+        { "memory", "legend", UI_LAYOUT_WIDGET_SLOT, "memory.legend", 0 },
         { "playlist_list", "tabs", UI_LAYOUT_WIDGET_SLOT, "playlist_list.tabs", 1 },
         { "playlist_list", "tab_my", UI_LAYOUT_WIDGET_SLOT, "playlist_list.tab_my", 0 },
         { "playlist_list", "tab_liked", UI_LAYOUT_WIDGET_SLOT, "playlist_list.tab_liked", 0 },
@@ -199,7 +212,18 @@ static int validate_required_widgets(void)
         { "playlist_list", "item_covers", UI_LAYOUT_WIDGET_SLOT, "playlist_list.item_covers", 0 },
         { "playlist_list", "item_titles", UI_LAYOUT_WIDGET_SLOT, "playlist_list.item_titles", 0 },
         { "playlist_list", "item_info", UI_LAYOUT_WIDGET_SLOT, "playlist_list.item_info", 0 },
-        { "now_playing", "bottom_bar", UI_LAYOUT_WIDGET_RECT, "none", 0 }
+        { "now_playing", "cover", UI_LAYOUT_WIDGET_SLOT, "now_playing.cover", 0 },
+        { "now_playing", "title", UI_LAYOUT_WIDGET_SLOT, "now_playing.title", 0 },
+        { "now_playing", "album", UI_LAYOUT_WIDGET_SLOT, "now_playing.album", 0 },
+        { "now_playing", "artists", UI_LAYOUT_WIDGET_SLOT, "now_playing.artists", 0 },
+        { "now_playing", "progress_time", UI_LAYOUT_WIDGET_SLOT, "now_playing.progress_time", 0 },
+        { "now_playing", "progress_bar", UI_LAYOUT_WIDGET_SLOT, "now_playing.progress_bar", 0 },
+        { "now_playing", "metadata", UI_LAYOUT_WIDGET_SLOT, "now_playing.metadata", 0 },
+        { "now_playing", "like", UI_LAYOUT_WIDGET_SLOT, "now_playing.like", 0 },
+        { "now_playing", "bottom_bar", UI_LAYOUT_WIDGET_RECT, "none", 0 },
+        { "now_playing", "bottom_status", UI_LAYOUT_WIDGET_SLOT, "now_playing.bottom_status", 0 },
+        { "now_playing", "bottom_mp3", UI_LAYOUT_WIDGET_SLOT, "now_playing.bottom_mp3", 0 },
+        { "now_playing", "bottom_sample_rate", UI_LAYOUT_WIDGET_SLOT, "now_playing.bottom_sample_rate", 0 }
     };
     unsigned int r;
 
@@ -300,7 +324,7 @@ int ui_layout_load(const char *path)
                 ui_layout_unload();
                 return -1;
             }
-            screen->background = 0xFF1A1A1A;
+            screen->background = UI_COLOR_BACKGROUND;
             screen->first_widget = s_widget_count;
             continue;
         }

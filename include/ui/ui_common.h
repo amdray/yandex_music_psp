@@ -2,6 +2,7 @@
 #define YM_UI_COMMON_H
 
 #include "app/app_state.h"
+#include "fonts/text.h"
 #include "services/locale.h"
 
 // Один пункт меню описывается ровно один раз: метка + экран перехода.
@@ -9,19 +10,28 @@
 typedef struct MenuItem {
     LocaleKey label;
     ScreenId  target;
+    int       requires_auth;
 } MenuItem;
 
 void ui_common_draw_header(const char *title);
-void ui_common_draw_menu(const MenuItem *items, int count, int selected);
-void ui_common_draw_battery_status(void);
 void ui_common_draw_top_status(void);
-
-// Нижняя полоса подсказок для произвольного числа меток.
-// Вызывать через макрос ui_common_draw_prompts(...) — он сам считает count.
-void ui_common_draw_prompts_n(const LocaleKey *keys, int count);
-#define ui_common_draw_prompts(...) \
-    ui_common_draw_prompts_n((const LocaleKey[]){ __VA_ARGS__ }, \
-        (int)(sizeof((const LocaleKey[]){ __VA_ARGS__ }) / sizeof(LocaleKey)))
+u32 ui_common_pulse_color(void);
+void ui_common_draw_marquee(float x, float y, float max_width,
+                            const char *text, u32 text_color,
+                            const char *suffix, u32 suffix_color,
+                            u64 start_us, u64 now_us);
+void ui_common_draw_marquee_font(TextFont font,
+                                 float x, float y, float max_width,
+                                 const char *text, u32 text_color,
+                                 const char *suffix, u32 suffix_color,
+                                 u64 start_us, u64 now_us);
+void ui_common_draw_marquee_font_icon(TextFont font,
+                                      float x, float y, float max_width,
+                                      const char *text, u32 text_color,
+                                      const char *icon_name, u32 icon_color,
+                                      int icon_y_offset,
+                                      const char *suffix, u32 suffix_color,
+                                      u64 start_us, u64 now_us);
 
 // Имя пресета эквалайзера (локализовано) + тост «EQ: ...» на 2.5 c
 // после смены (кнопка ♪ или экран). Рисовать каждый кадр поверх всего.

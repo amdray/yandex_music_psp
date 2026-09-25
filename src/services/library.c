@@ -126,6 +126,15 @@ int library_open_playlist(AppState *s, const PlaylistEntry *entry, int tab, int 
     if (!s || !entry) {
         return -1;
     }
+    if (!entry->title[0]) {
+        net_client_track_store_lock();
+        s->track_boot.error_code = -12;
+        net_client_track_store_unlock();
+        logLine("library: playlist open rejected kind=%d reason=empty_title\n",
+                entry->playlist_id);
+        logger_flush();
+        return -1;
+    }
 
     int playlist_kind = entry->playlist_id;
     /* Для лайкнутых плейлистов — owner_uid из записи; 0 = текущий пользователь. */
@@ -136,14 +145,14 @@ int library_open_playlist(AppState *s, const PlaylistEntry *entry, int tab, int 
 
     net_client_track_store_lock();
     s->track_boot.generation++;
-    app_state_reset_track_bootstrap(s, playlist_kind, selected_index, entry->uuid);
+    app_state_reset_track_bootstrap(s, playlist_kind, selected_index,
+                                    entry->uuid, entry->title);
     net_client_track_store_unlock();
 
     if (token_loader_read(token, sizeof(token)) != 0) {
         net_client_track_store_lock();
         s->track_boot.status = TRACK_BOOT_ERROR;
         s->track_boot.error_code = -10;
-        s->track_ui.track_bootstrap_indicator_visible = 0;
         net_client_track_store_unlock();
         return -1;
     }
@@ -157,7 +166,6 @@ int library_open_playlist(AppState *s, const PlaylistEntry *entry, int tab, int 
         net_client_track_store_lock();
         s->track_boot.status = TRACK_BOOT_ERROR;
         s->track_boot.error_code = -11;
-        s->track_ui.track_bootstrap_indicator_visible = 0;
         net_client_track_store_unlock();
         return -1;
     }
@@ -173,15 +181,23 @@ int library_track_entry_ready(AppState *s, int *out_pos, int *out_count)
     int window_ready = 0;
     int generation = 0;
     int count_snap = 0;
+    int empty_ready = 0;
 
     if (!s) {
         return 0;
     }
 
     net_client_track_store_lock();
+    if (s->track_boot.status == TRACK_BOOT_ERROR) {
+        net_client_track_store_unlock();
+        return -1;
+    }
+    if (s->track_boot.status == TRACK_BOOT_FULL_READY &&
+        s->track_store.ids_complete && s->track_store.count == 0) {
+        empty_ready = 1;
+    }
     if ((s->track_boot.status == TRACK_BOOT_LOADING ||
          s->track_boot.status == TRACK_BOOT_FULL_READY) &&
-        !s->track_ui.track_screen_transition_done &&
         s->track_store.count > 0) {
         const TrackAnchor *anchor =
             app_state_anchor_find(s, s->track_boot.target_uuid);
@@ -221,6 +237,16 @@ int library_track_entry_ready(AppState *s, int *out_pos, int *out_count)
         }
     }
     net_client_track_store_unlock();
+
+    if (empty_ready) {
+        if (out_pos) {
+            *out_pos = 0;
+        }
+        if (out_count) {
+            *out_count = 0;
+        }
+        return 1;
+    }
 
     if (!pos_known) {
         return 0;

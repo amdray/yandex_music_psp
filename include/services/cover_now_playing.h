@@ -22,6 +22,6 @@ void cover_now_playing_clear(void);
 const NowPlayingCover *cover_now_playing_get_for(int album_id, const char *cover_uri);
 
 int cover_now_playing_is_loading(void);
-void cover_now_playing_process_pending(void);
+void cover_now_playing_process_pending(int allow_without_playback);
 
 #endif

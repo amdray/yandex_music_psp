@@ -250,7 +250,7 @@ static int rotor_parse_sequence(cJSON *result_obj, const char *batch_id,
         }
         parse_rc = ym_api_parse_track_from_object(track_node, &entry);
         if (parse_rc != 0) {
-            /* rc == 1: no-rights/unparseable item — skipped by design. */
+            /* rc == 1: item without a usable id — skipped by design. */
             continue;
         }
         if (parsed >= max_items || !items) {

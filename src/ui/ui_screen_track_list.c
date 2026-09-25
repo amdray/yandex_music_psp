@@ -1,8 +1,10 @@
 #include "ui/ui_screen_track_list.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_screens.h"
 #include "services/locale.h"
 #include "services/cover_manager.h"
+#include "services/library.h"
 #include "services/net_client.h"
 #include "services/token_loader.h"
 #include "services/playback_controller.h"
@@ -37,6 +39,51 @@ void ui_screen_track_list_clear_cache(void)
 {
     s_last_visible_start = -1;
     s_last_visible_end = -1;
+}
+
+int ui_screen_track_list_content_ready(AppState *state)
+{
+    int enter_pos = 0;
+    int count = 0;
+    int ready = library_track_entry_ready(state, &enter_pos, &count);
+
+    if (ready < 0) {
+        int generation;
+        int playlist_kind;
+        int error_code;
+
+        net_client_track_store_lock();
+        generation = state->track_boot.generation;
+        playlist_kind = state->track_boot.target_playlist_kind;
+        error_code = state->track_boot.error_code;
+        net_client_track_store_unlock();
+        logLine("ui: track-list navigation failed playlist=%d generation=%d error=%d\n",
+                playlist_kind, generation, error_code);
+        logger_flush();
+        app_state_cancel_track_bootstrap(state);
+        return -1;
+    }
+    if (ready == 0) {
+        return 0;
+    }
+
+    {
+        int scroll = enter_pos - TRACK_LIST_VISIBLE_ROWS / 2;
+        int max_scroll = count - TRACK_LIST_VISIBLE_ROWS;
+        if (max_scroll < 0) {
+            max_scroll = 0;
+        }
+        if (scroll > max_scroll) {
+            scroll = max_scroll;
+        }
+        if (scroll < 0) {
+            scroll = 0;
+        }
+        state->track_ui.track_selected = enter_pos;
+        state->track_ui.track_scroll = scroll;
+    }
+    ui_screen_track_list_clear_cache();
+    return 1;
 }
 
 /* Leaving the screen: remember where the cursor stood as an identity anchor
@@ -134,7 +181,7 @@ void ui_screen_track_list_update(AppState *state)
 
     for (int i = 0; i < request_count; ++i) {
         const TrackEntry *track = &request_tracks[i];
-        if (track->cover_uri[0] && track->album_id != 0) {
+        if (track->available && track->cover_uri[0] && track->album_id != 0) {
             CoverPriority priority = (i < 5) ? COVER_PRIORITY_VISIBLE : COVER_PRIORITY_NEARBY;
             cover_manager_request_cover(COVER_ENTITY_ALBUM, track->album_id, track->cover_uri, priority, NULL);
         }
@@ -187,7 +234,10 @@ void ui_screen_track_list_handle_input(AppState *state, const InputState *input)
                 source_id = active_list[active_selected].playlist_id;
             }
 
-            if (playback_queue_set_from_ids(state->track_store.ids,
+            if (!state->track_store.window[slot].available) {
+                logLine("ui: play blocked unavailable track_id='%s'\n",
+                        state->track_store.window[slot].id);
+            } else if (playback_queue_set_from_ids(state->track_store.ids,
                                             visible_count,
                                             selected,
                                             PLAYBACK_QUEUE_SOURCE_PLAYLIST,
@@ -211,28 +261,21 @@ void ui_screen_track_list_handle_input(AppState *state, const InputState *input)
 
     if (start_playback) {
         memcpy(&state->now_playing_track, &selected_track, sizeof(TrackEntry));
-        app_state_push(state, SCREEN_NOW_PLAYING);
+        ui_screens_navigate(state, SCREEN_NOW_PLAYING);
         playback_controller_request_play_current();
     }
 }
 
 void ui_screen_track_list_render(const AppState *state)
 {
-    ui_draw_clear(0xFF1A1A1A);
+    ui_draw_clear(UI_COLOR_BACKGROUND);
     
-    // Формируем заголовок с названием плейлиста через локализацию
+    // Название фиксируется при открытии плейлиста и не зависит от индекса,
+    // который мог измениться после перехода.
     char header_text[256];
-    {
-        const PlaylistEntry *active_list = (state->playlist_tab == 0) ? state->playlists : state->liked_playlists;
-        int active_count    = (state->playlist_tab == 0) ? state->playlist_count : state->liked_playlist_count;
-        int active_selected = (state->playlist_tab == 0) ? state->playlist_selected : state->liked_playlist_selected;
-        if (active_selected >= 0 && active_selected < active_count && active_list[active_selected].title[0]) {
-            snprintf(header_text, sizeof(header_text), locale_get(LOCALE_SCREEN_TRACK_LIST_OF_PLAYLIST), active_list[active_selected].title);
-        } else {
-            strncpy(header_text, locale_get(LOCALE_SCREEN_TRACK_LIST), sizeof(header_text) - 1);
-            header_text[sizeof(header_text) - 1] = '\0';
-        }
-    }
+    snprintf(header_text, sizeof(header_text),
+             locale_get(LOCALE_SCREEN_PLAYLIST_TITLE),
+             state->track_boot.target_playlist_title);
     ui_common_draw_header(header_text);
     
     TrackEntry visible_tracks[TRACK_LIST_VISIBLE_ROWS];
@@ -276,7 +319,7 @@ void ui_screen_track_list_render(const AppState *state)
     /* The transition gate guarantees visible rows exist on entry, so the only
        zero-row state left is a genuinely empty playlist. */
     if (visible_count == 0) {
-        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), 0xFFBBBBBB);
+        ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_SCREEN_EMPTY), UI_COLOR_ACTIVE);
     } else {
         // Draw track list with thumbnails
         // Layout: header line (X=16) -> 6px selection indicator -> 5px gap -> cover (30x30) -> 5px gap -> text
@@ -298,24 +341,31 @@ void ui_screen_track_list_render(const AppState *state)
             
             // Draw selection indicator (aligned with header line, centered vertically relative to cover)
             if (i == selected_index) {
-                ui_draw_rect(header_x, y - 3.0f, selection_width, item_height - 4.0f, 0xFF00D5FF);
+                ui_draw_rect(header_x, y - 3.0f, selection_width,
+                             item_height - 4.0f, UI_COLOR_ACCENT);
             }
 
             if (!visible_valid[row]) {
-                ui_draw_text(text_x, y, "...", 0xFF777777);
+                ui_draw_text(text_x, y, "...", UI_COLOR_INACTIVE);
                 continue;
             }
 
-            if (!cover_manager_draw_cover(COVER_ENTITY_ALBUM, track->album_id, NULL,
+            if (track->available &&
+                !cover_manager_draw_cover(COVER_ENTITY_ALBUM, track->album_id, NULL,
                                           (int)thumb_x, (int)y, (int)thumb_size, (int)thumb_size)) {
                 if (cover_manager_is_loading(COVER_ENTITY_ALBUM, track->album_id, NULL)) {
-                    ui_draw_rect(thumb_x, y, thumb_size, thumb_size, 0xFF444444);
+                    ui_draw_rect(thumb_x, y, thumb_size, thumb_size,
+                                 UI_COLOR_INACTIVE);
                 }
             }
             
             // First line: artist - title, with the edition/version de-emphasized.
-            u32 line1_color = i == selected_index ? 0xFFFFFFFF : 0xFFBBBBBB;
-            u32 version_color = i == selected_index ? 0xFFBBBBBB : 0xFF777777;
+            u32 line1_color = !track->available ? UI_COLOR_INACTIVE :
+                              (i == selected_index
+                                   ? UI_COLOR_PRIMARY : UI_COLOR_ACTIVE);
+            u32 version_color = !track->available ? UI_COLOR_INACTIVE :
+                                (i == selected_index
+                                     ? UI_COLOR_ACTIVE : UI_COLOR_INACTIVE);
             char line1[512];  // 96 + 160 + 64 + separators
             if (track->artist[0]) {
                 snprintf(line1, sizeof(line1), "%s - %s", track->artist, track->title);
@@ -334,6 +384,12 @@ void ui_screen_track_list_render(const AppState *state)
                 }
             }
             
+            /* no-rights responses omit duration/albums; an empty second line
+               is more accurate than rendering the zero-initialized 0:00. */
+            if (!track->available) {
+                continue;
+            }
+
             // Second line: year %space% duration %space% genre %space% [E] explicit
             char line2[256];
             int parts = 0;
@@ -372,9 +428,8 @@ void ui_screen_track_list_render(const AppState *state)
                 strncat(line2, locale_get(LOCALE_TRACK_EXPLICIT), sizeof(line2) - strlen(line2) - 1);
             }
             
-            ui_draw_text(text_x, y + 16.0f, line2, 0xFF888888);
+            ui_draw_text(text_x, y + 16.0f, line2, UI_COLOR_INACTIVE);
         }
     }
     
-    ui_common_draw_prompts(LOCALE_TRACK_PLAY_PROMPT, LOCALE_TRACK_BACK_PROMPT);
 }

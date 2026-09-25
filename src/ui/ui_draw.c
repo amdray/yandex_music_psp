@@ -14,6 +14,13 @@ typedef struct Vertex2D {
     short z;
 } Vertex2D;
 
+typedef struct ColoredVertex2D {
+    u32 color;
+    short x;
+    short y;
+    short z;
+} ColoredVertex2D;
+
 int ui_draw_init(void)
 {
     // No initialization needed currently
@@ -57,6 +64,34 @@ void ui_draw_rect(float x, float y, float w, float h, u32 color_abgr)
     sceGuDrawArray(GU_SPRITES, GU_VERTEX_16BIT | GU_TRANSFORM_2D, 2, 0, v);
 }
 
+void ui_draw_colored_rects(const UiDrawColoredRect *rects, int count)
+{
+    ColoredVertex2D *vertices;
+    int i;
+
+    if (!hal_gpu_in_frame() || !rects || count <= 0) {
+        return;
+    }
+    hal_gpu_set_texturing(0);
+    vertices = (ColoredVertex2D *)sceGuGetMemory(
+        (unsigned int)(count * 2) * sizeof(*vertices));
+    for (i = 0; i < count; i++) {
+        const UiDrawColoredRect *r = &rects[i];
+        ColoredVertex2D *v = &vertices[i * 2];
+        v[0].color = r->color;
+        v[0].x = r->x;
+        v[0].y = r->y;
+        v[0].z = 0;
+        v[1].color = r->color;
+        v[1].x = (short)(r->x + r->w);
+        v[1].y = (short)(r->y + r->h);
+        v[1].z = 0;
+    }
+    sceGuDrawArray(GU_SPRITES,
+                   GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
+                   count * 2, 0, vertices);
+}
+
 typedef struct TexVertex2D {
     short u, v;
     short x, y, z;
@@ -93,6 +128,41 @@ void ui_draw_image_rgba_crop(const void *pixels, int tex_w, int tex_h,
     sceGuDrawArray(GU_SPRITES,
         GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
         2, 0, v);
+}
+
+void ui_draw_image_rgba_nearest(const void *pixels, int tex_w, int tex_h,
+                                int draw_w, int draw_h, float x, float y)
+{
+    TexVertex2D *v;
+
+    if (!hal_gpu_in_frame() || !pixels || tex_w <= 0 || tex_h <= 0 ||
+        draw_w <= 0 || draw_h <= 0 || draw_w > tex_w || draw_h > tex_h) {
+        return;
+    }
+    hal_gpu_flush_cache_range(pixels,
+                              (unsigned int)(tex_w * tex_h * (int)sizeof(u32)));
+    hal_gpu_set_texturing(1);
+    sceGuTexFlush();
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexImage(0, tex_w, tex_h, tex_w, pixels);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+
+    v = (TexVertex2D *)sceGuGetMemory(2 * sizeof(*v));
+    v[0].u = 0;
+    v[0].v = 0;
+    v[0].x = (short)x;
+    v[0].y = (short)y;
+    v[0].z = 0;
+    v[1].u = (short)draw_w;
+    v[1].v = (short)draw_h;
+    v[1].x = (short)(x + draw_w);
+    v[1].y = (short)(y + draw_h);
+    v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES,
+                   GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
+                   2, 0, v);
 }
 
 void ui_draw_text(float x, float y, const char *text, u32 color_abgr)

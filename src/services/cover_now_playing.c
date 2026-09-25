@@ -131,11 +131,12 @@ static int playback_allows_cover_work(void)
     return snapshot.state == AUDIO_PLAYER_PLAYING && snapshot.position_ms > 0;
 }
 
-static void signal_worker_if_allowed(void)
+static void signal_worker_if_allowed(int allow_without_playback)
 {
     int should_signal = 0;
 
-    if (s_worker_sema < 0 || !playback_allows_cover_work()) return;
+    if (s_worker_sema < 0 ||
+        (!allow_without_playback && !playback_allows_cover_work())) return;
 
     state_lock();
     if (!s_wakeup_pending && (s_current_queued || s_prefetch_queued)) {
@@ -307,7 +308,7 @@ job_done:
         state_lock();
         s_worker_job = COVER_JOB_NONE;
         state_unlock();
-        signal_worker_if_allowed();
+        signal_worker_if_allowed(0);
     }
 
     logLine("cover_now_playing: worker thread stopped\n");
@@ -473,7 +474,7 @@ int cover_now_playing_request_load(int album_id, const char *cover_uri)
     s_state = COVER_NOW_PLAYING_LOADING;
     state_unlock();
 
-    signal_worker_if_allowed();
+    signal_worker_if_allowed(0);
     logLine("cover_now_playing: current queued album_id=%d token=%u\n", album_id, token);
     return 1;
 }
@@ -498,7 +499,7 @@ void cover_now_playing_prefetch(int album_id, const char *cover_uri)
     s_prefetch_queued = 1;
     state_unlock();
 
-    signal_worker_if_allowed();
+    signal_worker_if_allowed(0);
     logLine("cover_now_playing: prefetch queued album_id=%d token=%u\n", album_id, token);
 }
 
@@ -528,7 +529,7 @@ int cover_now_playing_is_loading(void)
     return loading;
 }
 
-void cover_now_playing_process_pending(void)
+void cover_now_playing_process_pending(int allow_without_playback)
 {
-    signal_worker_if_allowed();
+    signal_worker_if_allowed(allow_without_playback);
 }

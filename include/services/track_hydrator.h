@@ -4,13 +4,13 @@
 #include "app/track.h"
 #include "services/ym_api.h"
 
-/* Background hydration of track metadata by id. Serves two requesters with
+/* Background hydration of track metadata by track+album identity. Serves two requesters with
    fixed precedence: a single playback track (the next song must start) beats
    a list window (rows the user is about to see). One pending job per slot,
    newest request replaces the older one (latest-wins) — навигация меняет
    потребность, устаревшие заявки не имеют смысла.
 
-   For every requested id the worker first consults the on-MS metadata store;
+   For every requested identity the worker first consults the on-MS metadata store;
    only the misses go to the network (one POST /tracks per job). Every result
    is written through to the store and delivered via the sink callback with
    the list position and the request generation — the consumer drops stale
@@ -36,6 +36,7 @@ int track_hydrator_request_window(const char *token,
    echoed back to the sink verbatim. */
 int track_hydrator_request_track(const char *token,
                                  const char *track_id,
+                                 int album_id,
                                  int position,
                                  int generation);
 

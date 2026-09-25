@@ -19,7 +19,7 @@ void hal_gpu_set_viewport(int width, int height);
 void hal_gpu_invalidate_tex_state(void);
 void hal_gpu_invalidate_scissor(void);
 int hal_gpu_in_frame(void);
-void *hal_gpu_get_draw_buffer(void);
+void *hal_gpu_get_draw_buffer_cpu(void);
 void hal_gpu_copy_image(int psm, int sx, int sy, int width, int height, int srcw, const void *src,
                         int dx, int dy, int destw, void *dest);
 

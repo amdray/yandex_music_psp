@@ -13,6 +13,7 @@ typedef struct {
     int pending;
     char token[256];
     ListIndexId ids[TRACK_HYDRATOR_JOB_MAX];
+    int album_ids[TRACK_HYDRATOR_JOB_MAX];
     int positions[TRACK_HYDRATOR_JOB_MAX];
     int count;
     int generation;
@@ -61,7 +62,9 @@ static YmApiStreamDecision hydrator_on_track(const TrackEntry *entry, void *user
     track_meta_store_put(entry);
 
     for (i = 0; i < ctx->job->count; i++) {
-        if (strcmp(ctx->job->ids[i], entry->id) == 0) {
+        if (strcmp(ctx->job->ids[i], entry->id) == 0 &&
+            (ctx->job->album_ids[i] == 0 ||
+             ctx->job->album_ids[i] == entry->album_id)) {
             if (s_sink) {
                 s_sink(entry, ctx->job->positions[i], ctx->job->generation);
             }
@@ -75,6 +78,7 @@ static YmApiStreamDecision hydrator_on_track(const TrackEntry *entry, void *user
 static void hydrator_run_job(HydratorJob *job)
 {
     ListIndexId misses[TRACK_HYDRATOR_JOB_MAX];
+    int miss_album_ids[TRACK_HYDRATOR_JOB_MAX];
     int miss_pos[TRACK_HYDRATOR_JOB_MAX];
     int miss_count = 0;
     int i;
@@ -82,12 +86,14 @@ static void hydrator_run_job(HydratorJob *job)
     /* Store first: most window slots are hits after one blob/likes pass. */
     for (i = 0; i < job->count; i++) {
         TrackEntry entry;
-        if (track_meta_store_get(job->ids[i], &entry) == 0) {
+        if (track_meta_store_get_for(job->ids[i], job->album_ids[i],
+                                     &entry) == 0) {
             if (s_sink) {
                 s_sink(&entry, job->positions[i], job->generation);
             }
         } else {
             memcpy(misses[miss_count], job->ids[i], sizeof(ListIndexId));
+            miss_album_ids[miss_count] = job->album_ids[i];
             miss_pos[miss_count] = job->positions[i];
             miss_count++;
         }
@@ -103,6 +109,8 @@ static void hydrator_run_job(HydratorJob *job)
            positions without touching the original arrays. */
         memset(&net_job, 0, sizeof(net_job));
         memcpy(net_job.ids, misses, (size_t)miss_count * sizeof(ListIndexId));
+        memcpy(net_job.album_ids, miss_album_ids,
+               (size_t)miss_count * sizeof(int));
         memcpy(net_job.positions, miss_pos, (size_t)miss_count * sizeof(int));
         net_job.count = miss_count;
         net_job.generation = job->generation;
@@ -115,8 +123,17 @@ static void hydrator_run_job(HydratorJob *job)
 
         int hydrate_rc;
         net_tls_cancel_bind(&s_cancel_requested);
-        hydrate_rc = ym_api_tracks_hydrate(&ctx, net_job.ids, miss_count,
-                                           hydrator_on_track, &deliver, &status);
+        {
+            TrackRef refs[TRACK_HYDRATOR_JOB_MAX];
+            for (i = 0; i < miss_count; ++i) {
+                memset(&refs[i], 0, sizeof(refs[i]));
+                snprintf(refs[i].id, sizeof(refs[i].id), "%s",
+                         net_job.ids[i]);
+                refs[i].album_id = net_job.album_ids[i];
+            }
+            hydrate_rc = ym_api_tracks_hydrate_refs(
+                &ctx, refs, miss_count, hydrator_on_track, &deliver, &status);
+        }
         net_tls_cancel_unbind();
         if (hydrate_rc != 0) {
             logLine("hydrator: net hydrate failed status=%d gen=%d\n",
@@ -257,6 +274,7 @@ int track_hydrator_request_window(const char *token,
     s_window_job.pending = 1;
     snprintf(s_window_job.token, sizeof(s_window_job.token), "%s", token);
     memcpy(s_window_job.ids, ids, (size_t)count * sizeof(ListIndexId));
+    memset(s_window_job.album_ids, 0, (size_t)count * sizeof(int));
     for (i = 0; i < count; i++) {
         s_window_job.positions[i] = start + i;
     }
@@ -270,6 +288,7 @@ int track_hydrator_request_window(const char *token,
 
 int track_hydrator_request_track(const char *token,
                                  const char *track_id,
+                                 int album_id,
                                  int position,
                                  int generation)
 {
@@ -284,6 +303,7 @@ int track_hydrator_request_track(const char *token,
     snprintf(s_track_job.token, sizeof(s_track_job.token), "%s", token);
     memset(s_track_job.ids[0], 0, sizeof(ListIndexId));
     strcpy(s_track_job.ids[0], track_id);
+    s_track_job.album_ids[0] = album_id;
     s_track_job.positions[0] = position;
     s_track_job.count = 1;
     s_track_job.generation = generation;

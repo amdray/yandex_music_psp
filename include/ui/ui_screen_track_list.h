@@ -5,6 +5,7 @@
 #include "hal/hal_input.h"
 
 void ui_screen_track_list_update(AppState *state);
+int ui_screen_track_list_content_ready(AppState *state);
 void ui_screen_track_list_handle_input(AppState *state, const InputState *input);
 void ui_screen_track_list_render(const AppState *state);
 void ui_screen_track_list_on_exit(AppState *state);

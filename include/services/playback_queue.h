@@ -49,6 +49,15 @@ int playback_queue_set_from_ids(
     int source_id,
     int generation);
 
+/* Preferred setter: keeps the album context of every queue position. */
+int playback_queue_set_from_refs(
+    const TrackRef *refs,
+    int count,
+    int selected_index,
+    PlaybackQueueSource source,
+    int source_id,
+    int generation);
+
 int playback_queue_set_order_mode(PlaybackOrderMode mode);
 
 int playback_queue_get_current(TrackEntry *out);
@@ -62,6 +71,9 @@ int playback_queue_get_info(PlaybackQueueInfo *out);
 
 /* Копия id очереди для сохранения (last_play). Возврат: число записанных. */
 int playback_queue_get_ids(ListIndexId *out, int max_count);
+
+/* Copy queue identities including per-position album context. */
+int playback_queue_get_refs(TrackRef *out, int max_count);
 
 /* Дописать id в конец (волна: подгрузка следующей пачки). Возврат 0 = ок. */
 int playback_queue_append_ids(const ListIndexId *ids, int count);

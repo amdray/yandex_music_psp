@@ -13,6 +13,7 @@
 #define LOG_LINE_MAX 512
 #define LOG_BUFFER_SIZE (64 * 1024)
 #define LOG_AUTO_FLUSH_THRESHOLD (LOG_BUFFER_SIZE / 2)  // Auto-flush when half full
+#define LOG_REOPEN_DELAY_US 5000000ULL
 
 // Ring buffer for log messages
 static char s_log_buffer[LOG_BUFFER_SIZE];
@@ -24,6 +25,11 @@ static int s_log_dropped = 0;
 // File handle and state
 static SceUID s_log_fd = -1;
 static int s_log_ready = 0;
+static int s_logger_initialized = 0;
+static int s_reopen_in_progress = 0;
+static u64 s_reopen_at_us = 0;
+static int s_last_sink_error = 0;
+static unsigned int s_sink_failures = 0;
 static volatile int s_realtime_mode = 0;
 static char s_log_path[LOG_PATH_MAX];
 
@@ -78,59 +84,101 @@ static void log_buffer_write_locked(const char *data, size_t len)
     s_log_used += len;
 }
 
+static void log_sink_failed_locked(int error)
+{
+    if (s_log_fd >= 0) fs_close(s_log_fd);
+    s_log_fd = -1;
+    s_log_ready = 0;
+    s_last_sink_error = error;
+    s_sink_failures++;
+    s_reopen_at_us = sceKernelGetSystemTimeWide() + LOG_REOPEN_DELAY_US;
+}
+
+/* Called without the logger mutex: fs_open() itself emits an fs log line. */
+static void log_try_reopen(void)
+{
+    SceUID fd;
+    u64 now;
+    int recovered = 0;
+    int last_error = 0;
+    unsigned int failures = 0;
+
+    now = sceKernelGetSystemTimeWide();
+    LOG_MUTEX_LOCK();
+    if (!s_logger_initialized || s_log_ready || s_reopen_in_progress ||
+        (s_reopen_at_us != 0 && now < s_reopen_at_us)) {
+        LOG_MUTEX_UNLOCK();
+        return;
+    }
+    s_reopen_in_progress = 1;
+    LOG_MUTEX_UNLOCK();
+
+    fd = fs_open(s_log_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0666);
+
+    LOG_MUTEX_LOCK();
+    if (fd >= 0) {
+        s_log_fd = fd;
+        s_log_ready = 1;
+        s_reopen_at_us = 0;
+        recovered = (s_sink_failures != 0);
+        last_error = s_last_sink_error;
+        failures = s_sink_failures;
+        s_last_sink_error = 0;
+        s_sink_failures = 0;
+    } else {
+        s_reopen_at_us = sceKernelGetSystemTimeWide() + LOG_REOPEN_DELAY_US;
+    }
+    s_reopen_in_progress = 0;
+    LOG_MUTEX_UNLOCK();
+    if (recovered) {
+        logLine("logger: sink recovered failures=%u last_error=%d\n",
+                failures, last_error);
+    }
+}
+
+/* Writes one contiguous span. The caller owns the logger mutex. */
+static size_t log_write_span_locked(const char *data, size_t len)
+{
+    size_t done = 0;
+    while (done < len && s_log_ready && s_log_fd >= 0) {
+        int rc = fs_write(s_log_fd, data + done, len - done);
+        if (rc <= 0) {
+            log_sink_failed_locked(rc);
+            break;
+        }
+        done += (size_t)rc;
+    }
+    return done;
+}
+
 // Flush buffered logs synchronously in the caller's thread.
 static void log_flush_internal(void)
 {
-    if (!s_log_ready || s_log_fd < 0) {
-        return;
-    }
+    log_try_reopen();
+    if (!s_log_ready || s_log_fd < 0) return;
 
     // Lock mutex to read from buffer
-    u64 t0 = sceKernelGetSystemTimeWide();
     LOG_MUTEX_LOCK();
-    u64 t1 = sceKernelGetSystemTimeWide();
 
-    int dropped = s_log_dropped;
-    size_t used = s_log_used;
-    size_t tail = s_log_tail;
-    size_t first = 0;
-    size_t second = 0;
-
-    if (used > 0) {
-        first = LOG_BUFFER_SIZE - tail;
-        if (first > used) {
-            first = used;
-        }
-        second = used - first;
-    }
-    if (dropped > 0) {
+    if (s_log_dropped > 0) {
         char dropped_line[64];
         int len = snprintf(dropped_line, sizeof(dropped_line),
-                          "[dropped %d log lines]\n", dropped);
+                          "[dropped %d log lines]\n", s_log_dropped);
         if (len > 0) {
-            fs_write(s_log_fd, dropped_line, (size_t)len);
+            if (log_write_span_locked(dropped_line, (size_t)len) == (size_t)len)
+                s_log_dropped = 0;
         }
     }
 
-    if (first > 0) {
-        u64 tw0 = sceKernelGetSystemTimeWide();
-        fs_write(s_log_fd, s_log_buffer + tail, first);
-        u64 tw1 = sceKernelGetSystemTimeWide();
-        if ((tw1 - tw0) > 50000ULL) {
-            /* write took >50ms — log it directly via sceIoWrite to avoid recursion */
-            char dbg[64];
-            int dl = snprintf(dbg, sizeof(dbg), "flush: log_mutex_wait=%u write=%u us\n",
-                (unsigned)(t1 - t0), (unsigned)(tw1 - tw0));
-            if (dl > 0) sceIoWrite(s_log_fd, dbg, (size_t)dl);
-        }
+    while (s_log_used > 0 && s_log_ready) {
+        size_t span = LOG_BUFFER_SIZE - s_log_tail;
+        size_t written;
+        if (span > s_log_used) span = s_log_used;
+        written = log_write_span_locked(s_log_buffer + s_log_tail, span);
+        s_log_tail = (s_log_tail + written) % LOG_BUFFER_SIZE;
+        s_log_used -= written;
+        if (written != span) break;
     }
-    if (second > 0) {
-        fs_write(s_log_fd, s_log_buffer, second);
-    }
-
-    s_log_dropped = 0;
-    s_log_tail = (tail + used) % LOG_BUFFER_SIZE;
-    s_log_used = 0;
 
     LOG_MUTEX_UNLOCK();
 }
@@ -163,6 +211,11 @@ void logger_init(const char *path)
     s_log_tail = 0;
     s_log_used = 0;
     s_log_dropped = 0;
+    s_logger_initialized = 1;
+    s_reopen_in_progress = 0;
+    s_reopen_at_us = 0;
+    s_last_sink_error = 0;
+    s_sink_failures = 0;
 
     // Ensure directory exists - use relative paths, they will be resolved via CWD
     sceIoMkdir("data", 0777);
@@ -174,7 +227,11 @@ void logger_init(const char *path)
         s_log_ready = 1;
         // Write initial message directly to verify file is writable
         const char *init_msg = "logger: file opened successfully\n";
-        fs_write(s_log_fd, init_msg, strlen(init_msg));
+        if (fs_write(s_log_fd, init_msg, strlen(init_msg)) != (int)strlen(init_msg)) {
+            LOG_MUTEX_LOCK();
+            log_sink_failed_locked(-1);
+            LOG_MUTEX_UNLOCK();
+        }
     } else {
         // File open failed - write error to separate file (use relative path)
         sceIoMkdir("data/logs", 0777);
@@ -199,7 +256,7 @@ void logger_shutdown(void)
     log_flush_internal();
     
     // Write shutdown message directly
-    if (s_log_fd >= 0) {
+    if (s_log_ready && s_log_fd >= 0) {
         const char *shutdown_msg = "logger: shutdown\n";
         fs_write(s_log_fd, shutdown_msg, strlen(shutdown_msg));
     }
@@ -210,6 +267,7 @@ void logger_shutdown(void)
         s_log_fd = -1;
     }
     s_log_ready = 0;
+    s_logger_initialized = 0;
 
     // Destroy mutex
     if (s_log_mutex_initialized) {

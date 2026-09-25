@@ -1,6 +1,7 @@
 /* Shared full-track parser. See ym_api_track_parse.h.
  * Moved from ym_api_playlists.c (hydrate path) with the documented fixes. */
 #include "services/ym_api_track_parse.h"
+#include "services/ym_api_genres.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,7 +73,9 @@ int ym_api_parse_track_cutout_uri(cJSON *track_obj, char *out, size_t out_size)
     return 1;
 }
 
-int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
+int ym_api_parse_track_from_object_for_album(cJSON *track_obj,
+                                              int preferred_album_id,
+                                              TrackEntry *entry)
 {
     cJSON *error_node;
     cJSON *title_node;
@@ -87,6 +90,7 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
     cJSON *year_node;
     cJSON *explicit_node;
     cJSON *available_node;
+    int no_rights = 0;
 
     if (!track_obj || !entry) {
         return -1;
@@ -95,13 +99,13 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
         return -1;
     }
 
-    /* API marks region/rights-blocked tracks with "error":"no-rights" and omits
-     * duration/albums for them; we skip such tracks, so the final parsed count
-     * can legitimately be lower than the count reported by the API response. */
+    /* A rights-blocked item is still a resolved playlist position. The API
+     * supplies its id/title/artists but may omit duration and albums, so parse
+     * the available metadata and mark the entry as non-playable. */
     error_node = cJSON_GetObjectItemCaseSensitive(track_obj, "error");
     if (error_node && cJSON_IsString(error_node) && error_node->valuestring) {
         if (strcmp(error_node->valuestring, "no-rights") == 0) {
-            return 1;
+            no_rights = 1;
         }
     }
 
@@ -151,10 +155,40 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
         return 1;
     }
 
+    genre_node = NULL;
     albums_node = cJSON_GetObjectItemCaseSensitive(track_obj, "albums");
     if (albums_node && cJSON_IsArray(albums_node) && cJSON_GetArraySize(albums_node) > 0) {
-        cJSON *first_album = cJSON_GetArrayItem(albums_node, 0);
+        cJSON *first_album = NULL;
+        int album_count = cJSON_GetArraySize(albums_node);
+        int album_index;
+
+        if (preferred_album_id > 0) {
+            for (album_index = 0; album_index < album_count; ++album_index) {
+                cJSON *candidate = cJSON_GetArrayItem(albums_node, album_index);
+                cJSON *candidate_id = candidate
+                    ? cJSON_GetObjectItemCaseSensitive(candidate, "id") : NULL;
+                int value = 0;
+                if (cJSON_IsNumber(candidate_id)) {
+                    value = candidate_id->valueint;
+                } else if (cJSON_IsString(candidate_id) &&
+                           candidate_id->valuestring) {
+                    value = atoi(candidate_id->valuestring);
+                }
+                if (value == preferred_album_id) {
+                    first_album = candidate;
+                    break;
+                }
+            }
+            if (!first_album) {
+                logLine("ym_track_parse: track %s lacks requested album %d\n",
+                        entry->id, preferred_album_id);
+                return 1;
+            }
+        } else {
+            first_album = cJSON_GetArrayItem(albums_node, 0);
+        }
         if (first_album) {
+            genre_node = cJSON_GetObjectItemCaseSensitive(first_album, "genre");
             cJSON *album_title_node = cJSON_GetObjectItemCaseSensitive(first_album, "title");
             if (album_title_node && cJSON_IsString(album_title_node) && album_title_node->valuestring) {
                 strncpy(entry->album, album_title_node->valuestring, sizeof(entry->album) - 1);
@@ -184,7 +218,8 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
     }
 
     cover_node = cJSON_GetObjectItemCaseSensitive(track_obj, "coverUri");
-    if (cover_node && cJSON_IsString(cover_node) && cover_node->valuestring) {
+    if (preferred_album_id == 0 && cover_node && cJSON_IsString(cover_node) &&
+        cover_node->valuestring) {
         entry->cover_uri[0] = '\0';
         strncpy(entry->cover_uri, cover_node->valuestring, sizeof(entry->cover_uri) - 1);
         entry->cover_uri[sizeof(entry->cover_uri) - 1] = '\0';
@@ -205,10 +240,9 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
         entry->version[sizeof(entry->version) - 1] = '\0';
     }
 
-    genre_node = cJSON_GetObjectItemCaseSensitive(track_obj, "genre");
     if (genre_node && cJSON_IsString(genre_node) && genre_node->valuestring) {
-        strncpy(entry->genre, genre_node->valuestring, sizeof(entry->genre) - 1);
-        entry->genre[sizeof(entry->genre) - 1] = '\0';
+        ym_api_genres_resolve(genre_node->valuestring,
+                              entry->genre, sizeof(entry->genre));
     }
 
     year_node = cJSON_GetObjectItemCaseSensitive(track_obj, "year");
@@ -229,6 +263,14 @@ int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
     } else if (available_node && cJSON_IsNumber(available_node)) {
         entry->available = (available_node->valueint != 0) ? 1 : 0;
     }
+    if (no_rights) {
+        entry->available = 0;
+    }
 
     return 0;
+}
+
+int ym_api_parse_track_from_object(cJSON *track_obj, TrackEntry *entry)
+{
+    return ym_api_parse_track_from_object_for_album(track_obj, 0, entry);
 }

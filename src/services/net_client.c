@@ -248,7 +248,6 @@ static void track_boot_publish_error(struct AppState *state, int generation, int
     }
     state->track_boot.status = TRACK_BOOT_ERROR;
     state->track_boot.error_code = error_code;
-    state->track_ui.track_bootstrap_indicator_visible = 0;
     net_client_track_store_unlock();
 }
 
@@ -496,8 +495,7 @@ static int track_boot_on_chunk(const char *data, int size, void *user_data)
 }
 
 /* Publish the id order as complete (shared by cache-hit and network). The
-   bootstrap indicator stays on until the transition gate confirms the entry
-   window is hydrated. */
+   navigation gate still waits until the entry window is hydrated. */
 static void track_boot_publish_full_ready(TrackBootstrapJob *job, const char *src)
 {
     net_client_track_store_lock();

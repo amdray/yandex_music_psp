@@ -8,7 +8,6 @@
 
 #include "core/fs.h"
 #include "ui/ui_draw.h"
-#include "services/image_loader.h"
 #include "core/logger.h"
 #include "services/splash_flow.h"
 #include "services/audio_cache.h"
@@ -38,15 +37,15 @@
 #include "ui/ui_screen_wave.h"
 #include "ui/ui_screen_search.h"
 #include "ui/ui_screen_help.h"
-#include "ui/ui_wave_carousel.h"
-#include "ui/ui_glow_bg.h"
+#include "ui/ui_screen_memory.h"
 #include "ui/ui_common.h"
+#include "ui/ui_layout.h"
+#include "ui/ui_icon_atlas.h"
 
-static void *s_splash_pixels = NULL;
-static int s_splash_w = 0;
-static int s_splash_h = 0;
 static SplashFlow s_splash_flow;
 static ScreenId s_last_screen = SCREEN_COUNT;
+static int s_fatal_resource_error = 0;
+static const char *s_fatal_resource_path = NULL;
 
 /* Screen lifecycle table. Every screen declares its hooks here; transition
    handling (on_exit of the old screen, on_enter of the new one) happens in a
@@ -61,10 +60,12 @@ typedef struct {
     void (*handle_input)(AppState *state, const InputState *input);
     void (*render)(const AppState *state);
     /* Kicks the screen's data load and reports whether its visible content is
-       ready: 1 ready, 0 still loading, -1 load failed (enter anyway — the
-       screen renders its own error state). Screens without the hook are
+       ready: 1 ready, 0 still loading, -1 load failed. On failure the source
+       screen is kept unless enter_on_content_error explicitly preserves a
+       legacy destination-owned error screen. Screens without the hook are
        always ready. Drives ui_screens_navigate(). */
     int (*content_ready)(AppState *state);
+    int enter_on_content_error;
     int owns_back; /* screen handles CIRCLE itself; no generic pop */
 } ScreenDesc;
 
@@ -85,7 +86,13 @@ static void splash_input(AppState *state, const InputState *input)
 static void splash_render(const AppState *state)
 {
     (void)state;
-    ui_screen_splash_render(&s_splash_flow, s_splash_pixels, s_splash_w, s_splash_h);
+    ui_screen_splash_render(&s_splash_flow);
+}
+
+static void splash_on_exit(AppState *state)
+{
+    (void)state;
+    splash_flow_release_image(&s_splash_flow);
 }
 
 static void album_list_render(const AppState *state)
@@ -110,7 +117,6 @@ static void playlist_list_on_exit(AppState *state)
 static void now_playing_on_exit(AppState *state)
 {
     (void)state;
-    carousel_close();
     ui_screen_now_playing_release_video();
 }
 
@@ -119,6 +125,7 @@ static void now_playing_on_exit(AppState *state)
 static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
     [SCREEN_SPLASH] = {
         .name = "splash",
+        .on_exit = splash_on_exit,
         .update = splash_update,
         .handle_input = splash_input,
         .render = splash_render,
@@ -130,12 +137,18 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .render = ui_screen_menu_render,
         .owns_back = 1,
     },
+    [SCREEN_SETTINGS] = {
+        .name = "settings",
+        .handle_input = ui_screen_settings_handle_input,
+        .render = ui_screen_settings_render,
+    },
     [SCREEN_NOW_PLAYING] = {
         .name = "now_playing",
         .on_exit = now_playing_on_exit,
         .update = ui_screen_now_playing_update,
         .handle_input = ui_screen_now_playing_handle_input,
         .render = ui_screen_now_playing_render,
+        .content_ready = ui_screen_now_playing_content_ready,
         .owns_back = 1,  // круг перехватывает дропдаун SELECT
     },
     [SCREEN_ALBUM_LIST] = {
@@ -159,6 +172,7 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .update = ui_screen_track_list_update,
         .handle_input = ui_screen_track_list_handle_input,
         .render = ui_screen_track_list_render,
+        .content_ready = ui_screen_track_list_content_ready,
     },
     [SCREEN_ACCOUNT] = {
         .name = "account",
@@ -171,6 +185,7 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .handle_input = ui_screen_artist_handle_input,
         .render = ui_screen_artist_render,
         .content_ready = ui_screen_artist_content_ready,
+        .enter_on_content_error = 1,
     },
     [SCREEN_ARTIST_MENU] = {
         .name = "artist_menu",
@@ -178,6 +193,7 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .handle_input = ui_screen_artist_menu_handle_input,
         .render = ui_screen_artist_menu_render,
         .content_ready = ui_screen_artist_menu_content_ready,
+        .enter_on_content_error = 1,
     },
     [SCREEN_NET_INFO] = {
         .name = "net_info",
@@ -217,6 +233,10 @@ static const ScreenDesc s_screen_table[SCREEN_COUNT] = {
         .name = "help",
         .render = ui_screen_help_render,
     },
+    [SCREEN_MEMORY] = {
+        .name = "memory",
+        .render = ui_screen_memory_render,
+    },
 };
 
 static const ScreenDesc *screen_desc(ScreenId id)
@@ -236,6 +256,7 @@ static const char *screen_name(ScreenId id)
 void ui_screens_navigate(AppState *state, ScreenId target)
 {
     const ScreenDesc *desc = screen_desc(target);
+    int ready;
 
     if (!desc) {
         return;
@@ -243,9 +264,19 @@ void ui_screens_navigate(AppState *state, ScreenId target)
     if (net_ui_status_input_locked()) {
         return;
     }
-    if (!desc->content_ready || desc->content_ready(state) != 0) {
+    if (!desc->content_ready) {
         s_nav_pending = SCREEN_COUNT;
         app_state_push(state, target);
+        return;
+    }
+    ready = desc->content_ready(state);
+    if (ready > 0 || (ready < 0 && desc->enter_on_content_error)) {
+        s_nav_pending = SCREEN_COUNT;
+        app_state_push(state, target);
+        return;
+    }
+    if (ready < 0) {
+        s_nav_pending = SCREEN_COUNT;
         return;
     }
     s_nav_pending = target;
@@ -259,6 +290,7 @@ ScreenId ui_screens_nav_pending(void)
 static void screens_service_pending_nav(AppState *state)
 {
     const ScreenDesc *desc;
+    int ready;
 
     if (s_nav_pending == SCREEN_COUNT) {
         return;
@@ -268,10 +300,13 @@ static void screens_service_pending_nav(AppState *state)
         s_nav_pending = SCREEN_COUNT;
         return;
     }
-    if (desc->content_ready(state) != 0) {
+    ready = desc->content_ready(state);
+    if (ready > 0 || (ready < 0 && desc->enter_on_content_error)) {
         ScreenId target = s_nav_pending;
         s_nav_pending = SCREEN_COUNT;
         app_state_push(state, target);
+    } else if (ready < 0) {
+        s_nav_pending = SCREEN_COUNT;
     }
 }
 
@@ -326,7 +361,11 @@ void ui_screens_update(AppState *state, const InputState *input)
 {
     const ScreenDesc *desc;
 
-    system_status_update();
+    if (s_fatal_resource_error) return;
+
+    system_status_update(input &&
+                         (input->buttons &
+                          (PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)));
     net_ui_status_update(input ? input->hold : 0,
                          input ? input->wlan_on : 0);
     screens_sync_lifecycle(state);
@@ -347,35 +386,25 @@ void ui_screens_update(AppState *state, const InputState *input)
 
 int ui_screens_init(void)
 {
-    void *data = NULL;
-    int w = 0;
-    int h = 0;
-    const char *rel_path = "assets/splash.jpg";
-    int loaded = 0;
-
-    logLine("ui: splash load try '%s'\n", rel_path);
-    if (image_load_rgba8888(rel_path, &data, &w, &h, NULL) == 0) {
-        loaded = 1;
+    s_fatal_resource_error = 0;
+    s_fatal_resource_path = NULL;
+    if (ui_layout_load("assets/ui_layout.txt") != 0) {
+        s_fatal_resource_error = 1;
+        s_fatal_resource_path = "assets/ui_layout.txt";
+        logLine("ui: fatal resource error path='assets/ui_layout.txt'\n");
+        return 0;
     }
-
-    if (loaded) {
-        s_splash_pixels = data;
-        s_splash_w = w;
-        s_splash_h = h;
-        logLine("ui: splash loaded %dx%d\n", w, h);
-        // Log memory after splash load (using safe function)
-        {
-            int maxFree = sceKernelMaxFreeMemSize();
-            logLine("mem: after splash max_free=%d\n", maxFree);
-        }
-    } else {
-        logLine("ui: splash load failed (non-critical)\n");
+    if (ui_icon_atlas_init("assets/ui_icons.t4") != 0) {
+        s_fatal_resource_error = 1;
+        s_fatal_resource_path = "assets/ui_icons.t4";
+        logLine("ui: fatal resource error path='assets/ui_icons.t4'\n");
+        return 0;
     }
 
     splash_flow_init(&s_splash_flow);
+    ui_screen_memory_init();
     system_status_init();
     net_ui_status_init();
-    glow_bg_init();
 
     audio_cache_init();
     playback_controller_init();
@@ -395,14 +424,23 @@ int ui_screens_init(void)
     return 0;
 }
 
+int ui_screens_has_fatal_resource_error(void)
+{
+    return s_fatal_resource_error;
+}
+
 int ui_screens_shutdown(void)
 {
     int quiesced = 1;
+    if (s_fatal_resource_error) {
+        ui_icon_atlas_shutdown();
+        ui_layout_unload();
+        return 0;
+    }
     /* Phase one only: close admission and join every consumer. Nothing is
      * deleted or freed unless every join has succeeded. The process exits after
      * this function, so phase two is OS reclamation. */
     last_play_save();  // чистый выход посреди трека — запомнили
-    glow_bg_free();
     net_tls_quiesce_begin();
     if (splash_flow_quiesce(&s_splash_flow) < 0) quiesced = 0;
     if (playback_controller_quiesce() < 0) quiesced = 0;
@@ -414,6 +452,8 @@ int ui_screens_shutdown(void)
     if (net_client_playlist_load_quiesce() < 0) quiesced = 0;
     if (audio_cache_quiesce() < 0) quiesced = 0;
     if (net_client_shutdown() < 0) quiesced = 0;
+    ui_icon_atlas_shutdown();
+    ui_layout_unload();
     return quiesced ? 0 : -1;
 }
 
@@ -422,13 +462,16 @@ void ui_screens_handle_input(AppState *state, const InputState *input)
     ScreenId current = app_state_get_current(state);
     const ScreenDesc *desc = screen_desc(current);
 
-    if (net_ui_status_input_locked()) {
+    if (s_fatal_resource_error || net_ui_status_input_locked()) {
         return;
     }
 
     /* Any new input while a gated navigation waits re-asserts user control;
        the handler below may immediately re-request it (e.g. repeated X). */
     if (s_nav_pending != SCREEN_COUNT && input->pressed) {
+        if (s_nav_pending == SCREEN_TRACK_LIST) {
+            app_state_cancel_track_bootstrap(state);
+        }
         s_nav_pending = SCREEN_COUNT;
     }
 
@@ -452,10 +495,22 @@ void ui_screens_render(const AppState *state)
 
     ui_draw_begin_frame();
 
+    if (s_fatal_resource_error) {
+        char fatal_line[96];
+        ui_draw_clear(UI_COLOR_BACKGROUND);
+        snprintf(fatal_line, sizeof(fatal_line), "FATAL: %s",
+                 s_fatal_resource_path ? s_fatal_resource_path : "UI resource");
+        ui_draw_text(16.0f, 118.0f, fatal_line, UI_COLOR_PRIMARY);
+        ui_draw_text(16.0f, 138.0f, "Reinstall application resources",
+                     UI_COLOR_ACTIVE);
+        ui_draw_end_frame();
+        return;
+    }
+
     if (desc && desc->render) {
         desc->render(state);
     } else {
-        ui_draw_clear(0xFF1A1A1A);
+        ui_draw_clear(UI_COLOR_BACKGROUND);
         ui_common_draw_header("Unknown");
     }
 
@@ -463,7 +518,6 @@ void ui_screens_render(const AppState *state)
         ui_common_draw_top_status();
     }
     ui_common_draw_eq_toast();
-    net_ui_status_on_rendered_frame();
 
     ui_draw_end_frame();
 }

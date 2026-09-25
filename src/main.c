@@ -19,13 +19,12 @@
 #include "services/image_loader.h"
 #include "services/cover_manager.h"
 #include "services/eq.h"
-#include "services/system_status.h"
 #include "services/playback_controller.h"
 #include "services/audio_player.h"
 #include "services/net_client.h"
 #include "core/logger.h"
 #include "core/fs.h"
-#include "core/clock.h"
+#include "core/mem_probe.h"
 #include "services/systemctrl_rng.h"
 
 #define LOGGER_PATH "data/logs/app.log"
@@ -54,11 +53,33 @@ static int ui_draw_ready = 0;
 static int ui_screens_ready = 0;
 static int hal_input_ready = 0;
 
+static void log_heap_state(const char *stage)
+{
+    MemProbeSample sample;
+    size_t cap;
+    size_t used;
+    size_t free_bytes;
+
+    if (mem_probe_latest(&sample)) {
+        cap = sample.heap_cap;
+        used = sample.heap_used;
+    } else {
+        cap = mem_heap_cap();
+        used = mem_heap_used();
+    }
+    free_bytes = cap > used ? cap - used : 0;
+
+    logLine("mem: heap stage=%s used=%u free=%u cap=%u\n",
+            stage ? stage : "periodic",
+            (unsigned int)used,
+            (unsigned int)free_bytes,
+            (unsigned int)cap);
+}
+
 typedef enum {
     EXIT_STAGE_NONE = 0,
     EXIT_STAGE_AFTER_LOGGER = 1,
     EXIT_STAGE_AFTER_FS = 2,
-    EXIT_STAGE_AFTER_CLOCK = 3,
 } ExitStage;
 
 static int exit_on_stage(ExitStage stage)
@@ -87,14 +108,16 @@ static void log_data_paths(void)
     }
 }
 
+static volatile int s_exit_requested = 0;
+
 /* Exit callback - called when user presses HOME button */
 static int exit_callback(int arg1, int arg2, void *common)
 {
     (void)arg1;
     (void)arg2;
     (void)common;
-    /* Workers may still be running. Process exit reclaims the intact graph. */
-    sceKernelExitGame();
+    /* The main thread owns worker quiescence and the final log close. */
+    s_exit_requested = 1;
     return 0;
 }
 
@@ -161,6 +184,7 @@ int main(int argc, char *argv[])
 {
     int exit_code = 1;
     u64 last_log_flush_us = 0;
+    u64 last_heap_log_us = 0;
 
     // Set CWD from argv[0] - required for relative paths to work
     if (argc > 0 && argv[0]) {
@@ -199,20 +223,6 @@ int main(int argc, char *argv[])
     logLine("app: init - log_data_paths\n");
     log_data_paths();
     if (exit_on_stage(EXIT_STAGE_AFTER_FS)) {
-        return 0;
-    }
-
-    logLine("app: init - clock_init\n");
-    // Initialize system time (required for TLS/SSL certificate validation)
-    if (clock_init() < 0) {
-        logLine("app: FATAL - RTC check failed, TLS/SSL will not work\n");
-        logLine("app: Please check:\n");
-        logLine("app:   1. PSP battery (RTC battery may be dead)\n");
-        logLine("app:   2. Date/Time in PSP settings (must be >= 2024)\n");
-        goto cleanup;
-    }
-    logLine("app: system time initialized\n");
-    if (exit_on_stage(EXIT_STAGE_AFTER_CLOCK)) {
         return 0;
     }
 
@@ -264,10 +274,12 @@ int main(int argc, char *argv[])
     }
     exit_code = 0;
 
-    // Log memory state after all initialization (using safe function)
+    mem_probe_update(sceKernelGetSystemTimeWide());
+    log_heap_state("initialized");
     logLine("app: entering main loop\n");
     logger_flush();
     u64 last_net_poll_us = 0;
+    u64 note_pressed_us = 0;
     int wd_pos = -1;
     u64 wd_t0 = 0;
     int wd_stage = 0;
@@ -279,40 +291,49 @@ int main(int argc, char *argv[])
 
         hal_input_poll(&input);
 
+        if (s_exit_requested) break;
+
+        if (ui_screens_has_fatal_resource_error()) {
+            ui_screens_render(&s_app_state);
+            now_us = sceKernelGetSystemTimeWide();
+            logger_set_realtime_mode(0);
+            if (last_log_flush_us == 0 ||
+                (now_us - last_log_flush_us) >= 250000ULL) {
+                logger_flush();
+                last_log_flush_us = now_us;
+            }
+            continue;
+        }
+
         /* События питания (сон/пробуждение/переключатель): сразу
          * перепроверяем сеть, а не ждём секундного тика. */
         if (s_power_event) {
             int ev = s_power_event;
             s_power_event = 0;
             logLine("app: power event 0x%08X, net recheck\n", ev);
-            logger_flush();
-            net_client_poll();
+            if (net_client_runtime_started()) net_client_poll();
         }
 
-        /* Кнопка ♪ (NOTE): переключение профилей эквалайзера везде. */
-        if (input.pressed & PSP_CTRL_NOTE) {
-            int p = eq_next_preset();
-            eq_save();
-            logLine("app: NOTE -> eq preset %d\n", p);
-        }
-
-        /* Громкость поверх системного максимума: VOL+ на 30/30 растит
-         * предусиление (+2 дБ, до +12), VOL- сначала сливает его.
-         * (ОС свои шаги тоже делает — это её сторону не отменяет.) */
-        if (input.pressed & (PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)) {
-            SystemStatusSnapshot vs;
-            system_status_get_snapshot(&vs);
-            if (input.pressed & PSP_CTRL_VOLUP) {
-                if (vs.volume_available && vs.volume_level >= 30 &&
-                    eq_get_preamp_db() < EQ_PREAMP_MAX_DB) {
-                    eq_set_preamp_db(eq_get_preamp_db() + EQ_PREAMP_STEP_DB);
-                    eq_save();
-                }
-            } else if (eq_get_preamp_db() > 0.0f) {
-                eq_set_preamp_db(eq_get_preamp_db() - EQ_PREAMP_STEP_DB);
+        now_us = sceKernelGetSystemTimeWide();
+        /* Короткое нажатие ♪ с отпусканием меняет пресет; длительное
+         * удержание остаётся системной кнопкой звука. */
+        if (!input.note_valid) {
+            note_pressed_us = 0;
+        } else if (input.pressed & PSP_CTRL_NOTE) {
+            note_pressed_us = now_us;
+        } else if (note_pressed_us != 0 && !(input.buttons & PSP_CTRL_NOTE)) {
+            if (now_us - note_pressed_us < 1000000ULL) {
+                int p = eq_next_preset();
                 eq_save();
+                logLine("app: NOTE short -> eq preset %d\n", p);
+            } else {
+                logLine("app: NOTE long hold -> eq unchanged\n");
             }
+            note_pressed_us = 0;
         }
+
+        s_app_state.ui_now_us = now_us;
+        mem_probe_update(now_us);
 
         ui_screens_update(&s_app_state, &input);
         if (net_client_requires_process_exit()) {
@@ -323,12 +344,16 @@ int main(int argc, char *argv[])
         ui_screens_render(&s_app_state);
         playback_controller_service();
 
-        now_us = sceKernelGetSystemTimeWide();
+        if (last_heap_log_us == 0 || now_us - last_heap_log_us >= 10000000ULL) {
+            log_heap_state("periodic");
+            last_heap_log_us = now_us;
+        }
 
         /* Keep APCTL state current after the splash screen. Previously it was
          * polled only during startup, so a later network transition was
          * invisible and net_client_is_ready() remained stale. */
-        if (last_net_poll_us == 0 || now_us - last_net_poll_us >= 1000000ULL) {
+        if (net_client_runtime_started() &&
+            (last_net_poll_us == 0 || now_us - last_net_poll_us >= 1000000ULL)) {
             net_client_poll();
             last_net_poll_us = now_us;
         }
@@ -387,6 +412,10 @@ cleanup:
         /* ui_screens_shutdown is join-only. Whether every join succeeds or not,
          * no application/network destructor runs in this process. */
         (void)ui_screens_shutdown();
+        logLine("app: shutdown\n");
+        LOG_FLUSH();
+        LOG_SHUTDOWN();
+        fs_shutdown();
         sceKernelExitGame();
         return exit_code;
     }

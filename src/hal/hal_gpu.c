@@ -254,9 +254,11 @@ int hal_gpu_in_frame(void)
     return s_in_frame;
 }
 
-void *hal_gpu_get_draw_buffer(void)
+void *hal_gpu_get_draw_buffer_cpu(void)
 {
-    return s_draw_buffer;
+    uintptr_t base_addr = (uintptr_t)sceGeEdramGetAddr();
+    uintptr_t offset = (uintptr_t)s_draw_buffer;
+    return (void *)((0x40000000UL | base_addr) + offset);
 }
 
 void hal_gpu_invalidate_tex_state(void)

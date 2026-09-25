@@ -21,6 +21,20 @@ static void set_string_field(char *dst, size_t dst_size, const cJSON *node)
     }
 }
 
+static void set_iso_date_field(char dst[11], const cJSON *node)
+{
+    const char *value;
+    if (!dst || !node || !cJSON_IsString(node) || !node->valuestring) {
+        return;
+    }
+    value = node->valuestring;
+    if (strlen(value) < 10 || value[4] != '-' || value[7] != '-') {
+        return;
+    }
+    memcpy(dst, value, 10);
+    dst[10] = '\0';
+}
+
 int api_parser_account_status(const char *json_body, size_t json_size, UserInfo *info)
 {
     cJSON *root = NULL;
@@ -195,6 +209,9 @@ int api_parser_playlists_list(const char *json_body, size_t json_size,
         cJSON *revision = cJSON_GetObjectItemCaseSensitive(item, "revision");
         entry->revision = (revision && cJSON_IsNumber(revision)) ? revision->valueint : 0;
 
+        set_iso_date_field(entry->modified_date,
+                           cJSON_GetObjectItemCaseSensitive(item, "modified"));
+
         // playlistUuid
         cJSON *pu = cJSON_GetObjectItemCaseSensitive(item, "playlistUuid");
         if (pu && cJSON_IsString(pu) && pu->valuestring) {
@@ -329,6 +346,9 @@ int api_parser_liked_playlists(const char *json_body, size_t json_size,
         cJSON *revision = cJSON_GetObjectItemCaseSensitive(item, "revision");
         entry->revision = (revision && cJSON_IsNumber(revision)) ? revision->valueint : 0;
 
+        set_iso_date_field(entry->modified_date,
+                           cJSON_GetObjectItemCaseSensitive(item, "modified"));
+
         // playlistUuid
         cJSON *pu = cJSON_GetObjectItemCaseSensitive(item, "playlistUuid");
         if (pu && cJSON_IsString(pu) && pu->valuestring) {
@@ -340,6 +360,14 @@ int api_parser_liked_playlists(const char *json_body, size_t json_size,
         cJSON *uid = cJSON_GetObjectItemCaseSensitive(item, "uid");
         if (uid && cJSON_IsNumber(uid)) {
             entry->owner_uid = uid->valueint;
+        }
+
+        {
+            cJSON *owner = cJSON_GetObjectItemCaseSensitive(item, "owner");
+            if (owner && cJSON_IsObject(owner)) {
+                set_string_field(entry->owner_name, sizeof(entry->owner_name),
+                                 cJSON_GetObjectItemCaseSensitive(owner, "name"));
+            }
         }
 
         cJSON *cover = cJSON_GetObjectItemCaseSensitive(item, "cover");

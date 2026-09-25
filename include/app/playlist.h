@@ -13,6 +13,8 @@ typedef struct {
     int playlist_id;  // Playlist ID (переименовано из kind)
     char cover_uri[96];  // URL обложки (с %% для размера)
     int owner_uid;  // 0 = текущий пользователь; != 0 для лайкнутых плейлистов чужого юзера
+    char owner_name[96];  // отображаемое имя владельца для лайкнутых плейлистов
+    char modified_date[11];  // дата изменения из modified: YYYY-MM-DD
     char uuid[48];  // playlistUuid — глобально уникальный идентификатор
     int revision;   // API revision counter — bumps on any edit; track-cache key
 } PlaylistEntry;

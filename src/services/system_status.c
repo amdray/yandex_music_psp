@@ -201,12 +201,17 @@ static void update_battery(void)
 
     remaining = scePowerGetBatteryRemainCapacity();
     full = scePowerGetBatteryFullCapacity();
-    if (remaining < 0 || full <= 0) {
-        s_status.battery_available = 0;
-        return;
+    if (remaining >= 0 && full > 0) {
+        percent = (int)(((long long)remaining * 100LL + full / 2) / full);
+    } else {
+        /* PPSSPP exposes battery presence but does not implement the capacity
+         * calls. Its life-percent call is available, as it is on a real PSP. */
+        percent = scePowerGetBatteryLifePercent();
+        if (percent < 0 || percent > 100) {
+            s_status.battery_available = 0;
+            return;
+        }
     }
-
-    percent = (int)(((long long)remaining * 100LL + full / 2) / full);
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
 
@@ -361,7 +366,7 @@ void system_status_init(void)
     s_cpu_window_idle_us = 0;
     s_cpu_sample_count = 0;
     cpu_log_init();
-    system_status_update();
+    system_status_update(0);
 }
 
 void system_status_shutdown(void)
@@ -373,11 +378,13 @@ void system_status_shutdown(void)
     }
 }
 
-void system_status_update(void)
+void system_status_update(int volume_button_down)
 {
     u64 now = sceKernelGetSystemTimeWide();
 
-    if (s_last_volume_us == 0 || now - s_last_volume_us >= VOLUME_POLL_US) {
+    s_status.volume_button_down = volume_button_down ? 1 : 0;
+    if (volume_button_down || s_last_volume_us == 0 ||
+        now - s_last_volume_us >= VOLUME_POLL_US) {
         update_volume();
         s_last_volume_us = now;
     }

@@ -12,7 +12,12 @@ typedef struct {
     int wifi_profile_id;
 } NetTlsNetworkConfig;
 
-#define NET_STACK_ERR_FATAL_LIVE_RUNTIME         (-21001)
+typedef enum NetStackStartResult {
+    NET_STACK_START_OK = 0,
+    NET_STACK_ERR_FATAL_LIVE_RUNTIME = -21001,
+    NET_STACK_ERR_WLAN_OFF = -21002,
+    NET_STACK_ERR_NO_PROFILE = -21003
+} NetStackStartResult;
 
 typedef enum NetSupervisorPhase {
     NET_SUPERVISOR_IDLE = 0,
@@ -30,6 +35,7 @@ typedef struct NetStackSnapshot {
 } NetStackSnapshot;
 
 int net_stack_init(const NetTlsNetworkConfig *config);
+int net_stack_wlan_switch_is_on(void);
 int net_stack_stop_supervisor(void);
 int net_stack_is_ready(void);
 int net_stack_is_stuck(void);

@@ -3,6 +3,39 @@
 
 #include <pspctrl.h>
 #include <pspwlan.h>
+#include <stdint.h>
+#include <string.h>
+
+#define CTRL_PEEK_POSITIVE_NID 0x3A622550u
+#define CTRL_DIALOG_RELEASE_MASK \
+    (PSP_CTRL_SELECT | PSP_CTRL_START | PSP_CTRL_UP | PSP_CTRL_RIGHT | \
+     PSP_CTRL_DOWN | PSP_CTRL_LEFT | PSP_CTRL_LTRIGGER | PSP_CTRL_RTRIGGER | \
+     PSP_CTRL_TRIANGLE | PSP_CTRL_CIRCLE | PSP_CTRL_CROSS | PSP_CTRL_SQUARE | \
+     PSP_CTRL_NOTE | PSP_CTRL_SCREEN | PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)
+
+struct KernelCallArg {
+    u32 arg1;
+    u32 arg2;
+    u32 arg3;
+    u32 arg4;
+    u32 arg5;
+    u32 arg6;
+    u32 arg7;
+    u32 arg8;
+    u32 arg9;
+    u32 arg10;
+    u32 arg11;
+    u32 arg12;
+    u32 ret1;
+    u32 ret2;
+};
+
+extern u32 sctrlHENFindFunction(const char *module_name,
+                                const char *library_name, u32 nid);
+extern int kuKernelCall(void *function, struct KernelCallArg *args);
+
+static u32 s_kernel_ctrl_peek;
+static int s_kernel_ctrl_failed;
 
 int hal_input_init(void)
 {
@@ -19,6 +52,16 @@ int hal_input_init(void)
         logLine("hal_input: failed to set analog mode (0x%08X)\n", ret);
         return -1;
     }
+
+    s_kernel_ctrl_peek = sctrlHENFindFunction("sceController_Service",
+                                              "sceCtrl_driver",
+                                              CTRL_PEEK_POSITIVE_NID);
+    s_kernel_ctrl_failed = 0;
+    if (s_kernel_ctrl_peek == 0) {
+        logLine("hal_input: kernel controller export missing; using user controller sample\n");
+    } else {
+        logLine("hal_input: kernel controller export resolved\n");
+    }
     
     logLine("hal_input: initialized (analog mode)\n");
     return 0;
@@ -34,13 +77,16 @@ void hal_input_shutdown(void)
 void hal_input_poll(InputState *out_state)
 {
     static u32 prev_buttons = 0;
+    static int home_dialog_active = 0;
     static int switches_initialized = 0;
     static int prev_hold = 0;
     static int prev_ctrl_wlan = 0;
     static int prev_wlan_api = 0;
     SceCtrlData pad;
+    SceCtrlData kernel_pad;
     int ret;
     int wlan_api;
+    int note_valid = 0;
 
     if (!out_state) {
         return;
@@ -48,17 +94,67 @@ void hal_input_poll(InputState *out_state)
 
     out_state->buttons = 0;
     out_state->pressed = 0;
+    out_state->note_valid = 0;
     out_state->hold = 0;
     wlan_api = sceWlanGetSwitchState();
     out_state->wlan_on = wlan_api ? 1 : 0;
 
+    memset(&pad, 0, sizeof(pad));
     ret = sceCtrlPeekBufferPositive(&pad, 1);
     if (ret <= 0) {
+        prev_buttons = 0;
+        return;
+    }
+
+    /* In user mode PSP_CTRL_HOME remains set while the system exit dialog is
+     * visible. Suppress every application action during the dialog and until
+     * its navigation/confirmation buttons have all been released. */
+    if (pad.Buttons & PSP_CTRL_HOME) {
+        if (!home_dialog_active) {
+            logLine("hal_input: HOME dialog opened; application input blocked\n");
+        }
+        home_dialog_active = 1;
+        prev_buttons = 0;
+        return;
+    }
+
+    memset(&kernel_pad, 0, sizeof(kernel_pad));
+    if (s_kernel_ctrl_peek != 0 && !s_kernel_ctrl_failed) {
+        struct KernelCallArg args;
+        int bridge_rc;
+
+        memset(&args, 0, sizeof(args));
+        args.arg1 = (u32)(uintptr_t)&kernel_pad;
+        args.arg2 = 1;
+        bridge_rc = kuKernelCall((void *)s_kernel_ctrl_peek, &args);
+        if (bridge_rc < 0 || (int)args.ret1 < 0) {
+            logLine("hal_input: kernel controller read failed bridge=%d peek=%d; NOTE unavailable\n",
+                    bridge_rc, (int)args.ret1);
+            s_kernel_ctrl_failed = 1;
+        } else if ((int)args.ret1 > 0) {
+            note_valid = 1;
+        }
+    }
+
+    if (note_valid) {
+        pad.Buttons = (pad.Buttons & ~PSP_CTRL_NOTE) |
+                      (kernel_pad.Buttons & PSP_CTRL_NOTE);
+    }
+
+    if (home_dialog_active) {
+        prev_buttons = 0;
+        if (pad.Buttons & CTRL_DIALOG_RELEASE_MASK) {
+            return;
+        }
+        home_dialog_active = 0;
+        logLine("hal_input: HOME dialog closed; application input resumed\n");
         return;
     }
 
     out_state->buttons = pad.Buttons;
     out_state->pressed = (pad.Buttons ^ prev_buttons) & pad.Buttons;
+    out_state->note_valid = note_valid || s_kernel_ctrl_peek == 0 ||
+                            s_kernel_ctrl_failed;
     out_state->hold = (pad.Buttons & PSP_CTRL_HOLD) ? 1 : 0;
     prev_buttons = pad.Buttons;
 

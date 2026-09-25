@@ -141,6 +141,8 @@ typedef enum {
 
     // My wave
     LOCALE_SCREEN_WAVE,
+    LOCALE_CAROUSEL_TITLE,
+    LOCALE_TRACK_WAVE,
     LOCALE_WAVE_LOADING,
     LOCALE_WAVE_ERROR,
 

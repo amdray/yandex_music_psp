@@ -1,6 +1,7 @@
 #include "ui/ui_screen_now_playing.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
+#include "ui/ui_glow_bg.h"
 #include "ui/ui_icon_atlas.h"
 #include "ui/ui_layout.h"
 #include "ui/ui_screens.h"
@@ -528,6 +529,7 @@ void ui_screen_now_playing_render(const AppState *state)
         return;
     }
     (void)ui_layout_render("now_playing", NULL, NULL, NULL);
+    glow_bg_draw(0.0f, 0.0f, 480.0f, 272.0f);
     
     if (state->now_playing_track.id[0] == '\0') {
         ui_draw_text(title_widget.x, title_widget.y,

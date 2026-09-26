@@ -671,6 +671,13 @@ static void vfpu_build_sparkrow(int y)
 
 static void vfpu_render_pack(float bright)
 {
+    // Байер 4x4 для дитеринга (±0.5 LSB): разбивает 8-битные bands градиента.
+    static const float kDith[16] = {
+        0.0f/16.0f,  8.0f/16.0f,  2.0f/16.0f, 10.0f/16.0f,
+        12.0f/16.0f,  4.0f/16.0f, 14.0f/16.0f,  6.0f/16.0f,
+        3.0f/16.0f, 11.0f/16.0f,  1.0f/16.0f,  9.0f/16.0f,
+        15.0f/16.0f,  7.0f/16.0f, 13.0f/16.0f,  5.0f/16.0f
+    };
     int y, xq;
 #if VFPU_DUMP
     {
@@ -781,6 +788,10 @@ static void vfpu_render_pack(float bright)
                     b = s_fbgq[px][2] + (b - s_fbgq[px][2]) * bright;
                     if (s_liked) {
                         r += 0.0392f; g -= 0.0157f; b -= 0.0392f;
+                    }
+                    {
+                        float dth = (kDith[(px & 3) | ((y & 3) << 2)] - 0.5f) * (1.0f / 255.0f);
+                        r += dth; g += dth; b += dth;
                     }
                     ri = (int)(r * 255.0f + 0.5f);
                     gi = (int)(g * 255.0f + 0.5f);

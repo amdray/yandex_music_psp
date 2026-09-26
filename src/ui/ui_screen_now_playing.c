@@ -331,6 +331,7 @@ static int s_last_selected_index = -1;
 static char s_last_loaded_track_id[128] = {0};
 static char s_last_cover_uri[96] = {0};
 static int s_video_cover_requested = 0;
+static int s_glow_pal_album = 0;  /* альбом, из которого взята палитра свечения */
 
 /* Холд влево/вправо = перемотка, тап = соседний трек.
  * Тап срабатывает на отпускании (до 450 мс), иначе seek-повторы. */
@@ -387,6 +388,8 @@ void ui_screen_now_playing_update(AppState *state)
                     sizeof(s_last_loaded_track_id) - 1);
             s_last_loaded_track_id[sizeof(s_last_loaded_track_id) - 1] = '\0';
             s_last_cover_uri[0] = '\0';
+            glow_bg_pulse();
+            logLine("np: track change -> glow pulse id='%s'\n", track->id);
 
             /* A track change invalidates every previous video-cover attempt.
              * Queue the ordinary cover first; its worker stays asleep while
@@ -434,6 +437,28 @@ void ui_screen_now_playing_update(AppState *state)
         cover_now_playing_clear();
         video_cover_clear();
     }
+
+    /* Свечение реагирует на воспроизведение и лайк; пульс при смене трека
+     * поднимается в точке обновления s_last_loaded_track_id. */
+    if (track->id[0] != '\0') {
+        glow_bg_set_liked(track_like_is_on(track->id));
+
+        /* Палитра вайб-фона — из декодированной обложки (как в Яндексе).
+         * Один раз на обложку, после её загрузки. */
+        if (track->album_id != 0 && track->album_id != s_glow_pal_album) {
+            const NowPlayingCover *glow_cover =
+                cover_now_playing_get_for(track->album_id, track->cover_uri);
+            if (glow_cover && glow_cover->rgba_data && glow_cover->loaded) {
+                glow_bg_set_cover(glow_cover->rgba_data, glow_cover->w,
+                                  glow_cover->h, glow_cover->stride_bytes);
+                s_glow_pal_album = track->album_id;
+                logLine("np: glow palette from cover album_id=%d\n",
+                        track->album_id);
+            }
+        }
+    }
+    audio_player_get_snapshot(&audio);
+    glow_bg_set_playing(audio.state == AUDIO_PLAYER_PLAYING);
 }
 
 void ui_screen_now_playing_handle_input(AppState *state, const InputState *input)

@@ -41,6 +41,9 @@ static void text_draw(TextFont font, int x, int y, const char *text,
     }
 
     hal_gpu_set_texturing(1);
+    /* v2 fonts carry 16-level coverage alpha: the AA edge needs blending to
+     * stay thin, so never rely on the caller's GU_BLEND state here. */
+    hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
     sceGuEnable(GU_ALPHA_TEST);
     sceGuAlphaFunc(GU_GREATER, 0, 0xFF);
 

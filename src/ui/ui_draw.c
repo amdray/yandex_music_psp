@@ -142,6 +142,8 @@ void ui_draw_image_rgba_nearest(const void *pixels, int tex_w, int tex_h,
     hal_gpu_flush_cache_range(pixels,
                               (unsigned int)(tex_w * tex_h * (int)sizeof(u32)));
     hal_gpu_set_texturing(1);
+    /* RGBA blit: transparent texels must composite, not overwrite. */
+    hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
     sceGuTexFlush();
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
     sceGuTexImage(0, tex_w, tex_h, tex_w, pixels);

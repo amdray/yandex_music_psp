@@ -198,6 +198,10 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Максимальная частота CPU: без этого PSP работает на 222 МГц и весь
+    // интерфейс (не только свечение) тормозит. Игнорируем ошибку keeper'ов.
+    scePowerSetClockFrequency(333, 333, 166);
+
     // Initialize fs module
     if (fs_init() != 0) {
         return 1;

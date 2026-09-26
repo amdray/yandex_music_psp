@@ -3,6 +3,7 @@
 #include "ui/ui_common.h"
 #include "ui/ui_screens.h"
 #include "ui/ui_layout.h"
+#include "ui/ui_glow_bg.h"
 #include "services/locale.h"
 #include "services/eq.h"
 #include "services/ym_api.h"
@@ -35,6 +36,7 @@ static const MenuItem kSettingsMenu[] = {
     { LOCALE_MENU_EQ,          SCREEN_EQ,            0 },
     { LOCALE_MENU_AUDIO_QUALITY, SCREEN_COUNT,       0 },
     { LOCALE_MENU_AUTOPLAY,    SCREEN_COUNT,         0 },
+    { LOCALE_MENU_GLOW_STYLE,  SCREEN_COUNT,         0 },
     { LOCALE_MENU_MEMORY,      SCREEN_MEMORY,        0 },
 };
 #define MAIN_MENU_COUNT ((int)(sizeof(kMainMenu) / sizeof(kMainMenu[0])))
@@ -87,6 +89,11 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
                 const char *value = locale_get(
                     last_play_autostart_enabled()
                         ? LOCALE_SETTING_ON : LOCALE_SETTING_OFF);
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label, value);
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_GLOW_STYLE) {
+                const char *value = locale_get(
+                    glow_bg_style_name_key(glow_bg_get_style()));
                 snprintf(quality_row, sizeof(quality_row), "%s: %s", label, value);
                 label = quality_row;
             }
@@ -182,6 +189,18 @@ void ui_screen_settings_handle_input(AppState *state, const InputState *input)
                (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
                !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
         last_play_set_autostart((input->pressed & PSP_CTRL_RIGHT) != 0);
+    } else if (state->settings_index >= 0 &&
+               state->settings_index < SETTINGS_MENU_COUNT &&
+               kSettingsMenu[state->settings_index].label == LOCALE_MENU_GLOW_STYLE &&
+               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
+               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+        int style = glow_bg_get_style();
+        if (input->pressed & PSP_CTRL_RIGHT) {
+            style = (style + 1) % GLOW_STYLE_COUNT;
+        } else {
+            style = (style + GLOW_STYLE_COUNT - 1) % GLOW_STYLE_COUNT;
+        }
+        glow_bg_set_style(style);
     }
     menu_handle_input(state, input, kSettingsMenu, SETTINGS_MENU_COUNT,
                       &state->settings_index, "settings");

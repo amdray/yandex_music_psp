@@ -201,6 +201,603 @@ static sfix s_vv2[WEB_H2];
 static unsigned char s_spark_x2[WEB_H2][WEB_W2];
 static sfix s_glowfall[GLOWFALL_N];           // 1/(1+11*dn), init-once
 static sfix s_recip[RECIP_N];                 // 1/(0.25+q/32), init-once
+
+// VFPU micro-probe: 1 = прогнать раз при старте и вывести биты в лог.
+// Проверяет недоказанные инструкции перед написанием ядра.
+#define VFPU_PROBE 0
+#if VFPU_PROBE
+static void vfpu_probe_run(void)
+{
+    static float pin[4] __attribute__((aligned(16)));
+    static float pin2[4] __attribute__((aligned(16)));
+    static float pout[64] __attribute__((aligned(16)));
+    unsigned *b;
+    int i;
+    pin[0] = 2.0f; pin[1] = 4.0f; pin[2] = 6.0f; pin[3] = 8.0f;
+    pin2[0] = 1.0f; pin2[1] = 2.0f; pin2[2] = 2.0f; pin2[3] = 4.0f;
+    __asm__ volatile (
+        "lv.q R000, 0(%[pin])\n\t"
+        "lv.q R001, 0(%[pin2])\n\t"
+        "vdiv.q R002, R000, R001\n\t"
+        "sv.q R002, 16(%[pout])\n\t"
+        : : [pin]"r"(pin), [pin2]"r"(pin2), [pout]"r"(pout) : "memory");
+    b = (unsigned *)pout;
+    for (i = 0; i < 2; i++) {
+        logLine("vfdivord %d: %08x %08x %08x %08x\n",
+                i, b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]);
+    }
+}
+#endif
+
+// VFPU-ядро веб-свечения: полное разрешение 240x136, float32 (точнее 16.16).
+// Стадии: 0 = выкл (C-путь половинного разрешения — сохранённый быстрый вариант),
+// 1 = фон + круги (const lay/spark), 2 = +шумовые поля, 3 = полное (все стадии).
+#define VFPU_STAGE 1
+// Временный дамп значений ядра в лог (диагностика пересвета). 0 = выкл.
+#define VFPU_DUMP 0
+
+#if VFPU_STAGE
+#include <stddef.h>
+
+// Определены ниже по файлу — форвардные объявления для каркаса ядра.
+static float s_vtime;
+static unsigned s_web_tick;
+static void hsl_to_rgb(float h, float s, float l, float *r, float *g, float *b);
+static sfix snoise3_fx(sfix x, sfix y, sfix z);
+static float fast_atan2(float y, float x);
+static sfix raw_spark_fx(sfix afx, sfix vtime);
+
+// Блоб указателей для ядра. Смещения фиксированы (проверяются в init).
+typedef struct {
+    const float *g0, *g1, *g2;       // +0,+4,+8 (стадия 2+)
+    const float *sparkf;             // +12 (стадия 3)
+    const float *bgq;                // +16: фон 240 квадов {r,g,b,0} 0..1
+    const float *colTq;              // +20: цвета [3][3][2] {c1,c2} транспонированные
+    const float *prmTq;              // +24: параметры [3][8] {invedge,inten,offx,offy,brad,bwidH,bmul,recip}
+    const float *txq;                // +28 (стадия 2+)
+    const float *tyq;                // +32 (стадия 2+)
+    const float *uvxq;               // +36: 60 квадов uvx
+    const float *nx2q;               // +40: 60 квадов nx^2
+    const float *uvyq;               // +44: 136 квадов {uvy,0,0,0}
+    const float *oneq;               // +48: {1,1,1,1}
+    float *tmp;                      // +52: выходные [60][3] {R,G,B} 0..1
+    const short *x0q;                // +56 (стадия 2+)
+    const float *k41q;               // +60: {0.41 x4}
+    const float *khalfq;             // +64: {0.5 x4}
+    const float *k7q;                // +68: {0.7 x4}
+    const float *k3q;                // +72: {0.3 x4}
+    const float *k11q;               // +76: {11.0 x4}
+    const float *vigtq;              // +80: 136 квадов {ny2*0.5 x4}
+} VfpuBlob;
+static VfpuBlob s_vblob;
+
+static float s_fbgq[240][4] __attribute__((aligned(16)));
+static float s_fbgT[60][3][4] __attribute__((aligned(16)));
+static float s_fcolT[3][3][2][4] __attribute__((aligned(16)));
+static float s_fprmT[3][8][4] __attribute__((aligned(16)));
+static float s_fuvxq[60][4] __attribute__((aligned(16)));
+static float s_fnx2q[60][4] __attribute__((aligned(16)));
+static float s_fuvyq[136][4] __attribute__((aligned(16)));
+static float s_fvigt[136][4] __attribute__((aligned(16)));
+static float s_fone[4] __attribute__((aligned(16)));
+static float s_fk41[4] __attribute__((aligned(16)));
+static float s_fkhalf[4] __attribute__((aligned(16)));
+static float s_fk7[4] __attribute__((aligned(16)));
+static float s_fk3[4] __attribute__((aligned(16)));
+static float s_fk11[4] __attribute__((aligned(16)));
+static float s_ftmp[60][3][4] __attribute__((aligned(16)));
+// Шумовые поля (стадия 2): двойной буфер + по-кадровый lerped-слой.
+// Убирает 8.7Гц-ступенчатость морфа (тёмные прыгающие bands на полном разрешении).
+static float s_fgridA[3][19][33] __attribute__((aligned(16)));
+static float s_fgridB[3][19][33] __attribute__((aligned(16)));
+static float s_fgridL[3][19][33] __attribute__((aligned(16)));
+static int s_gridParity = 0;
+static int s_gridAge = 0;
+static float s_ftxq[60][4] __attribute__((aligned(16)));
+static float s_fty2[136][4] __attribute__((aligned(16)));
+static short s_fx0q[60] __attribute__((aligned(16)));
+static short s_fy0r[136] __attribute__((aligned(16)));
+// Спарк стадии 3: LUT шейдера (float) + построчные буферы (spark, recip/circle).
+static float s_fsparkLUT[SPARK_N] __attribute__((aligned(16)));
+static float s_sparkQR[60][4] __attribute__((aligned(16)));
+static float s_recipQQR[3][60][4] __attribute__((aligned(16)));
+
+// Статическая геометрия + проводка блоба. Разово при инициализации.
+static void vfpu_init_tables(void)
+{
+    int x, y, i;
+    // Индексы и веса билинейки полей: статическая геометрия.
+    for (x = 0; x < 60; x++) {
+        int q;
+        float fxc = ((float)(4 * x + 1) + 0.5f) * (1.0f / (GLOW_W - 1)) * (float)(NF_W - 1);
+        int x0 = (int)fxc;
+        if (x0 < 0) x0 = 0;
+        if (x0 > NF_W - 2) x0 = NF_W - 2;
+        s_fx0q[x] = (short)x0;
+        for (q = 0; q < 4; q++) {
+            float fx = ((float)(4 * x + q)) * (1.0f / (GLOW_W - 1)) * (float)(NF_W - 1);
+            float tx = fx - (float)x0;
+            if (tx < 0.0f) tx = 0.0f;
+            if (tx > 1.0f) tx = 1.0f;
+            s_ftxq[x][q] = tx;
+        }
+    }
+    for (y = 0; y < 136; y++) {
+        float fy = (float)y * (1.0f / (GLOW_H - 1)) * (float)(NF_H - 1);
+        float ty = fy - (float)((int)fy);
+        int y0raw = (int)fy;
+        int y0;
+        int q;
+        if (y0raw > NF_H - 2) { y0 = NF_H - 2; ty = 1.0f; }
+        else { y0 = y0raw < 0 ? 0 : y0raw; }
+        if (ty < 0.0f) ty = 0.0f;
+        if (ty > 1.0f) ty = 1.0f;
+        s_fy0r[y] = (short)y0;
+        for (q = 0; q < 4; q++) s_fty2[y][q] = ty;
+    }
+    for (x = 0; x < 60; x++) {
+        float uu = ((float)(4 * x) + 1.5f) * (1.0f / (GLOW_W - 1)) * 0.5f;
+        float nx = uu * 2.0f - 1.0f;
+        float uvx = nx * WEB_EX;
+        int q;
+        for (q = 0; q < 4; q++) {
+            float uup = ((float)(4 * x + q)) * (1.0f / (GLOW_W - 1));
+            float nxp = uup * 2.0f - 1.0f;
+            s_fuvxq[x][q] = nxp * WEB_EX;
+            s_fnx2q[x][q] = nxp * nxp;
+        }
+        (void)uvx; (void)nx;
+    }
+    for (y = 0; y < 136; y++) {
+        float vv = (float)y * (1.0f / (GLOW_H - 1));
+        float ny = vv * 2.0f - 1.0f;
+        float uvy = ny * WEB_EY;
+        s_fuvyq[y][0] = uvy; s_fuvyq[y][1] = uvy;
+        s_fuvyq[y][2] = uvy; s_fuvyq[y][3] = uvy;
+        s_fvigt[y][0] = s_fvigt[y][1] = s_fvigt[y][2] = s_fvigt[y][3]
+            = ny * ny * 0.5f;
+    }
+    s_fone[0] = s_fone[1] = s_fone[2] = s_fone[3] = 1.0f;
+    s_fk41[0] = s_fk41[1] = s_fk41[2] = s_fk41[3] = 0.41f;
+    s_fkhalf[0] = s_fkhalf[1] = s_fkhalf[2] = s_fkhalf[3] = 0.5f;
+    s_fk7[0] = s_fk7[1] = s_fk7[2] = s_fk7[3] = 0.7f;
+    s_fk3[0] = s_fk3[1] = s_fk3[2] = s_fk3[3] = 0.3f;
+    s_fk11[0] = s_fk11[1] = s_fk11[2] = s_fk11[3] = 11.0f;
+    // Стадия 1: brad статичен (const lay) — базовые радиусы и половины ширин.
+    // recip = 1/(outer-0.5) считается на CPU (как RECIP в C-пути): ядру не нужен
+    // ни vrcp, ни чтение singles — только проверенные quad-операции.
+    for (i = 0; i < 3; i++) {
+        float brad = 0.95f - 0.15f * (float)i;
+        float bwidH = (0.8f - 0.2f * (float)i) * 0.5f;
+        float bmul = 1.0f - (float)i * 0.3f;
+        float recip = 1.0f / ((brad + bwidH) - 0.5f);
+        int q;
+        for (q = 0; q < 4; q++) {
+            s_fprmT[i][4][q] = brad;
+            s_fprmT[i][5][q] = bwidH;
+            s_fprmT[i][6][q] = bmul;
+            s_fprmT[i][7][q] = recip;
+        }
+    }
+    s_vblob.g0 = &s_fgridL[0][0][0];
+    s_vblob.g1 = &s_fgridL[1][0][0];
+    s_vblob.g2 = &s_fgridL[2][0][0];
+    s_vblob.sparkf = NULL;
+    s_vblob.bgq = &s_fbgT[0][0][0];
+    s_vblob.colTq = &s_fcolT[0][0][0][0];
+    s_vblob.prmTq = &s_fprmT[0][0][0];
+    s_vblob.txq = &s_ftxq[0][0];
+    s_vblob.tyq = &s_fty2[0][0];
+    s_vblob.uvxq = &s_fuvxq[0][0];
+    s_vblob.nx2q = &s_fnx2q[0][0];
+    s_vblob.uvyq = &s_fuvyq[0][0];
+    s_vblob.oneq = s_fone;
+    s_vblob.tmp = &s_ftmp[0][0][0];
+    s_vblob.x0q = s_fx0q;
+    s_vblob.k41q = s_fk41;
+    s_vblob.khalfq = s_fkhalf;
+    s_vblob.k7q = s_fk7;
+    s_vblob.k3q = s_fk3;
+    s_vblob.k11q = s_fk11;
+    s_vblob.vigtq = &s_fvigt[0][0];
+    // Смещения фиксированы — ядро опирается на них через lw.
+    if (offsetof(VfpuBlob, bgq) != 16 || offsetof(VfpuBlob, colTq) != 20 ||
+        offsetof(VfpuBlob, prmTq) != 24 || offsetof(VfpuBlob, uvxq) != 36 ||
+        offsetof(VfpuBlob, nx2q) != 40 || offsetof(VfpuBlob, uvyq) != 44 ||
+        offsetof(VfpuBlob, oneq) != 48 || offsetof(VfpuBlob, tmp) != 52 ||
+        offsetof(VfpuBlob, k41q) != 60 || offsetof(VfpuBlob, khalfq) != 64 ||
+        offsetof(VfpuBlob, k7q) != 68 || offsetof(VfpuBlob, k3q) != 72 ||
+        offsetof(VfpuBlob, k11q) != 76 || offsetof(VfpuBlob, vigtq) != 80 ||
+        sizeof(VfpuBlob) != 84) {
+        logLine("vfpu: blob layout mismatch, fallback to C\n");
+    }
+    // Кэш-гигиена CPU->VFPU для статической геометрии (разово): иначе на
+    // железе VFPU читает stale-RAM (в эмуляторе память единая — незаметно).
+    sceKernelDcacheWritebackRange(s_fuvxq, sizeof(s_fuvxq));
+    sceKernelDcacheWritebackRange(s_fnx2q, sizeof(s_fnx2q));
+    sceKernelDcacheWritebackRange(s_fuvyq, sizeof(s_fuvyq));
+    sceKernelDcacheWritebackRange(s_fvigt, sizeof(s_fvigt));
+    sceKernelDcacheWritebackRange(s_fone, sizeof(s_fone));
+    sceKernelDcacheWritebackRange(s_fk41, sizeof(s_fk41));
+    sceKernelDcacheWritebackRange(s_fkhalf, sizeof(s_fkhalf));
+    sceKernelDcacheWritebackRange(s_fk7, sizeof(s_fk7));
+    sceKernelDcacheWritebackRange(s_fk3, sizeof(s_fk3));
+    sceKernelDcacheWritebackRange(s_fk11, sizeof(s_fk11));
+    sceKernelDcacheWritebackRange(s_ftxq, sizeof(s_ftxq));
+    sceKernelDcacheWritebackRange(s_fty2, sizeof(s_fty2));
+}
+
+// Кадровые таблицы из морфирующих цветов/параметров (float, 0..1).
+static void vfpu_build_frame(float bright)
+{
+    static const float kRot[3][3] = {
+        { -0.3f, 0.3f, 0.2f }, { -0.3f, -0.3f, -0.2f }, { -0.3f, -0.3f, 0.2f }
+    };
+    int i, x, q;
+    (void)bright;
+    for (x = 0; x < GLOW_W; x++) {
+        float pos = (1.0f - (float)x / (float)(GLOW_W - 1)) * 100.0f;
+        int s = 0;
+        float f;
+        while (s < WEB_STOPS - 2 && kWebStopPos[s + 1] < pos) s++;
+        f = (pos - kWebStopPos[s]) /
+            (kWebStopPos[s + 1] - kWebStopPos[s] + 1e-6f);
+        if (f < 0.0f) f = 0.0f;
+        if (f > 1.0f) f = 1.0f;
+        for (i = 0; i < 3; i++) {
+            s_fbgq[x][i] = (s_web_stops[s][i] +
+                (s_web_stops[s + 1][i] - s_web_stops[s][i]) * f) * (0.62f / 255.0f);
+        }
+        s_fbgq[x][3] = 0.0f;
+    }
+    // Транспонированный фон для ядра: [quad][канал][4 пикселя].
+    for (x = 0; x < 60; x++) {
+        for (q = 0; q < 4; q++) {
+            s_fbgT[x][0][q] = s_fbgq[x * 4 + q][0];
+            s_fbgT[x][1][q] = s_fbgq[x * 4 + q][1];
+            s_fbgT[x][2][q] = s_fbgq[x * 4 + q][2];
+        }
+    }
+    for (i = 0; i < WEB_CIRCLES; i++) {
+        float ra = s_vtime * kRot[i][2];
+        float cs = cosf(ra), sn = sinf(ra);
+        float offx = kRot[i][0] * cs - kRot[i][1] * sn;
+        float offy = kRot[i][0] * sn + kRot[i][1] * cs;
+        float edge = 1.1f + sinf(s_vtime + 1.57f * (float)i);
+        float inten = 0.15f * (1.0f - 0.75f * sinf(s_vtime * 2.0f + 0.785f * (float)i));
+        float r1, g1, b1, r2, g2, b2;
+        hsl_to_rgb(s_web_col[i][0], s_web_col[i][1], s_web_col[i][2], &r1, &g1, &b1);
+        hsl_to_rgb(s_web_col[i + 3][0], s_web_col[i + 3][1], s_web_col[i + 3][2], &r2, &g2, &b2);
+        // hsl_to_rgb отдаёт 0..255 — ядру нужно 0..1.
+        r1 *= 0.0039215686f; g1 *= 0.0039215686f; b1 *= 0.0039215686f;
+        r2 *= 0.0039215686f; g2 *= 0.0039215686f; b2 *= 0.0039215686f;
+        for (q = 0; q < 4; q++) {
+            s_fprmT[i][0][q] = 1.0f / edge;
+            s_fprmT[i][1][q] = inten;
+            s_fprmT[i][2][q] = offx;
+            s_fprmT[i][3][q] = offy;
+        }
+        s_fcolT[i][0][0][0] = s_fcolT[i][0][0][1] = s_fcolT[i][0][0][2] = s_fcolT[i][0][0][3] = r1;
+        s_fcolT[i][0][1][0] = s_fcolT[i][0][1][1] = s_fcolT[i][0][1][2] = s_fcolT[i][0][1][3] = r2;
+        s_fcolT[i][1][0][0] = s_fcolT[i][1][0][1] = s_fcolT[i][1][0][2] = s_fcolT[i][1][0][3] = g1;
+        s_fcolT[i][1][1][0] = s_fcolT[i][1][1][1] = s_fcolT[i][1][1][2] = s_fcolT[i][1][1][3] = g2;
+        s_fcolT[i][2][0][0] = s_fcolT[i][2][0][1] = s_fcolT[i][2][0][2] = s_fcolT[i][2][0][3] = b1;
+        s_fcolT[i][2][1][0] = s_fcolT[i][2][1][1] = s_fcolT[i][2][1][2] = s_fcolT[i][2][1][3] = b2;
+    }
+}
+
+// Шумовые сетки float с паддингом (стадия 2). Та же математика, что web_build_fields.
+// Пишет в parity-буфер (double-buffer для по-кадровой интерполяции).
+static void vfpu_build_grids(sfix vt)
+{
+    float (*dst)[19][33] = s_gridParity ? s_fgridB : s_fgridA;
+    float kx = WEB_EX * 1.2f * WEB_NOISE_ZOOM;
+    float ky = WEB_EY * 1.2f * WEB_NOISE_ZOOM;
+    int f, j, i;
+    for (f = 0; f < 3; f++) {
+        sfix off = f == 0 ? 0 : (f == 1 ? 102944 : 205887);
+        for (j = 0; j < NF_H; j++) {
+            float evy = (((float)j / (float)(NF_H - 1)) * 2.0f - 1.0f) * ky;
+            sfix evy_s = (sfix)(evy * 65536.0f);
+            for (i = 0; i < NF_W; i++) {
+                float eux = (((float)i / (float)(NF_W - 1)) * 2.0f - 1.0f) * kx;
+                sfix eux_s = (sfix)(eux * 65536.0f);
+                sfix r = snoise3_fx(eux_s + off, evy_s + off, vt + off);
+                dst[f][j][i] = ((float)r / 65536.0f + 1.0f) * 0.5f;
+            }
+            dst[f][j][NF_W] = dst[f][j][NF_W - 1];
+        }
+        for (i = 0; i <= NF_W; i++) {
+            dst[f][NF_H][i] = dst[f][NF_H - 1][i];
+        }
+    }
+    sceKernelDcacheWritebackRange(dst, sizeof(s_fgridA));
+}
+
+// По-кадровая интерполяция сеток: L = lerp(prev, curr, 1-age/3). ~0.3мс.
+static void vfpu_lerp_grids(void)
+{
+    float (*prv)[19][33] = s_gridParity ? s_fgridA : s_fgridB;
+    float (*cur)[19][33] = s_gridParity ? s_fgridB : s_fgridA;
+    float k = 1.0f - (float)s_gridAge * (1.0f / 3.0f);
+    int f, j, i;
+    if (k < 0.0f) k = 0.0f;
+    for (f = 0; f < 3; f++) {
+        for (j = 0; j <= NF_H; j++) {
+            for (i = 0; i <= NF_W; i++) {
+                float a = prv[f][j][i];
+                s_fgridL[f][j][i] = a + (cur[f][j][i] - a) * k;
+            }
+        }
+    }
+    sceKernelDcacheWritebackRange(s_fgridL, sizeof(s_fgridL));
+}
+
+// Спарк-LUT шейдера во float (стадия 3). Та же математика, что C-путь.
+static void vfpu_build_sparklut(sfix vtf)
+{
+    int i;
+    for (i = 0; i < SPARK_N; i++) {
+        sfix a = ((sfix)i * 65536) / (SPARK_N - 1) - 32768;
+        sfix v = raw_spark_fx(a, vtf);
+        sfix s2, sp, gi, gate;
+        if (v < 0) v = 0;
+        if (v > 65536) v = 65536;
+        s2 = fx_mul(v, v);
+        sp = fx_mul(v, 13107) + fx_mul(fx_mul(fx_mul(s2, s2), s2), s2);
+        gi = fx_div(19661, sp + 1);
+        if (gi > 65536) gi = 65536;
+        gate = fx_mul(fx_mul(gi, gi), 196608 - 2 * gi);
+        s_fsparkLUT[i] = (float)fx_mul(sp, gate) / 65536.0f;
+    }
+}
+
+// Построчные спарк и recip/circle (стадия 3). brad/bwidH/bmul — литералы кругов.
+static void vfpu_build_sparkrow(int y)
+{
+    static const float kBrad[3] = { 0.95f, 0.80f, 0.65f };
+    static const float kBwidH[3] = { 0.40f, 0.30f, 0.20f };
+    static const float kBmul[3] = { 1.0f, 0.70f, 0.40f };
+    int xq, i, q;
+    float vc = (float)y * (1.0f / (GLOW_H - 1));
+    float uvy = (vc * 2.0f - 1.0f) * WEB_EY;
+    for (xq = 0; xq < 60; xq++) {
+        float uc = ((float)(4 * xq) + 1.5f) * (1.0f / (GLOW_W - 1));
+        float uvx = (uc * 2.0f - 1.0f) * WEB_EX;
+        float ang = fast_atan2(uvy, uvx) * 0.15915494f + 0.5f;
+        float fi, ft, spark;
+        int i0, i1;
+        if (ang < 0.0f) ang = 0.0f;
+        if (ang > 1.0f) ang = 1.0f;
+        fi = ang * (float)(SPARK_N - 1);
+        i0 = (int)fi;
+        if (i0 < 0) i0 = 0;
+        if (i0 > SPARK_N - 1) i0 = SPARK_N - 1;
+        ft = fi - (float)i0;
+        i1 = i0 + 1;
+        if (i1 > SPARK_N - 1) i1 = SPARK_N - 1;
+        spark = s_fsparkLUT[i0] + (s_fsparkLUT[i1] - s_fsparkLUT[i0]) * ft;
+        for (q = 0; q < 4; q++) s_sparkQR[xq][q] = spark;
+        for (i = 0; i < 3; i++) {
+            float outer = kBrad[i] + kBwidH[i] + kBmul[i] * spark;
+            float recip = 1.0f / (outer - 0.5f);
+            for (q = 0; q < 4; q++) s_recipQQR[i][xq][q] = recip;
+        }
+    }
+}
+
+// Стадия 1: фон + круги (const lay/spark), полное разрешение.
+// Регистры: R000=uvx R100=uvy R001=K41 R101=KHALF R103=ONE R200-202=cr/cg/cb.
+// Круги: R300-303=offx/offy/invedge/inten R400/R401=brad/bwidH R002/R003=c1/c2.
+// Временные: R500=blen R501/R502=dx/dy R503=llen R600-603 R700-703.
+#define VFPU_CIRCLE(po_, coff_, gi_, rq_) \
+        "lw %[s0], " #gi_ "(%[BL])\n\t" \
+        "addu %[s0], %[s0], %[Y0B]\n\t" \
+        "addu %[s1], %[s0], 132\n\t" \
+        "addu %[s0], %[s0], %[X0B]\n\t" \
+        "addu %[s1], %[s1], %[X0B]\n\t" \
+        "vsub.q R700, R103, R402\n\t" \
+        "vsub.q R702, R103, R403\n\t" \
+        "vzero.q R701\n\t" \
+        "lv.s S300, 0(%[s0])\n\t" \
+        "vmul.q R703, R700, R702\n\t" \
+        "vscl.q R703, R703, S300\n\t" \
+        "vadd.q R701, R701, R703\n\t" \
+        "lv.s S300, 4(%[s0])\n\t" \
+        "vmul.q R703, R402, R702\n\t" \
+        "vscl.q R703, R703, S300\n\t" \
+        "vadd.q R701, R701, R703\n\t" \
+        "lv.s S300, 0(%[s1])\n\t" \
+        "vmul.q R703, R700, R403\n\t" \
+        "vscl.q R703, R703, S300\n\t" \
+        "vadd.q R701, R701, R703\n\t" \
+        "lv.s S300, 4(%[s1])\n\t" \
+        "vmul.q R703, R402, R403\n\t" \
+        "vscl.q R703, R703, S300\n\t" \
+        "vadd.q R701, R701, R703\n\t" \
+        "lw %[s0], 24(%[BL])\n\t" \
+        "addu %[s0], %[s0], " #po_ "\n\t" \
+        "lv.q R300, 32(%[s0])\n\t" \
+        "lv.q R301, 48(%[s0])\n\t" \
+        "lv.q R302, 0(%[s0])\n\t" \
+        "lv.q R303, 16(%[s0])\n\t" \
+        "vadd.q R501, R000, R300\n\t" \
+        "vadd.q R502, R100, R301\n\t" \
+        "vabs.q R501, R501\n\t" \
+        "vabs.q R502, R502\n\t" \
+        "vmax.q R503, R501, R502\n\t" \
+        "vmin.q R700, R501, R502\n\t" \
+        "vmul.q R700, R700, R001\n\t" \
+        "vadd.q R503, R503, R700\n\t" \
+        "vsub.q R601, R500, R101\n\t" \
+        "addu %[s2], %[RQX], " #rq_ "\n\t" \
+        "lv.q R700, 0(%[s2])\n\t" \
+        "vmul.q R602, R601, R700\n\t" \
+        "vsat0.q R602, R602\n\t" \
+        "vmul.q R603, R602, R602\n\t" \
+        "vsub.q R700, R103, R602\n\t" \
+        "vadd.q R700, R700, R700\n\t" \
+        "vadd.q R700, R103, R700\n\t" \
+        "vmul.q R603, R603, R700\n\t" \
+        "vsub.q R602, R103, R603\n\t" \
+        "vsub.q R600, R503, R701\n\t" \
+        "vmul.q R700, R600, R302\n\t" \
+        "vsat0.q R700, R700\n\t" \
+        "vsub.q R601, R103, R700\n\t" \
+        "vmul.q R601, R601, R602\n\t" \
+        "vabs.q R600, R600\n\t" \
+        "lw %[s2], 76(%[BL])\n\t" \
+        "lv.q R603, 0(%[s2])\n\t" \
+        "vmul.q R600, R600, R603\n\t" \
+        "vadd.q R600, R600, R103\n\t" \
+        "vdiv.q R602, R303, R600\n\t" \
+        "vadd.q R603, R100, R301\n\t" \
+        "vadd.q R603, R603, R603\n\t" \
+        "vsat0.q R603, R603\n\t" \
+        "lw %[s1], 20(%[BL])\n\t" \
+        "addu %[s1], %[s1], " #coff_ "\n\t"
+
+#define VFPU_CHAN(cr_, c1o_, c2o_) \
+        "lv.q R002, " #c1o_ "(%[s1])\n\t" \
+        "lv.q R003, " #c2o_ "(%[s1])\n\t" \
+        "vsub.q R700, R003, R002\n\t" \
+        "vmul.q R700, R700, R603\n\t" \
+        "vadd.q R700, R700, R002\n\t" \
+        "vadd.q R700, R700, R602\n\t" \
+        "vsat0.q R700, R700\n\t" \
+        "vsub.q R700, R700, R" #cr_ "\n\t" \
+        "vmul.q R700, R700, R601\n\t" \
+        "vadd.q R" #cr_ ", R" #cr_ ", R700\n\t"
+
+static void vfpu_render_pack(float bright)
+{
+    int y, xq;
+#if VFPU_DUMP
+    {
+        static int dumped = 0;
+        if (!dumped) {
+            int yy, xx;
+            dumped = 1;
+            logLine("vfdump colT0: %f %f %f / %f %f %f\n",
+                s_fcolT[0][0][0][0], s_fcolT[0][1][0][0], s_fcolT[0][2][0][0],
+                s_fcolT[0][0][1][0], s_fcolT[0][1][1][0], s_fcolT[0][2][1][0]);
+            logLine("vfdump prmT0: inv=%f inten=%f off=(%f,%f) brad=%f bwidH=%f\n",
+                s_fprmT[0][0][0], s_fprmT[0][1][0], s_fprmT[0][2][0],
+                s_fprmT[0][3][0], s_fprmT[0][4][0], s_fprmT[0][5][0]);
+            logLine("vfdump bgT0=%f bgT59=%f uvx0=%f uvx59=%f\n",
+                s_fbgT[0][0][0], s_fbgT[59][0][3], s_fuvxq[0][0], s_fuvxq[59][3]);
+            (void)yy; (void)xx;
+        }
+    }
+#endif
+    for (y = 0; y < GLOW_H; y++) {
+        const float *uy = &s_fuvyq[y][0];
+        const float *vt = &s_fvigt[y][0];
+        const float *tyr = &s_fty2[y][0];
+        const float *rqx = &s_recipQQR[0][0][0];
+        int y0b = (int)s_fy0r[y] * 132;
+        if ((s_web_tick % 3) == 0) {
+            vfpu_build_sparkrow(y);
+            sceKernelDcacheWritebackRange(s_sparkQR, sizeof(s_sparkQR));
+            sceKernelDcacheWritebackRange(s_recipQQR, sizeof(s_recipQQR));
+        }
+        for (xq = 0; xq < 60; xq++) {
+            const float *T = &s_ftmp[xq][0][0];
+            const float *BG = &s_fbgT[xq][0][0];
+            const float *UX = &s_fuvxq[xq][0];
+            const float *NX = &s_fnx2q[xq][0];
+            const float *TX = &s_ftxq[xq][0];
+            int x0b = (int)s_fx0q[xq] * 4;
+            const VfpuBlob *BL = &s_vblob;
+            void *s0, *s1, *s2;
+            __asm__ volatile (
+                "lw %[s2], 48(%[BL])\n\t"
+                "lv.q R103, 0(%[s2])\n\t"
+                "lw %[s2], 60(%[BL])\n\t"
+                "lv.q R001, 0(%[s2])\n\t"
+                "lw %[s2], 64(%[BL])\n\t"
+                "lv.q R101, 0(%[s2])\n\t"
+                "lv.q R402, 0(%[TX])\n\t"
+                "lv.q R403, 0(%[TYR])\n\t"
+                "lv.q R000, 0(%[UX])\n\t"
+                "lv.q R100, 0(%[UY])\n\t"
+                "vabs.q R501, R000\n\t"
+                "vabs.q R502, R100\n\t"
+                "vmax.q R503, R501, R502\n\t"
+                "vmin.q R700, R501, R502\n\t"
+                "vmul.q R700, R700, R001\n\t"
+                "vadd.q R500, R503, R700\n\t"
+                "lv.q R200, 0(%[BG])\n\t"
+                "lv.q R201, 16(%[BG])\n\t"
+                "lv.q R202, 32(%[BG])\n\t"
+                VFPU_CIRCLE(0, 0, 0, 0)
+                VFPU_CHAN(200, 0, 16)
+                VFPU_CHAN(201, 32, 48)
+                VFPU_CHAN(202, 64, 80)
+                VFPU_CIRCLE(128, 96, 4, 960)
+                VFPU_CHAN(200, 0, 16)
+                VFPU_CHAN(201, 32, 48)
+                VFPU_CHAN(202, 64, 80)
+                VFPU_CIRCLE(256, 192, 8, 1920)
+                VFPU_CHAN(200, 0, 16)
+                VFPU_CHAN(201, 32, 48)
+                VFPU_CHAN(202, 64, 80)
+                "lv.q R601, 0(%[NX])\n\t"
+                "lw %[s2], 68(%[BL])\n\t"
+                "lv.q R102, 0(%[s2])\n\t"
+                "lv.q R600, 0(%[VT])\n\t"
+                "lw %[s2], 72(%[BL])\n\t"
+                "lv.q R603, 0(%[s2])\n\t"
+                "vmul.q R601, R601, R102\n\t"
+                "vadd.q R601, R601, R600\n\t"
+                "vmul.q R601, R601, R603\n\t"
+                "vsub.q R600, R103, R601\n\t"
+                "vmul.q R200, R200, R600\n\t"
+                "vmul.q R201, R201, R600\n\t"
+                "vmul.q R202, R202, R600\n\t"
+                "sv.q R200, 0(%[T])\n\t"
+                "sv.q R201, 16(%[T])\n\t"
+                "sv.q R202, 32(%[T])\n\t"
+                : [s0]"=&r"(s0), [s1]"=&r"(s1), [s2]"=&r"(s2)
+                : [BL]"r"(BL), [T]"r"(T), [BG]"r"(BG), [UX]"r"(UX),
+                  [NX]"r"(NX), [UY]"r"(uy), [VT]"r"(vt), [TX]"r"(TX),
+                  [TYR]"r"(tyr), [Y0B]"r"(y0b), [X0B]"r"(x0b), [RQX]"r"(rqx)
+                : "memory");
+        }
+        // Строка s_ftmp только что записана VFPU мимо CPU-кэша: инвалидировать.
+        sceKernelDcacheInvalidateRange(&s_ftmp[0][0][0], sizeof(s_ftmp));
+        {
+            unsigned char *dst = s_buf + (size_t)y * GLOW_PITCH * 4;
+            for (xq = 0; xq < 60; xq++) {
+                int lane;
+                for (lane = 0; lane < 4; lane++) {
+                    int px = xq * 4 + lane;
+                    float r = s_ftmp[xq][0][lane];
+                    float g = s_ftmp[xq][1][lane];
+                    float b = s_ftmp[xq][2][lane];
+                    int ri, gi, bi;
+                    r = s_fbgq[px][0] + (r - s_fbgq[px][0]) * bright;
+                    g = s_fbgq[px][1] + (g - s_fbgq[px][1]) * bright;
+                    b = s_fbgq[px][2] + (b - s_fbgq[px][2]) * bright;
+                    if (s_liked) {
+                        r += 0.0392f; g -= 0.0157f; b -= 0.0392f;
+                    }
+                    ri = (int)(r * 255.0f + 0.5f);
+                    gi = (int)(g * 255.0f + 0.5f);
+                    bi = (int)(b * 255.0f + 0.5f);
+                    if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
+                    if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
+                    if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
+                    dst[px * 4 + 0] = (unsigned char)ri;
+                    dst[px * 4 + 1] = (unsigned char)gi;
+                    dst[px * 4 + 2] = (unsigned char)bi;
+                    dst[px * 4 + 3] = 255;
+                }
+            }
+        }
+    }
+}
+#endif
 static float s_vtime = 0.0f;
 static unsigned long long s_last_us = 0;
 static unsigned s_web_tick = 0;
@@ -1030,6 +1627,30 @@ static void web_update(float dt)
     s_vtime += dt * (s_playing ? 0.2f : 0.06f);
     if (s_vtime > 86400.0f) s_vtime -= 86400.0f;
     web_update_targets(s_playing, dt > 1.0f ? 1.0f : dt);
+#if VFPU_STAGE
+    // VFPU-путь (полное разрешение): float-таблицы + ядро + пак. C-путь ниже
+    // остаётся как сохранённый быстрый вариант (VFPU_STAGE 0).
+    if ((s_web_tick % 3) == 0) {
+        sfix vt = (sfix)(s_vtime * 32768.0f);
+        sfix vtf = (sfix)(s_vtime * 65536.0f);
+        s_gridParity ^= 1;
+        vfpu_build_grids(vt);
+        vfpu_build_sparklut(vtf);
+        sceKernelDcacheWritebackRange(s_fsparkLUT, sizeof(s_fsparkLUT));
+        s_gridAge = 0;
+    } else if (s_gridAge < 2) {
+        s_gridAge++;
+    }
+    vfpu_lerp_grids();
+    vfpu_build_frame(bright);
+    // Кадровые таблицы в RAM для VFPU.
+    sceKernelDcacheWritebackRange(s_fbgT, sizeof(s_fbgT));
+    sceKernelDcacheWritebackRange(s_fcolT, sizeof(s_fcolT));
+    sceKernelDcacheWritebackRange(s_fprmT, sizeof(s_fprmT));
+    vfpu_render_pack(bright);
+    s_web_tick++;
+    return;
+#endif
     for (i = 0; i < 6; i++) {
         float r, g, b;
         hsl_to_rgb(s_web_col[i][0], s_web_col[i][1], s_web_col[i][2], &r, &g, &b);
@@ -1242,11 +1863,16 @@ static void glow_update(void)
     }
 
     // Padding для LINEAR-фильтра: реплика последнего столбца/строки.
-    // Веб-стиль рисует 120x68, остальные — 240x136.
+    // VFPU-ядро (как классика/нити) рисует 240x136; C-путь веба — 120x68.
     {
         int y, pw, ph;
+#if VFPU_STAGE
+        pw = GLOW_W;
+        ph = GLOW_H;
+#else
         pw = (s_style == GLOW_STYLE_WEB) ? WEB_W2 : GLOW_W;
         ph = (s_style == GLOW_STYLE_WEB) ? WEB_H2 : GLOW_H;
+#endif
         for (y = 0; y < ph; y++) {
             memcpy(s_buf + (size_t)(y * GLOW_PITCH + pw) * 4,
                    s_buf + (size_t)(y * GLOW_PITCH + pw - 1) * 4,
@@ -1263,6 +1889,9 @@ void glow_bg_init(void)
     if (s_buf) {
         return;
     }
+#if VFPU_PROBE
+    vfpu_probe_run();
+#endif
     s_buf = (unsigned char *)memalign(64, (size_t)GLOW_PITCH * GLOW_TEX_H * 4);
     if (s_buf) {
         memset(s_buf, 0, (size_t)GLOW_PITCH * GLOW_TEX_H * 4);
@@ -1320,6 +1949,9 @@ void glow_bg_init(void)
         for (x = 0; x < RECIP_N; x++) {
             s_recip[x] = (sfix)(2097152 / (8 + x));
         }
+#if VFPU_STAGE
+        vfpu_init_tables();
+#endif
     }
 }
 
@@ -1356,8 +1988,20 @@ void glow_bg_draw(float x, float y, float w, float h)
         v[0].x = (short)x;
         v[0].y = (short)y;
         v[0].z = 0;
-        v[1].u = (unsigned short)((s_style == GLOW_STYLE_WEB) ? WEB_W2 : GLOW_W);
-        v[1].v = (unsigned short)((s_style == GLOW_STYLE_WEB) ? WEB_H2 : GLOW_H);
+        v[1].u = (unsigned short)(
+#if VFPU_STAGE
+            GLOW_W
+#else
+            ((s_style == GLOW_STYLE_WEB) ? WEB_W2 : GLOW_W)
+#endif
+        );
+        v[1].v = (unsigned short)(
+#if VFPU_STAGE
+            GLOW_H
+#else
+            ((s_style == GLOW_STYLE_WEB) ? WEB_H2 : GLOW_H)
+#endif
+        );
         v[1].x = (short)(x + w);
         v[1].y = (short)(y + h);
         v[1].z = 0;

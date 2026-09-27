@@ -1989,6 +1989,10 @@ void glow_bg_draw(float x, float y, float w, float h)
     hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    // Сброс кэша дескрипторов GE: без него GE может держать текстуру шрифта
+    // от прошлых отрисовок и misread-ить s_buf полосами (как в ui_draw.c).
+    sceGuTexFlush();
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
     sceGuTexMode(GU_PSM_8888, 0, 0, 0);
     sceGuTexImage(0, GLOW_PITCH, GLOW_TEX_H, GLOW_PITCH, s_buf);
 

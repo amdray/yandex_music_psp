@@ -1,61 +1,87 @@
 # YMPSP
 
-Неофициальный клиент Яндекс Музыки для PlayStation Portable.
+Русская версия: [README_RU.md](README_RU.md)
 
-YMPSP не связан с ООО «Яндекс» и не одобрен им.
+An unofficial Yandex Music client for PlayStation Portable.
 
-## Скриншоты
+YMPSP is not affiliated with or endorsed by Yandex LLC.
 
-![Главное меню](screenshots/menu.jpg)
+## Features
 
-![Плейлисты](screenshots/playlists.jpg)
+- Direct connection to Yandex Music from the PSP
+- TLS 1.2 via mbedTLS
+- PSP KIRK PRNG used as the entropy source for TLS
+- No external proxy or companion server
+- Playlists and albums
+- Search
+- Music streaming
+- Local caching
+- Album artwork
+- NTP time synchronization
+- MP3 playback up to 320 kbps using the PSP's native `sceMp3` decoder
 
-![Экран плеера](screenshots/player.jpg)
+## Screenshots
 
-## Первый запуск
+![Main menu](screenshots/menu.jpg)
 
-Входить можно двумя способами:
+![Playlists](screenshots/playlists.jpg)
 
-**По коду с телефона .** Откройте пункт «Профиль» в меню (или нажмите `X` на пустом экране аккаунта), введите показанный код на странице `ya.ru/device` и подтвердите. Токен сохранится в `config/token.txt` сам.
+![Now playing](screenshots/player.jpg)
 
-**Вручную (рекомендуется).** Откройте незаполненный файл `config/token.txt` в каталоге собранного или распакованного приложения и впишите свой токен между кавычками:
+## First Launch
+
+There are two ways to sign in:
+
+**Using a device code.** Open **Profile** from the menu (or press `X` on the empty account screen), enter the displayed code at `ya.ru/device`, and confirm the login. The token will be saved automatically to `config/token.txt`.
+
+**Manually (recommended).** Open the empty `config/token.txt` file in the built or extracted application directory and enter your token between the quotes:
 
 ```text
 YANDEX_TOKEN = "..."
 ```
 
-Далее:
+Then:
 
-1. Скопируйте каталог приложения в `PSP/GAME/YMPSP/` на Memory Stick.
-2. Убедитесь, что рядом с `EBOOT.PBP` находятся `assets` и `fonts`. Рабочие каталоги внутри `data` приложение создаёт само.
-3. Включите WLAN и заранее настройте рабочее Wi-Fi-подключение в системном меню PSP.
+1. Copy the application directory to `PSP/GAME/YMPSP/` on the Memory Stick.
+2. Make sure `assets` and `fonts` are located next to `EBOOT.PBP`. Runtime directories inside `data` are created automatically.
+3. Enable WLAN and configure a working Wi-Fi connection in the PSP system menu.
 
-Заполненный `config/token.txt` с реальным токеном не должен попадать в Git или публичные архивы. Незаполненный шаблон `YANDEX_TOKEN = ""`, создаваемый сборкой, секрета не содержит.
+A populated `config/token.txt` containing a real token must not be committed to Git or included in public archives. The empty template `YANDEX_TOKEN = ""` created by the build does not contain any secret data.
 
-## Текущее состояние
+## Current Status
 
-Приложение ориентировано на PSP с ARK-4 или ARK-5 и находится в разработке.
+The application targets PSP systems running ARK-4 or ARK-5 and is under active development.
 
-## Сборка
+## Building
 
-Для разработки используется PSPSDK. Из корня проекта:
+YMPSP is built using PSPSDK.
 
-В Linux:
+From the project root:
+
+On Linux:
 
 ```
 make
 ```
 
-В PowerShell:
+In PowerShell:
 
 ```
 wsl --shell-type login make
 ```
 
-Результат создаётся в `release/EBOOT.PBP`. Команда `make` также копирует отслеживаемые ресурсы из `fonts/` и `assets/` в соответствующие каталоги внутри `release/` и при отсутствии создаёт незаполненный `release/config/token.txt` с параметром `YANDEX_TOKEN = ""`. Токен можно вписать туда заранее, а можно войти по коду уже на приставке — повторная сборка заполненный файл не перезаписывает.
+The result is created at `release/EBOOT.PBP`.
 
-## Лицензия
+The `make` command also copies tracked resources from `fonts/` and `assets/` into the corresponding directories under `release/` and, if missing, creates an empty `release/config/token.txt` containing:
 
-Исходный код распространяются по лицензии MIT — см. [LICENSE](LICENSE).
+```text
+YANDEX_TOKEN = ""
+```
 
-Названия и товарные знаки Яндекса принадлежат их правообладателям и лицензией MIT не покрываются. Изображения музыкальных обложек, видимые на скриншотах, также принадлежат соответствующим правообладателям.
+You can populate the token file manually before launching the application or sign in using the device-code flow directly on the PSP. Subsequent builds do not overwrite an already populated token file.
+
+## License
+
+The source code is distributed under the MIT License — see [LICENSE](LICENSE).
+
+Yandex names and trademarks belong to their respective owners and are not covered by the MIT License. Album artwork shown in the screenshots also belongs to the respective copyright holders.

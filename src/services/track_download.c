@@ -8,16 +8,24 @@
 
 int track_download_build_path(const char *track_id, char *out, size_t out_size)
 {
+    return track_download_build_path_for_codec(track_id, "mp3", out, out_size);
+}
+
+int track_download_build_path_for_codec(const char *track_id, const char *codec,
+                                        char *out, size_t out_size)
+{
     int rc;
+    const char *ext;
 
     if (!track_id || !out || out_size == 0) {
         return -1;
     }
+    ext = (codec && strcmp(codec, "flac") == 0) ? "flac" : "mp3";
 
-    /* Cache path contract: cache_music/<track_id>.mp3
-     * Calibrated: "cache_music/" (12) + observed max track_id (10 digits) + ".mp3" (4) = 26 chars.
+    /* Cache path contract: cache_music/<track_id>.<mp3|flac>
+     * Calibrated: "cache_music/" (12) + observed max track_id (10 digits) + ".flac" (5) = 27 chars.
      * out_size of 64 bytes is the documented minimum; callers use 64. */
-    rc = snprintf(out, out_size, "cache_music/%s.mp3", track_id);
+    rc = snprintf(out, out_size, "cache_music/%s.%s", track_id, ext);
     if (rc < 0 || rc >= (int)out_size) {
         logLine("track_dl: path too long for id='%s'\n", track_id);
         return -1;

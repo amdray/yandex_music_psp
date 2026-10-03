@@ -34,4 +34,8 @@ int track_download_mp3_to_ram_from(const char *url, int offset, int expected_tot
 // Returns 0 on success, -1 if the buffer would truncate.
 int track_download_build_path(const char *track_id, char *out, size_t out_size);
 
+/* Codec-aware variant: "flac" -> cache_music/<id>.flac, anything else -> .mp3. */
+int track_download_build_path_for_codec(const char *track_id, const char *codec,
+                                        char *out, size_t out_size);
+
 #endif /* YM_SERVICES_TRACK_DOWNLOAD_H */

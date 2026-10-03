@@ -14,6 +14,7 @@
 #include "core/logger.h"
 #include "services/audio_cache.h"
 #include "services/eq.h"
+#include "services/ym_flac.h"
 #include "services/audio_stream_buf.h"
 #include "services/net_http.h"
 #include "services/net_stack.h"
@@ -898,6 +899,207 @@ static int audio_player_apply_seek(TrackEntry *track, AudioSourceSnapshot *sourc
     return 0;
 }
 
+/* FLAC: длина доступного префикса файла (прогрессивная докачка). */
+static int64_t flac_file_avail_cb(void *user){
+    const char *track_id = (const char *)user;
+    AudioCacheStatus status;
+    if (!track_id || !audio_cache_get_status(&status)) {
+        return 0;
+    }
+    if (strcmp(status.track_id, track_id) != 0) {
+        return 0;
+    }
+    return status.downloaded_bytes;
+}
+
+/* FLAC-цикл: файл (прогрессивный или готовый) -> dr_flac -> PCM s16 ->
+ * тот же SRC-вывод/EQ/позиция, что у MP3. MP3-путь ниже не тронут. */
+#define FLAC_DECODE_FRAMES 1152
+
+static int audio_player_flac_file_run(const TrackEntry *track,
+                                      const AudioSourceSnapshot *source,
+                                      int fd,
+                                      YmFlacAvailFn avail_fn, void *avail_user,
+                                      int *rate_ptr, int *channels_ptr,
+                                      int64_t *played_ptr,
+                                      int *audio_reserved_ptr,
+                                      int *reserved_bytes_ptr,
+                                      int *first_pcm_done_ptr,
+                                      unsigned worker_generation,
+                                      int *stop_state_ptr)
+{
+    YmFlac *flac = NULL;
+    YmFlacFormat fmt;
+    int64_t played = 0;
+    int seek_wait_left;
+
+    memset(&fmt, 0, sizeof(fmt));
+    flac = ym_flac_open_file(fd, 0, avail_fn, avail_user);
+    if (!flac) {
+        logLine("ap: flac open failed track_id='%s'\n", track->id);
+        return AUDIO_PLAYER_ERR_SOURCE;
+    }
+    if (ym_flac_format(flac, &fmt) != 0 ||
+        fmt.sample_rate != 44100 || fmt.channels != 2 ||
+        fmt.bits_per_sample != 16) {
+        logLine("ap: flac format rejected track_id='%s' %d/%d/%d (need 44100/2/16)\n",
+                track->id, fmt.sample_rate, fmt.channels, fmt.bits_per_sample);
+        ym_flac_close(flac);
+        return AUDIO_PLAYER_ERR_SOURCE;
+    }
+    logLine("ap: flac ok track_id='%s' 44100/16/stereo total_frames=%d\n",
+            track->id, (int)fmt.total_frames);
+    *rate_ptr = 44100;
+    *channels_ptr = 2;
+    set_format_snapshot(44100, 2);
+    set_bitrate_snapshot(source->bitrate_kbps);
+    eq_reset();
+    set_active_status(AUDIO_PLAYER_PLAYING, track->id);
+
+    while (!s_stop_requested) {
+        int64_t got;
+        int bytes_decoded;
+        int sample_count;
+        int out_rc;
+
+        if (wait_while_paused(track->id) != 0) {
+            *stop_state_ptr = 1;
+            break;
+        }
+        if (s_seek_pending) {
+            int target_ms = s_seek_target_ms;
+            int64_t target_frame = ((int64_t)target_ms * 44100) / 1000;
+            int64_t est = target_frame * 4 + 8192;
+            int rc;
+            s_seek_pending = 0;
+            rc = wait_for_more_data(track->id, est);
+            if (rc == AUDIO_PLAYER_EOF) {
+                *stop_state_ptr = 1;
+                break;
+            }
+            if (rc != 0) {
+                ym_flac_close(flac);
+                return rc;
+            }
+            seek_wait_left = 3;
+            for (;;) {
+                rc = ym_flac_seek_frame(flac, target_frame);
+                if (rc == 0) break;
+                if (rc != -1 || seek_wait_left-- <= 0) {
+                    logLine("ap: flac seek failed track_id='%s' rc=%d\n",
+                            track->id, rc);
+                    ym_flac_close(flac);
+                    return AUDIO_PLAYER_ERR_SOURCE;
+                }
+                rc = wait_for_more_data(track->id, est + 65536);
+                if (rc == AUDIO_PLAYER_EOF) {
+                    *stop_state_ptr = 1;
+                    break;
+                }
+                if (rc != 0) {
+                    ym_flac_close(flac);
+                    return rc;
+                }
+            }
+            if (rc == AUDIO_PLAYER_EOF) {
+                break;
+            }
+            played = target_frame;
+            *played_ptr = played;
+            set_position_snapshot(target_ms);
+            eq_reset();
+            logLine("ap: flac seek ok track_id='%s' target_ms=%d\n",
+                    track->id, target_ms);
+            continue;
+        }
+
+        got = ym_flac_read_s16(flac, (short *)s_pcm_buf, FLAC_DECODE_FRAMES);
+        if (got < 0) {
+            ym_flac_close(flac);
+            return AUDIO_PLAYER_ERR_SOURCE;
+        }
+        if (got == 0) {
+            AudioCacheStatus status;
+            int rc;
+            audio_cache_get_status(&status);
+            if (strcmp(status.track_id, track->id) != 0) {
+                ym_flac_close(flac);
+                return AUDIO_PLAYER_ERR_TRACK_MISMATCH;
+            }
+            if (!status.complete) {
+                rc = wait_for_more_data(track->id,
+                                        status.downloaded_bytes + 65536);
+                if (rc == AUDIO_PLAYER_EOF) {
+                    *stop_state_ptr = 1;
+                    break;
+                }
+                if (rc != 0) {
+                    ym_flac_close(flac);
+                    return rc;
+                }
+                continue;
+            }
+            logLine("ap: eof decode terminal (flac) track_id='%s' played_ms=%d\n",
+                    track->id, (int)((played * 1000) / 44100));
+            logger_flush();
+            *stop_state_ptr = 1;
+            break;
+        }
+
+        bytes_decoded = (int)got * 4;
+        if (eq_is_active()) {
+            eq_process((short *)s_pcm_buf, (int)got, 2, 44100);
+            sceKernelDcacheWritebackInvalidateRange(s_pcm_buf, bytes_decoded);
+        }
+
+        if (!*audio_reserved_ptr || *reserved_bytes_ptr != bytes_decoded) {
+            if (*audio_reserved_ptr) {
+                release_audio_src_channel();
+                *audio_reserved_ptr = 0;
+            }
+            sample_count = (int)got;
+            if (sample_count < 17 || sample_count > 4111) {
+                ym_flac_close(flac);
+                return AUDIO_PLAYER_ERR_SOURCE;
+            }
+            if (sceAudioSRCChReserve(sample_count, 44100, 2) < 0) {
+                ym_flac_close(flac);
+                return AUDIO_PLAYER_ERR_SOURCE;
+            }
+            *audio_reserved_ptr = 1;
+            *reserved_bytes_ptr = bytes_decoded;
+            logLine("ap: sceAudioSRCChReserve ok (flac) track_id='%s' samples=%d\n",
+                    track->id, sample_count);
+        }
+
+        if (wait_while_paused(track->id) != 0) {
+            *stop_state_ptr = 1;
+            break;
+        }
+
+        out_rc = sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX,
+                                           (short *)s_pcm_buf);
+        if (out_rc < 0) {
+            ym_flac_close(flac);
+            return out_rc;
+        }
+
+        played += got;
+        *played_ptr = played;
+        if (!*first_pcm_done_ptr) {
+            *first_pcm_done_ptr = 1;
+            audio_report_publish_first_pcm(track->id, worker_generation);
+        }
+        set_position_snapshot((int)((played * 1000) / 44100));
+        if (s_state != AUDIO_PLAYER_PLAYING) {
+            set_active_status(AUDIO_PLAYER_PLAYING, track->id);
+        }
+    }
+
+    ym_flac_close(flac);
+    return 0;
+}
+
 static int audio_player_worker(SceSize args, void *argp)
 {
     TrackEntry track;
@@ -967,6 +1169,21 @@ static int audio_player_worker(SceSize args, void *argp)
         }
         logLine("ap: cached file mode track_id='%s' path='%s'\n",
                 track.id, source.path);
+    }
+
+    /* FLAC: файл .flac -> софт-декод dr_flac. MP3 идёт старым путём ниже. */
+    {
+        const char *dot = source.path[0] ? strrchr(source.path, '.') : NULL;
+        if (!sbuf && fd >= 0 && dot && strcmp(dot, ".flac") == 0) {
+            logLine("ap: flac file mode track_id='%s' path='%s'\n",
+                    track.id, source.path);
+            error_code = audio_player_flac_file_run(&track, &source, fd,
+                flac_file_avail_cb, (void *)track.id,
+                &sampling_rate, &num_channels, &played_samples,
+                &audio_reserved, &reserved_bytes,
+                &first_pcm_done, worker_generation, &stop_state);
+            goto cleanup;
+        }
     }
 
     {

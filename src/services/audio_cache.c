@@ -294,6 +294,236 @@ static int ac_wait_for_retry(AcSlot *slot, const char *track_id, u64 retry_at)
     }
 }
 
+/* ---- FLAC lossless (44.1/16/stereo по мануалу PSP) ----
+ * RAM-буфер весь FLAC-трек не держит (20-40 МБ), поэтому FLAC идёт
+ * напрямую в файл (прогрессивная докачка Range resume), а плеер читает
+ * файл через курсор dr_flac. MP3-путь ниже не тронут. */
+
+#define FLAC_PROBE_BYTES 8192
+#define FLAC_PROBE_NEED 4096
+
+static unsigned char s_flac_probe[FLAC_PROBE_BYTES];
+static int s_flac_probe_len;
+
+static int flac_probe_chunk(const char *data, int size, void *user)
+{
+    int *len = (int *)user;
+    int room;
+    if (!data || size <= 0 || !len) return -1;
+    room = FLAC_PROBE_BYTES - *len;
+    if (room <= 0) return 1;
+    if (size > room) size = room;
+    memcpy(s_flac_probe + *len, data, (size_t)size);
+    *len += size;
+    return (*len >= FLAC_PROBE_NEED) ? 1 : 0;
+}
+
+/* Разбор STREAMINFO (первые 42 байта): 1 = rate/ch/bps годны. */
+static int flac_probe_streaminfo(const unsigned char *p, int len,
+                                 int *rate, int *ch, int *bps)
+{
+    unsigned type, mlen;
+    if (!p || len < 42 || memcmp(p, "fLaC", 4) != 0) return 0;
+    type = p[4] & 0x7F;
+    mlen = ((unsigned)p[5] << 16) | ((unsigned)p[6] << 8) | (unsigned)p[7];
+    if (type != 0 || mlen < 34) return 0;
+    p += 8;
+    *rate = ((int)p[10] << 12) | ((int)p[11] << 4) | ((int)p[12] >> 4);
+    *ch = (((int)p[12] >> 1) & 7) + 1;
+    *bps = ((((int)p[12] & 1) << 4) | ((int)p[13] >> 4)) + 1;
+    return 1;
+}
+
+typedef struct {
+    AcSlot *slot;
+    char track_id[40];
+    SceUID fd;
+    int64_t base_size;
+    int64_t session_written;
+    int64_t attempt_total;
+    int attempt_had_progress;
+} AcFileDlCtx;
+
+static int flac_file_chunk(const char *data, int size, void *user)
+{
+    AcFileDlCtx *ctx = (AcFileDlCtx *)user;
+    int rc;
+    if (!ctx || !data || size <= 0) return -1;
+    if (ctx->slot->job_cancel || s_shutdown) {
+        return NET_HTTP_STREAM_CANCELLED;
+    }
+    if (ctx->fd < 0) return -1;
+    rc = fs_write(ctx->fd, data, (SceSize)size);
+    if (rc != size) {
+        logLine("ac: flac file write short slot=%d rc=%d\n",
+                ctx->slot->slot_id, rc);
+        return -1;
+    }
+    ctx->session_written += size;
+    return 0;
+}
+
+static int flac_file_progress(int written_total, int content_length, void *user)
+{
+    AcFileDlCtx *ctx = (AcFileDlCtx *)user;
+    int64_t absolute;
+    int progressive;
+    if (!ctx) return -1;
+    if (ctx->attempt_total <= 0 && content_length > 0) {
+        ctx->attempt_total = content_length;
+    }
+    absolute = ctx->base_size + (int64_t)written_total;
+    progressive = (absolute >= AUDIO_CACHE_PROGRESSIVE_THRESHOLD);
+    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (strcmp(ctx->slot->status.track_id, ctx->track_id) == 0) {
+        ctx->slot->status.downloaded_bytes = absolute;
+        if (ctx->attempt_total > 0) {
+            ctx->slot->status.content_length = ctx->base_size + ctx->attempt_total;
+        }
+        ctx->slot->status.error_code = 0;
+        if (progressive && ctx->slot->status.state == AUDIO_CACHE_DOWNLOADING) {
+            ctx->slot->status.state = AUDIO_CACHE_PROGRESSIVE_READY;
+            ctx->slot->status.progressive = 1;
+            logLine("ac: slot=%d progressive ready '%s' bytes=%d\n",
+                    ctx->slot->slot_id, ctx->track_id, (int)absolute);
+        }
+    }
+    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    ctx->attempt_had_progress = 1;
+    return 0;
+}
+
+/* Прогрессивная докачка FLAC в файл. Возвращает 0 (READY/CANCELLED — как RAM
+ * путь: отмена не ошибка) или <0. Частичный файл сохраняется для resume. */
+static int run_flac_file_job(AcSlot *slot, const AcJob *job,
+                             const YmApiContext *api_ctx, const char *path)
+{
+    unsigned int retry_delay_us = AUDIO_CACHE_RETRY_MIN_US;
+    YmDownloadVariant variant;
+    YmStatus ym_status;
+
+    memset(&variant, 0, sizeof(variant));
+    for (;;) {
+        AcFileDlCtx ctx;
+        SceIoStat st;
+        int64_t base_size = 0;
+        int rc_dl;
+
+        if (slot->job_cancel || s_shutdown) {
+            slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
+                            NET_HTTP_STREAM_CANCELLED);
+            return 0;
+        }
+
+        ym_status = ym_api_download_get_flac_raw((YmApiContext *)api_ctx,
+                                                 job->track.id, &variant);
+        if (ym_status != YM_OK) {
+            if (ym_status == YM_ERR_NETWORK) {
+                if (ac_wait_for_retry(slot, job->track.id,
+                                      sceKernelGetSystemTimeWide() + retry_delay_us) != 0) {
+                    slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id,
+                                    NULL, NET_HTTP_STREAM_CANCELLED);
+                    return 0;
+                }
+                if (retry_delay_us < AUDIO_CACHE_RETRY_MAX_US / 2) {
+                    retry_delay_us *= 2;
+                } else {
+                    retry_delay_us = AUDIO_CACHE_RETRY_MAX_US;
+                }
+                continue;
+            }
+            logLine("ac: flac url FAILED slot=%d track='%s' status=%d\n",
+                    slot->slot_id, job->track.id, ym_status);
+            logger_flush();
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL,
+                            (int)ym_status);
+            return -1;
+        }
+
+        memset(&st, 0, sizeof(st));
+        if (fs_getstat(path, &st) == 0 && st.st_size > 0) {
+            base_size = (int64_t)st.st_size;
+        }
+
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.slot = slot;
+        snprintf(ctx.track_id, sizeof(ctx.track_id), "%s", job->track.id);
+        ctx.base_size = base_size;
+        ctx.fd = fs_open(path, PSP_O_WRONLY | (base_size > 0 ? PSP_O_APPEND : (PSP_O_CREAT | PSP_O_TRUNC)), 0777);
+        if (ctx.fd < 0) {
+            logLine("ac: flac file open failed slot=%d '%s' rc=0x%08X\n",
+                    slot->slot_id, path, ctx.fd);
+            logger_flush();
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL,
+                            ctx.fd);
+            return -1;
+        }
+
+        slot_set_source(slot, AUDIO_CACHE_DOWNLOADING, job->track.id, path,
+                        base_size, base_size, variant.bitrate_kbps, 0,
+                        base_size >= AUDIO_CACHE_PROGRESSIVE_THRESHOLD,
+                        0);
+        logLine("ac: flac file start slot=%d track='%s' resume=%d\n",
+                slot->slot_id, job->track.id, (int)base_size);
+        logger_flush();
+
+        rc_dl = http_stream(&(HttpRequest){
+                                .method = HTTP_GET, .url = variant.url,
+                                .token = api_ctx->oauth_token,
+                                .identity_encoding = 1,
+                                .range_enabled = base_size > 0,
+                                .range_start = (int)base_size,
+                                .range_total = 0
+                            },
+                            &(HttpSink){ .on_chunk = flac_file_chunk,
+                                         .on_progress = flac_file_progress,
+                                         .user = &ctx });
+        fs_close(ctx.fd);
+        ctx.fd = -1;
+
+        if (rc_dl == 0) {
+            memset(&st, 0, sizeof(st));
+            if (fs_getstat(path, &st) == 0 && st.st_size > 0) {
+                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id, path,
+                                (int64_t)st.st_size, (int64_t)st.st_size,
+                                variant.bitrate_kbps, 1, 1, 0);
+                logLine("ac: state -> READY (flac file) slot=%d track='%s' size=%d\n",
+                        slot->slot_id, job->track.id, (int)st.st_size);
+                logger_flush();
+                return 0;
+            }
+            rc_dl = NET_HTTP_ERR_PROTOCOL;
+        }
+        if (rc_dl == NET_HTTP_STREAM_CANCELLED ||
+            slot->job_cancel || s_shutdown) {
+            slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
+                            NET_HTTP_STREAM_CANCELLED);
+            return 0;
+        }
+        if (!net_http_error_is_network(rc_dl)) {
+            logLine("ac: flac file failed terminal slot=%d track='%s' rc=%d\n",
+                    slot->slot_id, job->track.id, rc_dl);
+            logger_flush();
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, rc_dl);
+            return -1;
+        }
+        logLine("ac: flac file interrupted slot=%d track='%s' rc=%d\n",
+                slot->slot_id, job->track.id, rc_dl);
+        logger_flush();
+        if (ac_wait_for_retry(slot, job->track.id,
+                              sceKernelGetSystemTimeWide() + retry_delay_us) != 0) {
+            slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
+                            NET_HTTP_STREAM_CANCELLED);
+            return 0;
+        }
+        if (retry_delay_us < AUDIO_CACHE_RETRY_MAX_US / 2) {
+            retry_delay_us *= 2;
+        } else {
+            retry_delay_us = AUDIO_CACHE_RETRY_MAX_US;
+        }
+    }
+}
+
 static int run_download_job(AcSlot *slot, const AcJob *job)
 {
     YmApiContext api_ctx;
@@ -301,6 +531,8 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
     YmDownloadVariant original_variant;
     YmStatus ym_status;
     int net_paused = job->pause_network;
+    char dl_path[64];
+    int dl_is_flac = 0;
 
     logLine("ac: worker started slot=%d track_id='%s'\n",
             slot->slot_id, job->track.id);
@@ -308,8 +540,6 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
 
     slot_clear_status(slot);
     asb_reset(&slot->stream_buf);
-    slot_set_source(slot, AUDIO_CACHE_DOWNLOADING, job->track.id,
-                    job->path, 0, 0, 0, 0, 0, 0);
 
     if (job->token[0] == '\0') {
         logLine("ac: token missing slot=%d\n", slot->slot_id);
@@ -317,6 +547,33 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
         if (net_paused) cover_manager_resume_network();
         slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, -1);
         return -1;
+    }
+
+    api_ctx.oauth_token = job->token;
+    api_ctx.timeout_ms = 0;
+
+    /* Хиты кэша: сначала .flac (качество), потом .mp3. */
+    {
+        char flac_path[64];
+        SceIoStat st;
+        if (track_download_build_path_for_codec(job->track.id, "flac",
+                                                flac_path, sizeof(flac_path)) == 0) {
+            memset(&st, 0, sizeof(st));
+            logLine("ac: check cache slot=%d '%s'\n", slot->slot_id, flac_path);
+            logger_flush();
+            if (fs_getstat(flac_path, &st) == 0) {
+                logLine("ac: cache hit (flac) slot=%d '%s'\n", slot->slot_id, flac_path);
+                logger_flush();
+                if (net_paused) cover_manager_resume_network();
+                strncpy(dl_path, flac_path, sizeof(dl_path) - 1);
+                dl_path[sizeof(dl_path) - 1] = '\0';
+                dl_is_flac = 1;
+                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
+                                dl_path, (int64_t)st.st_size,
+                                (int64_t)st.st_size, 0, 1, 1, 0);
+                return 0;
+            }
+        }
     }
 
     {
@@ -328,8 +585,10 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
             logLine("ac: cache hit slot=%d '%s'\n", slot->slot_id, job->path);
             logger_flush();
             if (net_paused) cover_manager_resume_network();
+            strncpy(dl_path, job->path, sizeof(dl_path) - 1);
+            dl_path[sizeof(dl_path) - 1] = '\0';
             slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
-                            job->path, (int64_t)st.st_size,
+                            dl_path, (int64_t)st.st_size,
                             (int64_t)st.st_size, 0, 1, 1, 0);
             return 0;
         }
@@ -340,9 +599,62 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
             net_tls_config_is_ready(), net_stack_is_ready());
     logger_flush();
 
-    api_ctx.oauth_token = job->token;
-    api_ctx.timeout_ms = 0;
-    ym_status = ym_api_download_get_mp3_raw(&api_ctx, job->track.id, &variant);
+    /* Переговоры: сначала FLAC lossless, при отказе — MP3. */
+    {
+        YmDownloadVariant flac_variant;
+        int rate = 0, ch = 0, bps = 0;
+        memset(&flac_variant, 0, sizeof(flac_variant));
+        ym_status = ym_api_download_get_flac_raw(&api_ctx, job->track.id,
+                                                 &flac_variant);
+        if (ym_status == YM_OK) {
+            int probe_rc;
+            s_flac_probe_len = 0;
+            probe_rc = http_stream(&(HttpRequest){
+                                        .method = HTTP_GET, .url = flac_variant.url,
+                                        .token = api_ctx.oauth_token,
+                                        .identity_encoding = 1,
+                                        .range_enabled = 1,
+                                        .range_start = 0,
+                                        .range_total = 0
+                                    },
+                                    &(HttpSink){ .on_chunk = flac_probe_chunk,
+                                                 .on_progress = NULL,
+                                                 .user = &s_flac_probe_len });
+            if ((probe_rc == 0 || probe_rc == NET_HTTP_STREAM_CANCELLED) &&
+                s_flac_probe_len >= 42 &&
+                flac_probe_streaminfo(s_flac_probe, s_flac_probe_len,
+                                      &rate, &ch, &bps) &&
+                rate == 44100 && ch == 2 && bps == 16) {
+                logLine("ac: flac committed slot=%d track='%s' 44100/16/stereo bitrate=%d\n",
+                        slot->slot_id, job->track.id, flac_variant.bitrate_kbps);
+                logger_flush();
+                if (track_download_build_path_for_codec(job->track.id, "flac",
+                                                        dl_path, sizeof(dl_path)) == 0) {
+                    variant = flac_variant;
+                    original_variant = variant;
+                    dl_is_flac = 1;
+                }
+            } else {
+                logLine("ac: flac rejected slot=%d track='%s' probe_rc=%d len=%d fmt=%d/%d/%d\n",
+                        slot->slot_id, job->track.id, probe_rc,
+                        s_flac_probe_len, rate, ch, bps);
+                logger_flush();
+            }
+        } else {
+            logLine("ac: flac unavailable slot=%d track='%s' status=%d (mp3 fallback)\n",
+                    slot->slot_id, job->track.id, ym_status);
+            logger_flush();
+        }
+    }
+
+    if (!dl_is_flac) {
+        if (track_download_build_path_for_codec(job->track.id, "mp3",
+                                                dl_path, sizeof(dl_path)) != 0) {
+            if (net_paused) cover_manager_resume_network();
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, -4);
+            return -1;
+        }
+        ym_status = ym_api_download_get_mp3_raw(&api_ctx, job->track.id, &variant);
     if (ym_status != YM_OK) {
         if (net_paused) cover_manager_resume_network();
         if (slot->job_cancel || s_shutdown) {
@@ -359,6 +671,7 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
         slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, (int)ym_status);
         return -1;
     }
+    } /* !dl_is_flac: mp3 negotiation done */
     original_variant = variant;
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
@@ -375,6 +688,13 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
                         NET_HTTP_STREAM_CANCELLED);
         return 0;
     }
+
+    if (dl_is_flac) {
+        return run_flac_file_job(slot, job, &api_ctx, dl_path);
+    }
+
+    slot_set_source(slot, AUDIO_CACHE_DOWNLOADING, job->track.id,
+                    dl_path, 0, 0, 0, 0, 0, 0);
 
     logLine("ac: ram stream start slot=%d track_id='%s'\n",
             slot->slot_id, job->track.id);
@@ -565,7 +885,7 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
                     logLine("ac: cache written slot=%d '%s' size=%d took=%u ms\n",
                             slot->slot_id, job->path, (int)write_size,
                             (unsigned)((t1 - t0) / 1000));
-                    /* Чистка: свежие 32 mp3, свежие 150 обложек. */
+                    /* Чистка: свежие 32 трека (mp3/flac), свежие 150 обложек. */
                     fs_evict_oldest("cache_music", 32);
                     fs_evict_oldest("data/cache/covers", 150);
                 } else {

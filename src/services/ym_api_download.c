@@ -67,10 +67,12 @@ static int ym_url_encode_component(const char *in, char *out, size_t out_size)
     return 0;
 }
 
-static int ym_download_build_mp3_raw_url(const char *track_id,
-                                         char *out_url, size_t out_size)
+static int ym_download_build_file_info_url(const char *track_id,
+                                             const char *quality,
+                                             const char *codecs,
+                                             const char *transports,
+                                             char *out_url, size_t out_size)
 {
-    const char *quality = s_quality;
     const mbedtls_md_info_t *md_info;
     time_t now;
     char ts[24];
@@ -82,7 +84,7 @@ static int ym_download_build_mp3_raw_url(const char *track_id,
     size_t olen = 0;
     int url_len;
 
-    if (!track_id || !out_url || out_size == 0) {
+    if (!track_id || !quality || !codecs || !transports || !out_url || out_size == 0) {
         return -1;
     }
 
@@ -96,7 +98,7 @@ static int ym_download_build_mp3_raw_url(const char *track_id,
 
     snprintf(sign_input, sizeof(sign_input), "%s%s%s%s%s",
              ts, track_id, quality,
-             YM_FILE_INFO_CODECS, YM_FILE_INFO_TRANSPORTS);
+             codecs, transports);
     sign_input[sizeof(sign_input) - 1] = '\0';
 
     md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -131,8 +133,8 @@ static int ym_download_build_mp3_raw_url(const char *track_id,
     url_len = snprintf(out_url, out_size,
                        "https://api.music.yandex.net/get-file-info"
                        "?ts=%s&trackId=%s&quality=%s&codecs=%s&sign=%s&transports=%s",
-                       ts, track_id, quality, YM_FILE_INFO_CODECS,
-                       sign_query, YM_FILE_INFO_TRANSPORTS);
+                       ts, track_id, quality, codecs,
+                       sign_query, transports);
     if (url_len < 0 || (size_t)url_len >= out_size) {
         logLine("ym_api_download: URL truncated need=%d have=%u\n",
                 url_len, (unsigned int)out_size);
@@ -147,9 +149,13 @@ static int ym_json_string_nonempty(cJSON *node)
     return node && cJSON_IsString(node) && node->valuestring && node->valuestring[0] != '\0';
 }
 
-YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
-                                     const char *track_id,
-                                     YmDownloadVariant *out)
+static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
+                                            const char *track_id,
+                                            const char *quality,
+                                            const char *codecs,
+                                            const char *transports,
+                                            const char *want_codec,
+                                            YmDownloadVariant *out)
 {
     NetHttpResponse response;
     char url[256];
@@ -165,7 +171,8 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
     int bitrate_kbps = 0;
     int ret;
 
-    if (!ctx || !ctx->oauth_token || !track_id || !out || track_id[0] == '\0') {
+    if (!ctx || !ctx->oauth_token || !track_id || !quality || !codecs ||
+        !transports || !want_codec || !out || track_id[0] == '\0') {
         logLine("ym_api_download: invalid args ctx=%d token=%d track_id=%d out=%d\n",
                 ctx ? 1 : 0,
                 (ctx && ctx->oauth_token) ? 1 : 0,
@@ -176,12 +183,13 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
     }
     memset(out, 0, sizeof(*out));
 
-    if (ym_download_build_mp3_raw_url(track_id, url, sizeof(url)) != 0) {
+    if (ym_download_build_file_info_url(track_id, quality, codecs,
+                                          transports, url, sizeof(url)) != 0) {
         logger_flush();
         return YM_ERR_PARSE;
     }
 
-    logLine("ym_api_download: fetch mp3/raw track_id='%s'\n", track_id);
+    logLine("ym_api_download: fetch %s/raw track_id='%s'\n", want_codec, track_id);
 
     memset(&response, 0, sizeof(response));
     ret = http_request(&(HttpRequest){
@@ -241,7 +249,7 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
     bitrate = cJSON_GetObjectItemCaseSensitive(download_info, "bitrate");
     key = cJSON_GetObjectItemCaseSensitive(download_info, "key");
 
-    if (!ym_json_string_nonempty(codec) || strcmp(codec->valuestring, "mp3") != 0) {
+    if (!ym_json_string_nonempty(codec) || strcmp(codec->valuestring, want_codec) != 0) {
         logLine("ym_api_download: rejected codec='%s'\n",
                 (codec && cJSON_IsString(codec) && codec->valuestring) ? codec->valuestring : "(missing)");
         cJSON_Delete(root);
@@ -282,28 +290,49 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
     }
 
     if (!direct_url || direct_url[0] == '\0') {
-        logLine("ym_api_download: missing direct mp3 url\n");
+        logLine("ym_api_download: missing direct %s url\n", want_codec);
         cJSON_Delete(root);
         logger_flush();
         return YM_ERR_NOT_FOUND;
     }
 
     if (strlen(direct_url) >= sizeof(out->url)) {
-        logLine("ym_api_download: direct MP3 URL too long (%u >= %u)\n",
+        logLine("ym_api_download: direct %s URL too long (%u >= %u)\n",
+                want_codec,
                 (unsigned int)strlen(direct_url), (unsigned int)sizeof(out->url));
         cJSON_Delete(root);
         logger_flush();
         return YM_ERR_PARSE;
     }
 
-    strcpy(out->url, direct_url);
-    strcpy(out->codec, "mp3");
+    strncpy(out->url, direct_url, sizeof(out->url) - 1);
+    out->url[sizeof(out->url) - 1] = '\0';
+    strncpy(out->codec, want_codec, sizeof(out->codec) - 1);
+    out->codec[sizeof(out->codec) - 1] = '\0';
     strcpy(out->transport, "raw");
     out->bitrate_kbps = bitrate_kbps;
     out->encrypted = 0;
-    logLine("ym_api_download: direct MP3 url ok codec=mp3 transport=raw bitrate=%d key=none url_len=%u\n",
+    logLine("ym_api_download: direct %s url ok codec=%s transport=raw bitrate=%d key=none url_len=%u\n",
+            want_codec, out->codec,
             out->bitrate_kbps, (unsigned int)strlen(out->url));
     cJSON_Delete(root);
     logger_flush();
     return YM_OK;
+}
+
+YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
+                                     const char *track_id,
+                                     YmDownloadVariant *out)
+{
+    return ym_download_fetch_variant(ctx, track_id, s_quality,
+                                     YM_FILE_INFO_CODECS,
+                                     YM_FILE_INFO_TRANSPORTS, "mp3", out);
+}
+
+YmStatus ym_api_download_get_flac_raw(YmApiContext *ctx,
+                                      const char *track_id,
+                                      YmDownloadVariant *out)
+{
+    return ym_download_fetch_variant(ctx, track_id, "lossless",
+                                     "flac", "raw", "flac", out);
 }

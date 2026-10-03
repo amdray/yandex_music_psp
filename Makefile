@@ -69,6 +69,7 @@ OBJS = src/main.o \
        src/services/system_status.o \
        src/services/kubridge_call_stub.o \
        src/services/ym_api_download.o \
+       src/services/ym_flac.o \
        src/services/ym_api_playlists.o \
        src/services/api_parser.o \
        src/services/list_index.o \

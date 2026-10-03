@@ -18,6 +18,13 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
                                      const char *track_id,
                                      YmDownloadVariant *out);
 
+/* FLAC lossless (44.1 кГц / 16 бит / стерео по мануалу PSP).
+ * quality=lossless, codecs=flac. YM_ERR_UNSUPPORTED, если сервер не отдал flac.
+ * Вызыватель сам решает fallback на MP3. */
+YmStatus ym_api_download_get_flac_raw(YmApiContext *ctx,
+                                      const char *track_id,
+                                      YmDownloadVariant *out);
+
 /* Качество MP3 для следующих треков: "nq" (192) / "hq" (320). */
 void ym_api_download_set_quality(const char *q);
 const char *ym_api_download_quality(void);

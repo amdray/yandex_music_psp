@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "cjson/cJSON.h"
+#include "services/libc_guard.h"
 #include "core/logger.h"
 #include "services/net_http.h"
 
@@ -94,7 +95,7 @@ int ym_api_search_tracks(YmApiContext *ctx, const char *query,
         logger_flush();
         return -1;
     }
-    root = cJSON_Parse(resp.body);
+    root = ym_json_parse(resp.body);
     if (!root) {
         logLine("ym_api_search: parse failed\n");
         net_http_response_free(&resp);

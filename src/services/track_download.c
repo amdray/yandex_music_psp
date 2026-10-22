@@ -20,9 +20,17 @@ int track_download_build_path_for_codec(const char *track_id, const char *codec,
     if (!track_id || !out || out_size == 0) {
         return -1;
     }
-    ext = (codec && strcmp(codec, "flac") == 0) ? "flac" : "mp3";
+    if (codec && strcmp(codec, "flac") == 0) {
+        ext = "flac";
+    } else if (codec && strcmp(codec, "aac") == 0) {
+        ext = "aac";   /* контейнер MP4, читается плеером на лету */
+    } else if (codec && strcmp(codec, "mp4") == 0) {
+        ext = "mp4";   /* flac-mp4: кэш и источник плеера без демукса */
+    } else {
+        ext = "mp3";
+    }
 
-    /* Cache path contract: cache_music/<track_id>.<mp3|flac>
+    /* Cache path contract: cache_music/<track_id>.<mp3|flac|aac|mp4>
      * Calibrated: "cache_music/" (12) + observed max track_id (10 digits) + ".flac" (5) = 27 chars.
      * out_size of 64 bytes is the documented minimum; callers use 64. */
     rc = snprintf(out, out_size, "cache_music/%s.%s", track_id, ext);

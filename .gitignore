@@ -33,3 +33,9 @@ cache_music/
 
 # Emulator working copy — contains OAuth token, cached media, logs, binaries. Never track.
 release/
+
+# Local debug tooling and build backups
+debug_tools/
+Makefile.new
+Makefile.prev_backup
+*.a

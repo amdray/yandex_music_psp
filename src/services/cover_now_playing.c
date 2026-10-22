@@ -276,6 +276,7 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
                 goto job_done;
             }
             downloaded = 1;
+            fs_evict_oldest("data/cache/covers", COVER_DISK_KEEP);
         }
 
         state_lock();

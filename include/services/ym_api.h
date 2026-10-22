@@ -18,14 +18,21 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
                                      const char *track_id,
                                      YmDownloadVariant *out);
 
-/* FLAC lossless (44.1 кГц / 16 бит / стерео по мануалу PSP).
- * quality=lossless, codecs=flac. YM_ERR_UNSUPPORTED, если сервер не отдал flac.
- * Вызыватель сам решает fallback на MP3. */
+/* FLAC lossless: quality=lossless, полный список кодеков (sign — без запятых).
+ * Сервер отдаёт flac-mp4 (MP4-контейнер) — вызыватель демуксит в сырой fLaC.
+ * YM_ERR_UNSUPPORTED, если сервер выбрал другой кодек (aac/mp3). */
 YmStatus ym_api_download_get_flac_raw(YmApiContext *ctx,
                                       const char *track_id,
                                       YmDownloadVariant *out);
 
-/* Качество MP3 для следующих треков: "nq" (192) / "hq" (320). */
+/* AAC: полный список кодеков, quality=текущая (lq -> he-aac-mp4@64,
+ * nq -> aac-mp4@192, hq -> aac-mp4@256). YM_ERR_UNSUPPORTED, если сервер
+ * выбрал другой кодек. Контейнер MP4 (esds + сэмплы) — декодер faad2. */
+YmStatus ym_api_download_get_aac_raw(YmApiContext *ctx,
+                                     const char *track_id,
+                                     YmDownloadVariant *out);
+
+/* Качество для следующих треков: "lq" / "nq" (192) / "hq" (320). */
 void ym_api_download_set_quality(const char *q);
 const char *ym_api_download_quality(void);
 

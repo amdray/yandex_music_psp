@@ -12,7 +12,18 @@
 #define LOG_PATH_MAX 256
 #define LOG_LINE_MAX 512
 #define LOG_BUFFER_SIZE (64 * 1024)
-#define LOG_AUTO_FLUSH_THRESHOLD (LOG_BUFFER_SIZE / 2)  // Auto-flush when half full
+/* Ленивый режим (по умолчанию): лог копится в RAM и пишется на карту редко —
+ * при накоплении LOG_AUTO_FLUSH_THRESHOLD, раз в LOG_WRITER_PERIOD_US или по
+ * logger_flush_now(). На реальной PSP каждая запись + sceIoSync держит
+ * Memory Stick секундами, и все чтения (шрифты, токен, конфиги) стоят в
+ * очереди за ними; плюс индикатор карты мигает постоянно. logger_flush()
+ * в ленивом режиме ничего не пишет (его зовут сотни мест, главный цикл —
+ * каждые 250 мс). YM_LOG_EAGER=1 — старое поведение для отладки падений. */
+#ifdef YM_LOG_EAGER
+#define LOG_AUTO_FLUSH_THRESHOLD (LOG_BUFFER_SIZE / 2)
+#else
+#define LOG_AUTO_FLUSH_THRESHOLD (LOG_BUFFER_SIZE / 4)
+#endif
 #define LOG_REOPEN_DELAY_US 5000000ULL
 
 // Ring buffer for log messages
@@ -32,6 +43,26 @@ static int s_last_sink_error = 0;
 static unsigned int s_sink_failures = 0;
 static volatile int s_realtime_mode = 0;
 static char s_log_path[LOG_PATH_MAX];
+
+// Фоновый писатель (async). Запись на Memory Stick на реальной PSP с
+// почти заполненной/фрагментированной FAT32-картой занимает ~2 с на операцию;
+// синхронный flush держал мьютекс логгера и fs, и UI замирал на каждом
+// logLine/logger_flush (меню «листало через раз», старт 100+ с).
+// Теперь на карту пишет только поток log_writer (низкий приоритет),
+// logLine/logger_flush никогда не ждут Memory Stick.
+#define LOG_WRITER_PRIO   0x30
+#ifdef YM_LOG_EAGER
+#define LOG_WRITER_PERIOD_US 2000000
+#define LOG_SYNC_MIN_US   4000000ULL
+#else
+#define LOG_WRITER_PERIOD_US 60000000
+#define LOG_SYNC_MIN_US   300000000ULL
+#endif
+#define LOG_WRITE_CHUNK   (16 * 1024)
+static SceUID s_writer_tid = -1;
+static SceUID s_writer_sema = -1;
+static volatile int s_writer_stop = 0;
+static char s_writer_buf[LOG_WRITE_CHUNK];
 
 // Thread-safety
 static SceLwMutexWorkarea s_log_mutex;
@@ -141,7 +172,7 @@ static size_t log_write_span_locked(const char *data, size_t len)
 {
     size_t done = 0;
     while (done < len && s_log_ready && s_log_fd >= 0) {
-        int rc = fs_write(s_log_fd, data + done, len - done);
+        int rc = sceIoWrite(s_log_fd, data + done, len - done);
         if (rc <= 0) {
             log_sink_failed_locked(rc);
             break;
@@ -181,6 +212,145 @@ static void log_flush_internal(void)
     }
 
     LOG_MUTEX_UNLOCK();
+}
+
+/* Фоновый сброс: копия куска под мьютексом, запись на MS — БЕЗ мьютекса
+ * логгера (logLine других потоков не ждут). Хвост двигает только писатель. */
+/* Синхронизация FAT после записи: без неё размер файла в каталоге
+ * обновляется только при закрытии, и при внезапном выключении/падении
+ * консоли всё записанное после открытия теряется (лог «обрывался» за
+ * минуты до реального места падения). Устройство берём из пути лога. */
+static u64 s_last_sync_us = 0;
+static volatile int s_force_flush = 0;
+static void log_sync_device(void)
+{
+    char dev[16];
+    const char *colon = strchr(s_log_path, ':');
+    size_t n;
+    if (!colon) return;
+    n = (size_t)(colon - s_log_path) + 1;
+    if (n >= sizeof(dev)) return;
+    memcpy(dev, s_log_path, n);
+    dev[n] = '\0';
+    (void)sceIoSync(dev, 0);
+}
+
+static void log_flush_background(void)
+{
+    int wrote = 0;
+
+    log_try_reopen();
+    if (!s_log_ready || s_log_fd < 0) return;
+
+    for (;;) {
+        size_t span;
+        int dropped = 0;
+        size_t done = 0;
+
+        LOG_MUTEX_LOCK();
+        if (s_log_dropped > 0) {
+            dropped = s_log_dropped;
+            s_log_dropped = 0;
+        }
+        span = LOG_BUFFER_SIZE - s_log_tail;
+        if (span > s_log_used) span = s_log_used;
+        if (span > LOG_WRITE_CHUNK) span = LOG_WRITE_CHUNK;
+        if (span > 0) memcpy(s_writer_buf, s_log_buffer + s_log_tail, span);
+        LOG_MUTEX_UNLOCK();
+
+        if (dropped > 0) {
+            char dl[64];
+            int len = snprintf(dl, sizeof(dl), "[dropped %d log lines]\n", dropped);
+            if (len > 0 && s_log_fd >= 0) (void)sceIoWrite(s_log_fd, dl, (size_t)len);
+        }
+        if (span == 0) break;
+
+        while (done < span && s_log_fd >= 0) {
+            int rc = sceIoWrite(s_log_fd, s_writer_buf + done, span - done);
+            if (rc <= 0) {
+                LOG_MUTEX_LOCK();
+                log_sink_failed_locked(rc);
+                LOG_MUTEX_UNLOCK();
+                break;
+            }
+            done += (size_t)rc;
+        }
+
+        if (done > 0) wrote = 1;
+        LOG_MUTEX_LOCK();
+        /* Даже при ошибке записи кусок снимаем — иначе вечный повтор. */
+        s_log_tail = (s_log_tail + span) % LOG_BUFFER_SIZE;
+        s_log_used -= span;
+        LOG_MUTEX_UNLOCK();
+        if (done != span) break;
+    }
+    if (wrote) {
+        /* sceIoSync на медленной карте дорогой: не чаще раза в LOG_SYNC_MIN_US. */
+        u64 now = sceKernelGetSystemTimeWide();
+        if (s_force_flush || now - s_last_sync_us >= LOG_SYNC_MIN_US) {
+            s_force_flush = 0;
+            log_sync_device();
+            s_last_sync_us = sceKernelGetSystemTimeWide();
+        }
+    }
+}
+
+static int log_writer_main(SceSize args, void *argp)
+{
+    (void)args;
+    (void)argp;
+    while (!s_writer_stop) {
+        SceUInt timeout = LOG_WRITER_PERIOD_US;
+        int busy;
+        (void)sceKernelWaitSema(s_writer_sema, 1, &timeout);
+        if (s_writer_stop) break;
+        /* В реальном времени (играет звук) пишем только когда накопилось
+         * 8 КБ (раньше 3/4 буфера — при падении терялись десятки КБ хвоста) — меньше конкуренции за MS с аудио. */
+        LOG_MUTEX_LOCK();
+        busy = s_realtime_mode && !s_force_flush &&
+               s_log_used < (LOG_BUFFER_SIZE / 8);
+        LOG_MUTEX_UNLOCK();
+        if (!busy) log_flush_background();
+    }
+    return sceKernelExitDeleteThread(0);
+}
+
+static void log_writer_start(void)
+{
+    if (s_writer_tid >= 0) return;
+    s_writer_sema = sceKernelCreateSema("log_wr", 0, 0, 1, NULL);
+    if (s_writer_sema < 0) return;
+    s_writer_stop = 0;
+    s_writer_tid = sceKernelCreateThread("log_writer", log_writer_main,
+                                         LOG_WRITER_PRIO, 0x2000,
+                                         PSP_THREAD_ATTR_USER, NULL);
+    if (s_writer_tid < 0 || sceKernelStartThread(s_writer_tid, 0, NULL) < 0) {
+        if (s_writer_tid >= 0) sceKernelDeleteThread(s_writer_tid);
+        s_writer_tid = -1;
+        sceKernelDeleteSema(s_writer_sema);
+        s_writer_sema = -1;
+    }
+}
+
+static void log_writer_signal(void)
+{
+    if (s_writer_sema >= 0) sceKernelSignalSema(s_writer_sema, 1);
+}
+
+static void log_writer_stop(void)
+{
+    SceUInt timeout = 3000000;
+    if (s_writer_tid < 0) return;
+    s_writer_stop = 1;
+    log_writer_signal();
+    if (sceKernelWaitThreadEnd(s_writer_tid, &timeout) < 0) {
+        sceKernelTerminateDeleteThread(s_writer_tid);
+    }
+    s_writer_tid = -1;
+    if (s_writer_sema >= 0) {
+        sceKernelDeleteSema(s_writer_sema);
+        s_writer_sema = -1;
+    }
 }
 
 void logger_init(const char *path)
@@ -248,11 +418,13 @@ void logger_init(const char *path)
         }
     }
 
+    log_writer_start();
 }
 
 void logger_shutdown(void)
 {
-    // Final flush of remaining data
+    // Остановить фонового писателя, затем финальный синхронный сброс.
+    log_writer_stop();
     log_flush_internal();
     
     // Write shutdown message directly
@@ -278,7 +450,25 @@ void logger_shutdown(void)
 
 void logger_flush(void)
 {
-    // Force immediate flush of buffered logs
+#ifdef YM_LOG_EAGER
+    // С фоновым писателем — только разбудить его (не ждём Memory Stick).
+    if (s_writer_tid >= 0) {
+        log_writer_signal();
+        return;
+    }
+    log_flush_internal();
+#endif
+    // Ленивый режим: запись идёт по порогу/таймеру, см. комментарий выше.
+}
+
+void logger_flush_now(void)
+{
+    // Сон/питание: записать накопленное и синхронизировать FAT.
+    s_force_flush = 1;
+    if (s_writer_tid >= 0) {
+        log_writer_signal();
+        return;
+    }
     log_flush_internal();
 }
 
@@ -328,11 +518,26 @@ void logLine(const char *fmt, ...)
                 s_log_ready && s_log_fd >= 0) {
                 need_flush = 1;
             }
+            /* Не даём буферу переполниться и в realtime-режиме (аудио). */
+            if (s_realtime_mode && s_log_used >= (LOG_BUFFER_SIZE * 5 / 8) &&
+                s_log_ready && s_log_fd >= 0) {
+                need_flush = 1;
+            }
             LOG_MUTEX_UNLOCK();
 
             if (need_flush) {
-                log_flush_internal();
+                if (s_writer_tid >= 0) log_writer_signal();
+                else log_flush_internal();
             }
+            return;
+        }
+
+        if (s_writer_tid >= 0) {
+            /* Буфер полон, писатель отстаёт (медленная карта): не ждём —
+             * строку теряем, считаем в dropped, будим писателя. */
+            s_log_dropped++;
+            LOG_MUTEX_UNLOCK();
+            log_writer_signal();
             return;
         }
 

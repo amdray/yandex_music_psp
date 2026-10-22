@@ -9,6 +9,7 @@
 #include "services/ym_api.h"
 #include "services/last_play.h"
 #include "services/playback_controller.h"
+#include "services/speed_test.h"
 #include "app/app_state.h"
 #include "core/logger.h"
 #include "fonts/text.h"
@@ -32,6 +33,7 @@ static const MenuItem kMainMenu[] = {
 static const MenuItem kSettingsMenu[] = {
     { LOCALE_MENU_ACCOUNT,     SCREEN_ACCOUNT,       0 },
     { LOCALE_MENU_NET_INFO,    SCREEN_NET_INFO,      0 },
+    { LOCALE_MENU_SPEED_TEST,  SCREEN_COUNT,         0 },
     { LOCALE_MENU_HELP,        SCREEN_HELP,          0 },
     { LOCALE_MENU_EQ,          SCREEN_EQ,            0 },
     { LOCALE_MENU_AUDIO_QUALITY, SCREEN_COUNT,       0 },
@@ -80,10 +82,18 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
                 color = ctx->pending_color;
             }
             if (ctx->items[i].label == LOCALE_MENU_AUDIO_QUALITY) {
-                const char *value = locale_get(
-                    strcmp(ym_api_download_quality(), "hq") == 0
-                        ? LOCALE_QUALITY_HIGH : LOCALE_QUALITY_NORMAL);
-                snprintf(quality_row, sizeof(quality_row), "%s: %s", label, value);
+                const char *q = ym_api_download_quality();
+                LocaleKey key = LOCALE_QUALITY_NORMAL;
+                if (q && strcmp(q, "hq") == 0) key = LOCALE_QUALITY_HIGH;
+                else if (q && strcmp(q, "lq") == 0) key = LOCALE_QUALITY_LOW;
+                else if (q && strcmp(q, "mp3") == 0) key = LOCALE_QUALITY_MP3;
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                         locale_get(key));
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_SPEED_TEST) {
+                char st[40];
+                speed_test_status(st, sizeof(st));
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label, st);
                 label = quality_row;
             } else if (ctx->items[i].label == LOCALE_MENU_AUTOPLAY) {
                 const char *value = locale_get(
@@ -175,12 +185,26 @@ void ui_screen_menu_render(const AppState *state)
 void ui_screen_settings_handle_input(AppState *state, const InputState *input)
 {
     if (state->settings_index >= 0 && state->settings_index < SETTINGS_MENU_COUNT &&
+        kSettingsMenu[state->settings_index].label == LOCALE_MENU_SPEED_TEST &&
+        (input->pressed & PSP_CTRL_CROSS)) {
+        speed_test_request();
+    } else if (state->settings_index >= 0 && state->settings_index < SETTINGS_MENU_COUNT &&
         kSettingsMenu[state->settings_index].label == LOCALE_MENU_AUDIO_QUALITY &&
         (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
         !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
-        const char *quality = (input->pressed & PSP_CTRL_RIGHT) ? "hq" : "nq";
-        if (strcmp(ym_api_download_quality(), quality) != 0) {
-            ym_api_download_set_quality(quality);
+        static const char *const kQualityOrder[] = { "lq", "nq", "hq", "mp3" };
+        const char *cur = ym_api_download_quality();
+        int idx = 1; /* nq */
+        if (cur && strcmp(cur, "lq") == 0) idx = 0;
+        else if (cur && strcmp(cur, "hq") == 0) idx = 2;
+        else if (cur && strcmp(cur, "mp3") == 0) idx = 3;
+        if (input->pressed & PSP_CTRL_RIGHT) {
+            idx = (idx + 1) % 4;
+        } else {
+            idx = (idx + 4 - 1) % 4;
+        }
+        if (strcmp(cur ? cur : "", kQualityOrder[idx]) != 0) {
+            ym_api_download_set_quality(kQualityOrder[idx]);
             eq_save();
         }
     } else if (state->settings_index >= 0 &&

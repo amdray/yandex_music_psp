@@ -157,8 +157,15 @@ int fs_getstat(const char *path, SceIoStat *st)
 int fs_remove(const char *path)
 {
     int rc;
+    char abs_path[512];
+    const char *use_path = path;
+
+    if (fs_make_abs_path(path, abs_path, sizeof(abs_path)) == 0) {
+        use_path = abs_path;
+    }
+
     fs_lock_internal();
-    rc = sceIoRemove(path);
+    rc = sceIoRemove(use_path);
     fs_unlock_internal();
     return rc;
 }
@@ -485,6 +492,73 @@ void fs_evict_oldest(const char *dir, int keep)
             list[j] = list[j + 1];
         }
         count--;
+    }
+    free(list);
+}
+
+/* Удалить все файлы каталога, кроме имён (до первой точки) из keep_ids.
+ * Каталог сканируется целиком (до FS_EVICT_SCAN_MAX), удаление идёт после
+ * закрытия каталога — безопасно для FAT. Вызывать из worker-потоков. */
+void fs_evict_except(const char *dir, const char *const *keep_ids,
+                     int keep_count)
+{
+    char abs_dir[512];
+    char full[576];
+    SceUID dfd;
+    SceIoDirent ent;
+    FsEvictEntry *list;
+    int count = 0, i;
+
+    if (!dir || !dir[0] || !keep_ids || keep_count <= 0) {
+        return;
+    }
+    if (fs_make_abs_path(dir, abs_dir, sizeof(abs_dir)) != 0) {
+        return;
+    }
+    list = (FsEvictEntry *)malloc(sizeof(FsEvictEntry) * FS_EVICT_SCAN_MAX);
+    if (!list) {
+        return;
+    }
+    memset(&ent, 0, sizeof(ent));
+    dfd = sceIoDopen(abs_dir);
+    if (dfd < 0) {
+        free(list);
+        return;
+    }
+    while (count < FS_EVICT_SCAN_MAX &&
+           sceIoDread(dfd, &ent) > 0) {
+        if (ent.d_name[0] == '\0' || strcmp(ent.d_name, ".") == 0 ||
+            strcmp(ent.d_name, "..") == 0) {
+            continue;
+        }
+        if (FIO_S_ISDIR(ent.d_stat.st_mode)) {
+            continue;
+        }
+        snprintf(list[count].name, sizeof(list[count].name),
+                 "%.63s", ent.d_name);
+        count++;
+        memset(&ent, 0, sizeof(ent));
+    }
+    sceIoDclose(dfd);
+
+    for (i = 0; i < count; i++) {
+        int k, keep = 0;
+        for (k = 0; k < keep_count; k++) {
+            const char *id = keep_ids[k];
+            size_t len;
+            if (!id || !id[0]) continue;
+            len = strlen(id);
+            if (strncmp(list[i].name, id, len) == 0 &&
+                (list[i].name[len] == '.' || list[i].name[len] == '\0')) {
+                keep = 1;
+                break;
+            }
+        }
+        if (keep) continue;
+        snprintf(full, sizeof(full), "%s/%s", abs_dir, list[i].name);
+        if (sceIoRemove(full) == 0) {
+            logLine("fs: evicted '%s'\n", list[i].name);
+        }
     }
     free(list);
 }

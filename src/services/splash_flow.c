@@ -3,6 +3,7 @@
 // #define DISABLE_NETWORK_INIT 1
 
 #include <pspthreadman.h>
+#include <psprtc.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -211,6 +212,23 @@ static int splash_image_load_cache(SplashFlow *flow)
     return 0;
 }
 
+/* Кэш заставки свежее 7 суток — скачивание на старте не нужно: оно стоило
+ * ~6 с (загрузка + две записи на медленную карту). */
+static int splash_cache_is_fresh(void)
+{
+    SceIoStat st;
+    ScePspDateTime now;
+    u64 t_now = 0, t_file = 0;
+
+    memset(&st, 0, sizeof(st));
+    if (fs_getstat(SPLASH_IMAGE_CACHE_PATH, &st) != 0) return 0;
+    if (sceRtcGetCurrentClockLocalTime(&now) != 0) return 0;
+    if (sceRtcGetTick(&now, &t_now) != 0 ||
+        sceRtcGetTick(&st.sce_st_mtime, &t_file) != 0) return 0;
+    return t_now >= t_file &&
+           (t_now - t_file) < 7ULL * 24ULL * 3600ULL * 1000000ULL;
+}
+
 static void splash_image_finish_download(SplashFlow *flow)
 {
     void *pixels = NULL;
@@ -220,6 +238,36 @@ static void splash_image_finish_download(SplashFlow *flow)
     if (!flow->image_download_data || flow->image_download_size <= 0) {
         logLine("splash: image worker published no data\n");
         return;
+    }
+    /* Та же картинка, что уже в кэше (обычный случай) — ничего не пишем:
+     * на медленной карте stage+cache запись стоила до ~25 с старта. */
+    if (flow->image_pixels) {
+        SceIoStat st;
+        memset(&st, 0, sizeof(st));
+        if (fs_getstat(SPLASH_IMAGE_CACHE_PATH, &st) >= 0 &&
+            st.st_size == (SceOff)flow->image_download_size) {
+            unsigned char *old = (unsigned char *)malloc((size_t)flow->image_download_size);
+            int same = 0;
+            if (old) {
+                SceUID fd = fs_open(SPLASH_IMAGE_CACHE_PATH, PSP_O_RDONLY, 0777);
+                if (fd >= 0) {
+                    int got = fs_read(fd, old, (size_t)flow->image_download_size);
+                    fs_close(fd);
+                    same = got == flow->image_download_size &&
+                           memcmp(old, flow->image_download_data,
+                                  (size_t)flow->image_download_size) == 0;
+                }
+                free(old);
+            }
+            if (same) {
+                /* Перезапись нужна лишь чтобы обновить mtime (раз в 7 суток). */
+                (void)fs_write_atomic(SPLASH_IMAGE_CACHE_PATH,
+                                      flow->image_download_data,
+                                      (size_t)flow->image_download_size);
+                logLine("splash: image unchanged, cache touched\n");
+                return;
+            }
+        }
     }
     if (fs_ensure_dir(SPLASH_IMAGE_STAGE_PATH) == 0 &&
         fs_write_atomic(SPLASH_IMAGE_STAGE_PATH, flow->image_download_data,
@@ -603,6 +651,11 @@ void splash_flow_tick(SplashFlow *flow, AppState *app)
         }
         break;
     case SPLASH_STATE_IMAGE_START:
+        if (flow->image_pixels && splash_cache_is_fresh()) {
+            logLine("splash: image cache fresh, skip refresh\n");
+            splash_set_state(flow, SPLASH_STATE_AUTH_START);
+            break;
+        }
         flow->image_cancel = 0;
         flow->image_published = 0U;
         flow->image_result = -2;

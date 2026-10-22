@@ -174,9 +174,17 @@ int osk_input_text(const char *title, const char *initial,
     {
         unsigned iter = 0;
         int st = 0;
+        int shutdown_sent = 0;
         while ((st = sceUtilityOskGetStatus()) != PSP_UTILITY_DIALOG_NONE) {
             sceDisplayWaitVblankStart();
-            sceUtilityOskUpdate(1);
+            if (st == PSP_UTILITY_DIALOG_VISIBLE) {
+                sceUtilityOskUpdate(1);
+            } else if (st == PSP_UTILITY_DIALOG_QUIT && !shutdown_sent) {
+                /* Пользователь закрыл клавиатуру: без ShutdownStart статус
+                 * навсегда остаётся QUIT (3) — вечный цикл, 0 FPS. */
+                sceUtilityOskShutdownStart();
+                shutdown_sent = 1;
+            }
             if (++iter % 600 == 0) {
                 logLine("osk: still in dialog iter=%u st=%d\n", iter, st);
                 logger_flush();

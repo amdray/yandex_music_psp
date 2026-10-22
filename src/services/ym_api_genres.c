@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include <cjson/cJSON.h>
+#include "services/libc_guard.h"
 
 #include "core/logger.h"
 #include "services/net_http.h"
@@ -120,7 +121,7 @@ int ym_api_genres_load(const char *token, const char *language)
         goto done;
     }
 
-    root = cJSON_ParseWithLength(response.body, (size_t)response.body_size);
+    root = ym_json_parse_len(response.body, (size_t)response.body_size);
     result = root ? cJSON_GetObjectItemCaseSensitive(root, "result") : NULL;
     if (!cJSON_IsArray(result)) {
         logLine("ym_genres: result is not an array\n");

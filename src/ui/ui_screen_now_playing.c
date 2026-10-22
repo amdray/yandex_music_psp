@@ -47,7 +47,9 @@ static void format_sample_rate(int sample_rate, char *out, size_t out_size)
     if ((sample_rate % 1000) == 0) {
         snprintf(out, out_size, "%d kHz", sample_rate / 1000);
     } else {
-        snprintf(out, out_size, "%.1f kHz", sample_rate / 1000.0f);
+        /* Без %f: dtoa newlib не потокобезопасен (см. libc_guard.h). */
+        int khz10 = (sample_rate + 50) / 100;
+        snprintf(out, out_size, "%d.%d kHz", khz10 / 10, khz10 % 10);
     }
 }
 
@@ -69,6 +71,7 @@ static void draw_now_playing_bottom_bar(const UiLayoutWidget *status_widget,
         } else if (snapshot) {
             char bitrate[16];
             char sample_rate[16];
+            const char *codec_icon;
             int icon_width = 0;
             int icon_height = 0;
 
@@ -80,14 +83,31 @@ static void draw_now_playing_bottom_bar(const UiLayoutWidget *status_widget,
             format_sample_rate(snapshot->sample_rate,
                                sample_rate, sizeof(sample_rate));
 
-            if (mp3 &&
-                ui_icon_atlas_get_size("in_mp3", &icon_width,
-                                       &icon_height) == 0) {
+            codec_icon = "in_mp3";
+            if (strcmp(snapshot->codec, "flac") == 0) {
+                codec_icon = "in_flac";
+            } else if (strcmp(snapshot->codec, "aac") == 0) {
+                codec_icon = "in_aac";
+            }
+            icon_width = 0;
+            icon_height = 0;
+            if (ui_icon_atlas_get_size(codec_icon, &icon_width,
+                                       &icon_height) != 0) {
+                codec_icon = "in_mp3";
+                icon_width = 0;
+                icon_height = 0;
+                if (ui_icon_atlas_get_size("in_mp3", &icon_width,
+                                           &icon_height) != 0) {
+                    icon_width = 0;
+                    icon_height = 0;
+                }
+            }
+            if (mp3 && icon_width > 0) {
                 int icon_x;
                 int icon_y;
                 icon_x = (int)mp3->x + ((int)mp3->w - icon_width) / 2;
                 icon_y = (int)mp3->y + ((int)mp3->h - icon_height) / 2;
-                ui_icon_atlas_draw("in_mp3", icon_x, icon_y, mp3->color);
+                ui_icon_atlas_draw(codec_icon, icon_x, icon_y, mp3->color);
             }
             if (bitrate_widget && bitrate[0]) {
                 ui_draw_text(bitrate_widget->x, bitrate_widget->y,

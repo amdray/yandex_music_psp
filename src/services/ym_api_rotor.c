@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include <cjson/cJSON.h>
+#include "services/libc_guard.h"
 
 #include "core/logger.h"
 #include "services/api_parser.h"
@@ -352,7 +353,7 @@ int ym_api_rotor_session_new(YmApiContext *ctx,
         return verdict;
     }
 
-    root = cJSON_ParseWithLength(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: session/new parse failed\n");
@@ -485,7 +486,7 @@ int ym_api_rotor_session_tracks(YmApiContext *ctx,
         return verdict;
     }
 
-    root = cJSON_ParseWithLength(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: session/tracks parse failed\n");
@@ -582,7 +583,7 @@ static int rotor_post_feedback(const YmApiContext *ctx,
         net_http_response_free(&resp);
         return verdict;
     }
-    root = cJSON_ParseWithLength(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: feedback parse failed\n");
@@ -638,6 +639,7 @@ static int rotor_track_event(const YmApiContext *ctx,
     char timestamp[YM_ROTOR_TIMESTAMP_SIZE];
     char composite[LIST_INDEX_ID_SIZE + 16];
     char event_body[512];
+    char total_s[32], len_s[32];
     int event_len;
 
     if (!batch_id || !batch_id[0] || !track_id || !track_id[0]) {
@@ -650,20 +652,23 @@ static int rotor_track_event(const YmApiContext *ctx,
                                   composite, sizeof(composite)) != 0) {
         return -1;
     }
+    /* Без %.3f: dtoa newlib не потокобезопасен (см. libc_guard.h). */
+    ym_fmt_fixed(total_s, sizeof(total_s), total_played_s, 3);
+    ym_fmt_fixed(len_s, sizeof(len_s), track_len_s, 3);
     if (has_total) {
         event_len = snprintf(event_body, sizeof(event_body),
                              "\"timestamp\":\"%s\",\"type\":\"%s\","
-                             "\"totalPlayedSeconds\":%.3f,"
-                             "\"trackLengthSeconds\":%.3f,"
+                             "\"totalPlayedSeconds\":%s,"
+                             "\"trackLengthSeconds\":%s,"
                              "\"trackId\":\"%s\"",
                              timestamp, event_type,
-                             total_played_s, track_len_s, composite);
+                             total_s, len_s, composite);
     } else {
         event_len = snprintf(event_body, sizeof(event_body),
                              "\"timestamp\":\"%s\",\"type\":\"%s\","
-                             "\"trackLengthSeconds\":%.3f,"
+                             "\"trackLengthSeconds\":%s,"
                              "\"trackId\":\"%s\"",
-                             timestamp, event_type, track_len_s, composite);
+                             timestamp, event_type, len_s, composite);
     }
     if (event_len < 0 || (size_t)event_len >= sizeof(event_body)) {
         return -1;
@@ -737,6 +742,7 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
     char play_enc[128];
     char ts_enc[128];
     char now_enc[128];
+    char len_s[32];
     NetHttpResponse resp;
     cJSON *root = NULL;
     cJSON *result_node = NULL;
@@ -754,14 +760,15 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
         rotor_url_encode_component(client_now_utc, now_enc, sizeof(now_enc)) != 0) {
         return -1;
     }
+    ym_fmt_fixed(len_s, sizeof(len_s), track_len_s, 3);  /* без %.3f */
     body_len = snprintf(body, sizeof(body),
                         "track-id=%s&from-cache=%s&from=yandex-music-psp"
                         "&play-id=%s&uid=%d&timestamp=%s"
-                        "&track-length-seconds=%.3f"
+                        "&track-length-seconds=%s"
                         "&total-played-seconds=0&end-position-seconds=0"
                         "&album-id=%d&client-now=%s",
                         track_enc, from_cache ? "true" : "false",
-                        play_enc, uid, ts_enc, track_len_s,
+                        play_enc, uid, ts_enc, len_s,
                         album_id, now_enc);
     if (body_len < 0 || (size_t)body_len >= sizeof(body)) {
         return -1;
@@ -790,7 +797,7 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
         net_http_response_free(&resp);
         return verdict;
     }
-    root = cJSON_ParseWithLength(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: play-audio parse failed\n");
@@ -998,7 +1005,7 @@ int ym_api_rotor_album_wave_cards(YmApiContext *ctx, int album_id,
         net_http_response_free(&resp);
         return v;
     }
-    root = cJSON_Parse(resp.body);
+    root = ym_json_parse(resp.body);
     net_http_response_free(&resp);
     if (!root) {
         return YM_ROTOR_ERR;

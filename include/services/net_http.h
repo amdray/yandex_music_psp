@@ -38,6 +38,27 @@ typedef enum {
     HTTP_POST = 1
 } HttpMethod;
 
+// Простой cookie-jar для веб-флоу (Яндекс Паспорт, вход по QR): хранит
+// name=value из Set-Cookie, отдаёт их заголовком Cookie. Атрибуты (Domain,
+// Path) не учитываются — jar живёт в пределах одного логина к одному хосту.
+#define HTTP_JAR_MAX   24
+#define HTTP_JAR_NAME  48
+#define HTTP_JAR_VALUE 768
+typedef struct {
+    char name[HTTP_JAR_NAME];
+    char value[HTTP_JAR_VALUE];
+} HttpCookie;
+typedef struct {
+    int count;
+    HttpCookie items[HTTP_JAR_MAX];
+} HttpCookieJar;
+
+void http_jar_clear(HttpCookieJar *jar);
+// "a=1; b=2" в out. Возврат длины (без NUL) или -1, если не влезло.
+int http_jar_format(const HttpCookieJar *jar, char *out, int out_sz);
+// Значение cookie или NULL.
+const char *http_jar_get(const HttpCookieJar *jar, const char *name);
+
 // Описание HTTP-запроса. Инициализируется через designated initializers;
 // незаполненные поля должны быть нулевыми.
 typedef struct {
@@ -53,6 +74,10 @@ typedef struct {
     int         range_enabled;  // только GET/http_stream; отправить Range
     int         range_start;    // абсолютное начало Range: bytes=<offset>-
     int         range_total;    // ожидаемый полный размер объекта для строгой проверки 206
+    const char *extra_headers;  // сырые строки "Name: value\r\n" (или NULL)
+    const char *user_agent;     // NULL => "PSP"
+    int         no_client_header; // не слать X-Yandex-Music-Client (чужие хосты)
+    HttpCookieJar *cookie_jar;  // только http_request: Cookie + приём Set-Cookie
 } HttpRequest;
 
 // Приёмник тела для потокового запроса. Любое поле опционально;

@@ -11,12 +11,15 @@
 //
 // Стили (переключение в настройках, выбор хранится в config/glow.cfg):
 //  CLASSIC — 4 мягких пятна; STRANDS — текучие нити;
-//  WEB — порт веб-вайба Яндекса (по умолчанию).
+//  WEB — порт веб-вайба Яндекса;
+//  MESH — mesh gradient по мотивам Paper Shaders, на сетке вершин GPU
+//  (по умолчанию, лёгкий: без текстуры и VFPU).
 #define GLOW_STYLE_CLASSIC 0
 #define GLOW_STYLE_STRANDS 1
 #define GLOW_STYLE_WEB 2
-#define GLOW_STYLE_COUNT 3
-#define GLOW_STYLE_DEFAULT GLOW_STYLE_WEB
+#define GLOW_STYLE_MESH 3
+#define GLOW_STYLE_COUNT 4
+#define GLOW_STYLE_DEFAULT GLOW_STYLE_MESH
 
 void glow_bg_init(void);
 void glow_bg_free(void);

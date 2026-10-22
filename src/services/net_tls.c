@@ -442,7 +442,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
     {
         int nb = 1;
         int so_rc = sceNetInetSetsockopt(sock, SOL_SOCKET, SO_NONBLOCK, &nb, sizeof(nb));
-        logLine("tls: set SO_NONBLOCK rc=%d\n", so_rc);
+        if (so_rc != 0) logLine("tls: set SO_NONBLOCK rc=%d\n", so_rc);
         if (so_rc < 0) {
             tls_conn_cleanup(out_conn);
             return NET_TLS_ERR_CONNECT;
@@ -608,7 +608,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
                 } else {
                     hs_want_write++;
                 }
-                if (hs_iter == 10 || hs_iter == 50 || hs_iter % 100 == 0) {
+                if (hs_iter % 300 == 0) {
                     u64 hs_elapsed_ms = (sceKernelGetSystemTimeWide() - hs_start) / 1000;
                     logLine("tls: hs alive iter=%d elapsed=%llu ms rd=%d wr=%d\n",
                             hs_iter, hs_elapsed_ms, hs_want_read, hs_want_write);
@@ -744,9 +744,10 @@ static int psp_net_send(void *ctx, const unsigned char *buf, size_t len)
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
 
-    if (cnt <= 20 || cnt % 20 == 0) {
+    if (cnt <= 2) {
+        /* Без logger_flush: синхронная запись на MS в горячем пути
+         * отправки дёргала скорость скачивания. */
         logLine("tls: send#%d fd=%d len=%d tid=%d\n", cnt, conn->net.fd, (int)len, tid);
-        logger_flush();
     }
 
     int ret = sceNetInetSend(conn->net.fd, buf, (int)len, 0);

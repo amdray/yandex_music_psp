@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "cjson/cJSON.h"
+#include "services/libc_guard.h"
 #include "core/logger.h"
 #include "services/net_http.h"
 
@@ -41,7 +42,7 @@ int ym_api_wave_station_tracks(YmApiContext *ctx, const char *station_id,
         net_http_response_free(&resp);
         return -1;
     }
-    root = cJSON_Parse(resp.body);
+    root = ym_json_parse(resp.body);
     if (!root) {
         logLine("ym_api_wave: parse failed\n");
         net_http_response_free(&resp);

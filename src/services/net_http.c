@@ -1,4 +1,4 @@
-#include "services/net_http.h"
+﻿#include "services/net_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +37,7 @@ static int stream_chunked_consume(const char *data, int size,
                                   int *line_len,
                                   int *out_done);
 static int write_fully(SceUID fd, const void *buf, int size);
+static void http_jar_absorb(HttpCookieJar *jar, const char *hdr, int len);
 
 #define HTTP_ALLOC_WARN_THRESHOLD (512 * 1024)
 #define HTTP_CHUNK_LIMIT (256 * 1024)
@@ -65,18 +66,20 @@ static int http_build_request(char *buf, size_t bufsz, const HttpRequest *req,
     size_t off = 0;
     int n;
 
+    const char *ua = req->user_agent ? req->user_agent : "PSP";
+
     if (port == 443) {
         n = snprintf(buf + off, bufsz - off,
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s\r\n"
-                     "User-Agent: PSP\r\n",
-                     req->method == HTTP_POST ? "POST" : "GET", path, host);
+                     "User-Agent: %s\r\n",
+                     req->method == HTTP_POST ? "POST" : "GET", path, host, ua);
     } else {
         n = snprintf(buf + off, bufsz - off,
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s:%d\r\n"
-                     "User-Agent: PSP\r\n",
-                     req->method == HTTP_POST ? "POST" : "GET", path, host, port);
+                     "User-Agent: %s\r\n",
+                     req->method == HTTP_POST ? "POST" : "GET", path, host, port, ua);
     }
     if (n < 0 || (size_t)n >= bufsz - off) return -1;
     off += (size_t)n;
@@ -110,6 +113,25 @@ static int http_build_request(char *buf, size_t bufsz, const HttpRequest *req,
 
     if (req->identity_encoding) {
         n = snprintf(buf + off, bufsz - off, "Accept-Encoding: identity\r\n");
+        if (n < 0 || (size_t)n >= bufsz - off) return -1;
+        off += (size_t)n;
+    }
+
+    if (req->extra_headers && req->extra_headers[0]) {
+        n = snprintf(buf + off, bufsz - off, "%s", req->extra_headers);
+        if (n < 0 || (size_t)n >= bufsz - off) return -1;
+        off += (size_t)n;
+    }
+
+    if (req->cookie_jar && req->cookie_jar->count > 0) {
+        int cl;
+        n = snprintf(buf + off, bufsz - off, "Cookie: ");
+        if (n < 0 || (size_t)n >= bufsz - off) return -1;
+        off += (size_t)n;
+        cl = http_jar_format(req->cookie_jar, buf + off, (int)(bufsz - off));
+        if (cl < 0) return -1;
+        off += (size_t)cl;
+        n = snprintf(buf + off, bufsz - off, "\r\n");
         if (n < 0 || (size_t)n >= bufsz - off) return -1;
         off += (size_t)n;
     }
@@ -176,8 +198,10 @@ static int http_open(const HttpRequest *req, const char *accept,
                      int send_client_header, NetTlsConnection *conn)
 {
     char host[128];
-    char path[256];
-    char request[1536];
+    char path[512];
+    char request_stack[1536];
+    char *request = request_stack;
+    size_t request_cap = sizeof(request_stack);
     int port = 443;
     int payload_length = 0;
 
@@ -205,18 +229,40 @@ static int http_open(const HttpRequest *req, const char *accept,
         }
     }
 
-    if (http_build_request(request, sizeof(request), req, host, port, path,
+    /* Р”Р»РёРЅРЅС‹Рµ Р·Р°РіРѕР»РѕРІРєРё (cookie РїР°СЃРїРѕСЂС‚Р° ~2-3 РљР‘) вЂ” РІ РєСѓС‡Рµ; РѕР±С‹С‡РЅС‹Рµ
+     * Р·Р°РїСЂРѕСЃС‹, РєР°Рє Рё СЂР°РЅСЊС€Рµ, С†РµР»РёРєРѕРј РЅР° СЃС‚РµРєРµ. */
+    {
+        size_t extra = 0;
+        if (req->extra_headers) extra += strlen(req->extra_headers);
+        if (req->cookie_jar && req->cookie_jar->count > 0)
+            extra += (size_t)req->cookie_jar->count *
+                     (HTTP_JAR_NAME + HTTP_JAR_VALUE + 4) + 16;
+        if (extra > 0) {
+            request_cap = sizeof(request_stack) + extra;
+            request = (char *)malloc(request_cap);
+            if (!request) {
+                logLine("http: request alloc failed %u\n", (unsigned)request_cap);
+                net_tls_disconnect(conn);
+                return -1;
+            }
+        }
+    }
+
+    if (http_build_request(request, request_cap, req, host, port, path,
                            accept, payload_length, send_client_header) != 0) {
         logLine("http: request header too large\n");
+        if (request != request_stack) free(request);
         net_tls_disconnect(conn);
         return -1;
     }
 
     if (http_write_all(conn, request, strlen(request)) != 0) {
         logLine("http: write header failed\n");
+        if (request != request_stack) free(request);
         net_tls_disconnect(conn);
         return NET_HTTP_ERR_TLS;
     }
+    if (request != request_stack) free(request);
 
     if (req->method == HTTP_POST && req->payload && payload_length > 0) {
         if (http_write_all(conn, req->payload, (size_t)payload_length) != 0) {
@@ -244,7 +290,7 @@ int http_request(const HttpRequest *req, NetHttpResponse *out)
 
     NetTlsConnection conn;
     {
-        int open_rc = http_open(req, accept, /*send_client_header=*/1, &conn);
+        int open_rc = http_open(req, accept, req->no_client_header ? 0 : 1, &conn);
         if (open_rc != 0) {
             return open_rc;
         }
@@ -277,6 +323,10 @@ int http_request(const HttpRequest *req, NetHttpResponse *out)
         }
         logLine("http: status=%d body_len=%d cl=%d chunked=%d\n",
                 status, body_len, content_length, chunked);
+        if (req->cookie_jar) {
+            http_jar_absorb(req->cookie_jar, response,
+                            (int)(body_ptr - response));
+        }
 
         if (chunked) {
             if (decode_chunked_body(body_ptr, body_len, &decoded, &decoded_size) != 0) {
@@ -541,7 +591,7 @@ int http_stream(const HttpRequest *req, const HttpSink *sink)
         char chunk_line[64];
         int chunk_line_len = 0;
         int stream_done = 0;
-        char read_buf[4096];
+        char read_buf[8192];
 
         if (body_len > 0) {
             if (stream_chunked_consume(body_ptr, body_len, stream_emit, &emit,
@@ -580,7 +630,7 @@ int http_stream(const HttpRequest *req, const HttpSink *sink)
         }
         ret = 0;
     } else {
-        char read_buf[4096];
+        char read_buf[8192];
 
         // Body bytes already present in the header buffer.
         if (body_len > 0) {
@@ -664,6 +714,113 @@ void net_http_response_free(NetHttpResponse *response)
     response->body_size = 0;
     response->status_code = 0;
     response->is_chunked = 0;
+}
+
+// ============================================================== cookie jar
+
+void http_jar_clear(HttpCookieJar *jar)
+{
+    if (jar) memset(jar, 0, sizeof(*jar));
+}
+
+const char *http_jar_get(const HttpCookieJar *jar, const char *name)
+{
+    int i;
+    if (!jar || !name) return NULL;
+    for (i = 0; i < jar->count; i++) {
+        if (strcmp(jar->items[i].name, name) == 0) return jar->items[i].value;
+    }
+    return NULL;
+}
+
+int http_jar_format(const HttpCookieJar *jar, char *out, int out_sz)
+{
+    int i, off = 0;
+    if (!jar || !out || out_sz <= 0) return -1;
+    out[0] = '\0';
+    for (i = 0; i < jar->count; i++) {
+        int n = snprintf(out + off, (size_t)(out_sz - off), "%s%s=%s",
+                         off ? "; " : "", jar->items[i].name,
+                         jar->items[i].value);
+        if (n < 0 || n >= out_sz - off) return -1;
+        off += n;
+    }
+    return off;
+}
+
+static void http_jar_remove(HttpCookieJar *jar, int idx)
+{
+    if (idx < 0 || idx >= jar->count) return;
+    if (idx != jar->count - 1) jar->items[idx] = jar->items[jar->count - 1];
+    jar->count--;
+}
+
+// РћРґРЅР° СЃС‚СЂРѕРєР° "Set-Cookie: name=value; Attr...". line РЅРµ NUL-С‚РµСЂРјРёРЅРёСЂРѕРІР°РЅР°.
+static void http_jar_set_line(HttpCookieJar *jar, const char *v, const char *end)
+{
+    const char *eq, *semi;
+    char name[HTTP_JAR_NAME];
+    size_t nlen, vlen;
+    int i, expired = 0;
+
+    while (v < end && (*v == ' ' || *v == '\t')) v++;
+    semi = memchr(v, ';', (size_t)(end - v));
+    if (!semi) semi = end;
+    eq = memchr(v, '=', (size_t)(semi - v));
+    if (!eq || eq == v) return;
+    nlen = (size_t)(eq - v);
+    vlen = (size_t)(semi - eq - 1);
+    if (nlen >= sizeof(name) || vlen >= HTTP_JAR_VALUE) {
+        logLine("http: cookie too long (n=%u v=%u), skipped\n",
+                (unsigned)nlen, (unsigned)vlen);
+        return;
+    }
+    memcpy(name, v, nlen);
+    name[nlen] = '\0';
+    /* РЈРґР°Р»РµРЅРёРµ: РїСѓСЃС‚РѕРµ Р·РЅР°С‡РµРЅРёРµ, Max-Age=0 РёР»Рё Expires РІ 1970. */
+    if (vlen == 0) expired = 1;
+    {
+        const char *a = semi;
+        while (a < end && !expired) {
+            if ((size_t)(end - a) >= 9 && strncasecmp(a, "Max-Age=0", 9) == 0 &&
+                (a + 9 == end || a[9] == ';' || a[9] == ' ')) expired = 1;
+            if ((size_t)(end - a) >= 4 && strncmp(a, "1970", 4) == 0) expired = 1;
+            a++;
+        }
+    }
+    for (i = 0; i < jar->count; i++) {
+        if (strcmp(jar->items[i].name, name) == 0) break;
+    }
+    if (expired) {
+        if (i < jar->count) http_jar_remove(jar, i);
+        return;
+    }
+    if (i == jar->count) {
+        if (jar->count >= HTTP_JAR_MAX) {
+            logLine("http: cookie jar full, '%s' skipped\n", name);
+            return;
+        }
+        jar->count++;
+        memcpy(jar->items[i].name, name, nlen + 1);
+    }
+    memcpy(jar->items[i].value, eq + 1, vlen);
+    jar->items[i].value[vlen] = '\0';
+}
+
+// Р Р°Р·РѕР±СЂР°С‚СЊ РІСЃРµ Set-Cookie РёР· Р±Р»РѕРєР° Р·Р°РіРѕР»РѕРІРєРѕРІ [hdr, hdr+len).
+static void http_jar_absorb(HttpCookieJar *jar, const char *hdr, int len)
+{
+    const char *p = hdr, *end = hdr + len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t)(end - p));
+        const char *le = nl ? nl : end;
+        const char *lt = le;
+        if (lt > p && lt[-1] == '\r') lt--;
+        if (lt - p > 11 && strncasecmp(p, "Set-Cookie:", 11) == 0) {
+            http_jar_set_line(jar, p + 11, lt);
+        }
+        p = nl ? nl + 1 : end;
+    }
 }
 
 // ============================================================ helper bodies

@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "cjson/cJSON.h"
+#include "services/libc_guard.h"
 #include "core/fs.h"
 #include "core/logger.h"
 #include "services/net_http.h"
@@ -67,6 +68,9 @@ static void save_response_dump(const char *path, const NetHttpResponse *resp)
     char abs_path[512];
     int rc;
 
+    if (!YM_DEBUG_RESPONSE_DUMPS) {
+        return;  /* см. logger.h: дампы выключены (медленная карта) */
+    }
     if (!path || !resp || !resp->body || resp->body_size <= 0) {
         return;
     }
@@ -108,7 +112,7 @@ int ym_api_liked_albums(YmApiContext *ctx, int uid,
     if (fetch_json(ctx, url, &resp) != 0) {
         return -1;
     }
-    root = cJSON_Parse(resp.body);
+    root = ym_json_parse(resp.body);
     if (!root) {
         logLine("ym_api_albums: parse failed\n");
         net_http_response_free(&resp);
@@ -211,7 +215,7 @@ int ym_api_album_tracks(YmApiContext *ctx, int album_id,
              "data/logs/album_%d_with_tracks_response.json", album_id);
     log_path[sizeof(log_path) - 1] = '\0';
     save_response_dump(log_path, &resp);
-    root = cJSON_Parse(resp.body);
+    root = ym_json_parse(resp.body);
     if (!root) {
         logLine("ym_api_albums: tracks parse failed\n");
         net_http_response_free(&resp);

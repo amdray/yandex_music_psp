@@ -50,7 +50,13 @@ static inline void net_link_accumulate(NetLinkAccumulator *state,
 {
     int previous_state;
     if (!net_link_state_valid(old_state) || !net_link_state_valid(new_state)) {
-        (void)__sync_lock_test_and_set(&state->publication_invalid, 1U);
+        /* Шум рантайма (old/new вне 0..6). Раньше это ставило
+         * publication_invalid навсегда -> все снапшоты -1 ->
+         * net_client_poll требовал выхода из процесса -> приложение
+         * МОЛЧА ЗАКРЫВАЛОСЬ (на консоли выглядело как выключение в
+         * момент открытия плейлиста — сетевой всплеск -> шумной колбэк).
+         * Игнорируем событие: последнее валидное состояние остаётся,
+         * таймауты коннекта досмотрят. */
         return;
     }
     previous_state = __sync_lock_test_and_set(&state->current_state, new_state);

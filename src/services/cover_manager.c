@@ -288,6 +288,15 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
         }
 
         // File is kept in cache, don't remove it
+        if (need_download) {
+            /* Чистка каталога = листинг + stat каждого файла на медленной
+             * карте. Не после каждой обложки, а раз в N скачанных. */
+            static int s_downloads_since_evict = 0;
+            if (++s_downloads_since_evict >= 24) {
+                s_downloads_since_evict = 0;
+                fs_evict_oldest("data/cache/covers", COVER_DISK_KEEP);
+            }
+        }
 
         // Add to pending queue
         int slot = -1;

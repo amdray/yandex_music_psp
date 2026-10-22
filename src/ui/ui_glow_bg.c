@@ -1,6 +1,7 @@
 // Светящийся фон как в Яндекс Музыке (vibe-визуализация). См. ui_glow_bg.h.
 //
-// Три стиля (переключение в настройках, выбор в config/glow.cfg):
+// Четыре стиля (переключение в настройках, выбор в config/glow.cfg);
+// MESH — по умолчанию (mesh gradient по мотивам Paper Shaders, см. ниже):
 //  CLASSIC — 4 мягких пятна (оригинал);
 //  STRANDS — текучие нити (оригинал);
 //  WEB — порт веб-вайба Яндекса (music.yandex.ru, v4.1657):
@@ -61,16 +62,6 @@
 #define WEB_EX 2.0f        // видимый диапазон effect-пространства по X
 #define WEB_EY 1.13f       // ... по Y (изотропно: EY=EX*136/240)
 #define WEB_NOISE_ZOOM 1.43f // шум в единицах десктоп-эффекта веба (2.86/2.0)
-#define WEB_RW 120          // фон-градиент: достаточно 120 колонок
-// Веб-стиль рендерится в половинном разрешении (120x68): содержимое —
-// мягкие градиенты, GPU с LINEAR-фильтром растягивает его бесплатно и гладко
-// (так делают bloom во всех играх). В 4 раза меньше попиксельной математики.
-#define WEB_W2 120
-#define WEB_H2 68
-// LUT вместо двух попиксельных делений (div ~40 тактов, 6 шт/пиксель):
-// GLOWFALL: 1/(1+11*dn) при инициализации; RECIP: 1/(outer-0.5), та же математика.
-#define GLOWFALL_N 256
-#define RECIP_N 57
 
 // Бакет палитры веба: диапазон hue + 16 стопов градиента.
 typedef struct {
@@ -146,7 +137,6 @@ static inline sfix fx_div(sfix a, sfix b)
     return q;
 }
 static int fx_floor(sfix x) { return x >= 0 ? (int)(x >> 16) : -((int)((65535 - x) >> 16)); }
-static sfix fx_clamp01(sfix x) { return x < 0 ? 0 : (x > 65536 ? 65536 : x); }
 static sfix fx_abs(sfix x) { return x < 0 ? -x : x; }
 static int mod289(int x) { int r = x % 289; return r < 0 ? r + 289 : r; }
 static int permute_i(int x) { int y = (x * 34 + 1) * x; return mod289(y); }
@@ -190,627 +180,11 @@ static float s_web_stops[WEB_STOPS][3];
 static float s_web_stops_t[WEB_STOPS][3];
 static float s_web_col[WEB_CIRCLES * 2][3];    // h(deg), s(0..1), l(0..1)
 static float s_web_col_t[WEB_CIRCLES * 2][3];
-static sfix s_wbg[WEB_RW][3];                  // фон-градиент, ед. цвета*256
-static sfix s_nfield[3][NF_H][NF_W];
-static sfix s_spark[SPARK_N];
-static unsigned char s_spark_x[GLOW_H][GLOW_W];
-static sfix s_uu[GLOW_W];
-static sfix s_vv[GLOW_H];
-static sfix s_uu2[WEB_W2];                    // половинная сетка веб-стиля
-static sfix s_vv2[WEB_H2];
-static unsigned char s_spark_x2[WEB_H2][WEB_W2];
-static sfix s_glowfall[GLOWFALL_N];           // 1/(1+11*dn), init-once
-static sfix s_recip[RECIP_N];                 // 1/(0.25+q/32), init-once
 
-// VFPU micro-probe: 1 = прогнать раз при старте и вывести биты в лог.
-// Проверяет недоказанные инструкции перед написанием ядра.
-#define VFPU_PROBE 0
-#if VFPU_PROBE
-static void vfpu_probe_run(void)
-{
-    static float pin[4] __attribute__((aligned(16)));
-    static float pin2[4] __attribute__((aligned(16)));
-    static float pout[64] __attribute__((aligned(16)));
-    unsigned *b;
-    int i;
-    pin[0] = 2.0f; pin[1] = 4.0f; pin[2] = 6.0f; pin[3] = 8.0f;
-    pin2[0] = 1.0f; pin2[1] = 2.0f; pin2[2] = 2.0f; pin2[3] = 4.0f;
-    __asm__ volatile (
-        "lv.q R000, 0(%[pin])\n\t"
-        "lv.q R001, 0(%[pin2])\n\t"
-        "vdiv.q R002, R000, R001\n\t"
-        "sv.q R002, 16(%[pout])\n\t"
-        : : [pin]"r"(pin), [pin2]"r"(pin2), [pout]"r"(pout) : "memory");
-    b = (unsigned *)pout;
-    for (i = 0; i < 2; i++) {
-        logLine("vfdivord %d: %08x %08x %08x %08x\n",
-                i, b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]);
-    }
-}
-#endif
-
-// VFPU-ядро веб-свечения: полное разрешение 240x136, float32 (точнее 16.16).
-// Стадии: 0 = выкл (C-путь половинного разрешения — сохранённый быстрый вариант),
-// 1 = фон + круги (const lay/spark), 2 = +шумовые поля, 3 = полное (все стадии).
-#define VFPU_STAGE 1
-// Временный дамп значений ядра в лог (диагностика пересвета). 0 = выкл.
-#define VFPU_DUMP 0
-
-#if VFPU_STAGE
-#include <stddef.h>
-
-// Определены ниже по файлу — форвардные объявления для каркаса ядра.
-static float s_vtime;
-static unsigned s_web_tick;
-static void hsl_to_rgb(float h, float s, float l, float *r, float *g, float *b);
-static sfix snoise3_fx(sfix x, sfix y, sfix z);
-static float fast_atan2(float y, float x);
-static sfix raw_spark_fx(sfix afx, sfix vtime);
-
-// Блоб указателей для ядра. Смещения фиксированы (проверяются в init).
-typedef struct {
-    const float *g0, *g1, *g2;       // +0,+4,+8 (стадия 2+)
-    const float *sparkf;             // +12 (стадия 3)
-    const float *bgq;                // +16: фон 240 квадов {r,g,b,0} 0..1
-    const float *colTq;              // +20: цвета [3][3][2] {c1,c2} транспонированные
-    const float *prmTq;              // +24: параметры [3][8] {invedge,inten,offx,offy,brad,bwidH,bmul,recip}
-    const float *txq;                // +28 (стадия 2+)
-    const float *tyq;                // +32 (стадия 2+)
-    const float *uvxq;               // +36: 60 квадов uvx
-    const float *nx2q;               // +40: 60 квадов nx^2
-    const float *uvyq;               // +44: 136 квадов {uvy,0,0,0}
-    const float *oneq;               // +48: {1,1,1,1}
-    float *tmp;                      // +52: выходные [60][3] {R,G,B} 0..1
-    const short *x0q;                // +56 (стадия 2+)
-    const float *k41q;               // +60: {0.41 x4}
-    const float *khalfq;             // +64: {0.5 x4}
-    const float *k7q;                // +68: {0.7 x4}
-    const float *k3q;                // +72: {0.3 x4}
-    const float *k11q;               // +76: {11.0 x4}
-    const float *vigtq;              // +80: 136 квадов {ny2*0.5 x4}
-} VfpuBlob;
-static VfpuBlob s_vblob;
-
-static float s_fbgq[240][4] __attribute__((aligned(16)));
-static float s_fbgT[60][3][4] __attribute__((aligned(16)));
-static float s_fcolT[3][3][2][4] __attribute__((aligned(16)));
-static float s_fprmT[3][8][4] __attribute__((aligned(16)));
-static float s_fuvxq[60][4] __attribute__((aligned(16)));
-static float s_fnx2q[60][4] __attribute__((aligned(16)));
-static float s_fuvyq[136][4] __attribute__((aligned(16)));
-static float s_fvigt[136][4] __attribute__((aligned(16)));
-static float s_fone[4] __attribute__((aligned(16)));
-static float s_fk41[4] __attribute__((aligned(16)));
-static float s_fkhalf[4] __attribute__((aligned(16)));
-static float s_fk7[4] __attribute__((aligned(16)));
-static float s_fk3[4] __attribute__((aligned(16)));
-static float s_fk11[4] __attribute__((aligned(16)));
-static float s_ftmp[60][3][4] __attribute__((aligned(16)));
-// Шумовые поля (стадия 2): двойной буфер + по-кадровый lerped-слой.
-// Убирает 8.7Гц-ступенчатость морфа (тёмные прыгающие bands на полном разрешении).
-static float s_fgridA[3][19][33] __attribute__((aligned(16)));
-static float s_fgridB[3][19][33] __attribute__((aligned(16)));
-static float s_fgridL[3][19][33] __attribute__((aligned(16)));
-static int s_gridParity = 0;
-static int s_gridAge = 0;
-static float s_ftxq[60][4] __attribute__((aligned(16)));
-static float s_fty2[136][4] __attribute__((aligned(16)));
-static short s_fx0q[60] __attribute__((aligned(16)));
-static short s_fy0r[136] __attribute__((aligned(16)));
-// Спарк стадии 3: LUT шейдера (float) + построчные буферы (spark, recip/circle).
-static float s_fsparkLUT[SPARK_N] __attribute__((aligned(16)));
-static float s_sparkQR[60][4] __attribute__((aligned(16)));
-static float s_recipQQR[3][60][4] __attribute__((aligned(16)));
-
-// Статическая геометрия + проводка блоба. Разово при инициализации.
-static void vfpu_init_tables(void)
-{
-    int x, y, i;
-    // Индексы и веса билинейки полей: статическая геометрия.
-    for (x = 0; x < 60; x++) {
-        int q;
-        float fxc = ((float)(4 * x + 1) + 0.5f) * (1.0f / (GLOW_W - 1)) * (float)(NF_W - 1);
-        int x0 = (int)fxc;
-        if (x0 < 0) x0 = 0;
-        if (x0 > NF_W - 2) x0 = NF_W - 2;
-        s_fx0q[x] = (short)x0;
-        for (q = 0; q < 4; q++) {
-            float fx = ((float)(4 * x + q)) * (1.0f / (GLOW_W - 1)) * (float)(NF_W - 1);
-            float tx = fx - (float)x0;
-            if (tx < 0.0f) tx = 0.0f;
-            if (tx > 1.0f) tx = 1.0f;
-            s_ftxq[x][q] = tx;
-        }
-    }
-    for (y = 0; y < 136; y++) {
-        float fy = (float)y * (1.0f / (GLOW_H - 1)) * (float)(NF_H - 1);
-        float ty = fy - (float)((int)fy);
-        int y0raw = (int)fy;
-        int y0;
-        int q;
-        if (y0raw > NF_H - 2) { y0 = NF_H - 2; ty = 1.0f; }
-        else { y0 = y0raw < 0 ? 0 : y0raw; }
-        if (ty < 0.0f) ty = 0.0f;
-        if (ty > 1.0f) ty = 1.0f;
-        s_fy0r[y] = (short)y0;
-        for (q = 0; q < 4; q++) s_fty2[y][q] = ty;
-    }
-    for (x = 0; x < 60; x++) {
-        float uu = ((float)(4 * x) + 1.5f) * (1.0f / (GLOW_W - 1)) * 0.5f;
-        float nx = uu * 2.0f - 1.0f;
-        float uvx = nx * WEB_EX;
-        int q;
-        for (q = 0; q < 4; q++) {
-            float uup = ((float)(4 * x + q)) * (1.0f / (GLOW_W - 1));
-            float nxp = uup * 2.0f - 1.0f;
-            s_fuvxq[x][q] = nxp * WEB_EX;
-            s_fnx2q[x][q] = nxp * nxp;
-        }
-        (void)uvx; (void)nx;
-    }
-    for (y = 0; y < 136; y++) {
-        float vv = (float)y * (1.0f / (GLOW_H - 1));
-        float ny = vv * 2.0f - 1.0f;
-        float uvy = ny * WEB_EY;
-        s_fuvyq[y][0] = uvy; s_fuvyq[y][1] = uvy;
-        s_fuvyq[y][2] = uvy; s_fuvyq[y][3] = uvy;
-        s_fvigt[y][0] = s_fvigt[y][1] = s_fvigt[y][2] = s_fvigt[y][3]
-            = ny * ny * 0.5f;
-    }
-    s_fone[0] = s_fone[1] = s_fone[2] = s_fone[3] = 1.0f;
-    s_fk41[0] = s_fk41[1] = s_fk41[2] = s_fk41[3] = 0.41f;
-    s_fkhalf[0] = s_fkhalf[1] = s_fkhalf[2] = s_fkhalf[3] = 0.5f;
-    s_fk7[0] = s_fk7[1] = s_fk7[2] = s_fk7[3] = 0.7f;
-    s_fk3[0] = s_fk3[1] = s_fk3[2] = s_fk3[3] = 0.3f;
-    s_fk11[0] = s_fk11[1] = s_fk11[2] = s_fk11[3] = 11.0f;
-    // Стадия 1: brad статичен (const lay) — базовые радиусы и половины ширин.
-    // recip = 1/(outer-0.5) считается на CPU (как RECIP в C-пути): ядру не нужен
-    // ни vrcp, ни чтение singles — только проверенные quad-операции.
-    for (i = 0; i < 3; i++) {
-        float brad = 0.95f - 0.15f * (float)i;
-        float bwidH = (0.8f - 0.2f * (float)i) * 0.5f;
-        float bmul = 1.0f - (float)i * 0.3f;
-        float recip = 1.0f / ((brad + bwidH) - 0.5f);
-        int q;
-        for (q = 0; q < 4; q++) {
-            s_fprmT[i][4][q] = brad;
-            s_fprmT[i][5][q] = bwidH;
-            s_fprmT[i][6][q] = bmul;
-            s_fprmT[i][7][q] = recip;
-        }
-    }
-    s_vblob.g0 = &s_fgridL[0][0][0];
-    s_vblob.g1 = &s_fgridL[1][0][0];
-    s_vblob.g2 = &s_fgridL[2][0][0];
-    s_vblob.sparkf = NULL;
-    s_vblob.bgq = &s_fbgT[0][0][0];
-    s_vblob.colTq = &s_fcolT[0][0][0][0];
-    s_vblob.prmTq = &s_fprmT[0][0][0];
-    s_vblob.txq = &s_ftxq[0][0];
-    s_vblob.tyq = &s_fty2[0][0];
-    s_vblob.uvxq = &s_fuvxq[0][0];
-    s_vblob.nx2q = &s_fnx2q[0][0];
-    s_vblob.uvyq = &s_fuvyq[0][0];
-    s_vblob.oneq = s_fone;
-    s_vblob.tmp = &s_ftmp[0][0][0];
-    s_vblob.x0q = s_fx0q;
-    s_vblob.k41q = s_fk41;
-    s_vblob.khalfq = s_fkhalf;
-    s_vblob.k7q = s_fk7;
-    s_vblob.k3q = s_fk3;
-    s_vblob.k11q = s_fk11;
-    s_vblob.vigtq = &s_fvigt[0][0];
-    // Смещения фиксированы — ядро опирается на них через lw.
-    if (offsetof(VfpuBlob, bgq) != 16 || offsetof(VfpuBlob, colTq) != 20 ||
-        offsetof(VfpuBlob, prmTq) != 24 || offsetof(VfpuBlob, uvxq) != 36 ||
-        offsetof(VfpuBlob, nx2q) != 40 || offsetof(VfpuBlob, uvyq) != 44 ||
-        offsetof(VfpuBlob, oneq) != 48 || offsetof(VfpuBlob, tmp) != 52 ||
-        offsetof(VfpuBlob, k41q) != 60 || offsetof(VfpuBlob, khalfq) != 64 ||
-        offsetof(VfpuBlob, k7q) != 68 || offsetof(VfpuBlob, k3q) != 72 ||
-        offsetof(VfpuBlob, k11q) != 76 || offsetof(VfpuBlob, vigtq) != 80 ||
-        sizeof(VfpuBlob) != 84) {
-        logLine("vfpu: blob layout mismatch, fallback to C\n");
-    }
-    // Кэш-гигиена CPU->VFPU для статической геометрии (разово): иначе на
-    // железе VFPU читает stale-RAM (в эмуляторе память единая — незаметно).
-    sceKernelDcacheWritebackRange(s_fuvxq, sizeof(s_fuvxq));
-    sceKernelDcacheWritebackRange(s_fnx2q, sizeof(s_fnx2q));
-    sceKernelDcacheWritebackRange(s_fuvyq, sizeof(s_fuvyq));
-    sceKernelDcacheWritebackRange(s_fvigt, sizeof(s_fvigt));
-    sceKernelDcacheWritebackRange(s_fone, sizeof(s_fone));
-    sceKernelDcacheWritebackRange(s_fk41, sizeof(s_fk41));
-    sceKernelDcacheWritebackRange(s_fkhalf, sizeof(s_fkhalf));
-    sceKernelDcacheWritebackRange(s_fk7, sizeof(s_fk7));
-    sceKernelDcacheWritebackRange(s_fk3, sizeof(s_fk3));
-    sceKernelDcacheWritebackRange(s_fk11, sizeof(s_fk11));
-    sceKernelDcacheWritebackRange(s_ftxq, sizeof(s_ftxq));
-    sceKernelDcacheWritebackRange(s_fty2, sizeof(s_fty2));
-}
-
-// Кадровые таблицы из морфирующих цветов/параметров (float, 0..1).
-static void vfpu_build_frame(float bright)
-{
-    static const float kRot[3][3] = {
-        { -0.3f, 0.3f, 0.2f }, { -0.3f, -0.3f, -0.2f }, { -0.3f, -0.3f, 0.2f }
-    };
-    int i, x, q;
-    (void)bright;
-    for (x = 0; x < GLOW_W; x++) {
-        float pos = (1.0f - (float)x / (float)(GLOW_W - 1)) * 100.0f;
-        int s = 0;
-        float f;
-        while (s < WEB_STOPS - 2 && kWebStopPos[s + 1] < pos) s++;
-        f = (pos - kWebStopPos[s]) /
-            (kWebStopPos[s + 1] - kWebStopPos[s] + 1e-6f);
-        if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        for (i = 0; i < 3; i++) {
-            s_fbgq[x][i] = (s_web_stops[s][i] +
-                (s_web_stops[s + 1][i] - s_web_stops[s][i]) * f) * (0.62f / 255.0f);
-        }
-        s_fbgq[x][3] = 0.0f;
-    }
-    // Транспонированный фон для ядра: [quad][канал][4 пикселя].
-    for (x = 0; x < 60; x++) {
-        for (q = 0; q < 4; q++) {
-            s_fbgT[x][0][q] = s_fbgq[x * 4 + q][0];
-            s_fbgT[x][1][q] = s_fbgq[x * 4 + q][1];
-            s_fbgT[x][2][q] = s_fbgq[x * 4 + q][2];
-        }
-    }
-    for (i = 0; i < WEB_CIRCLES; i++) {
-        float ra = s_vtime * kRot[i][2];
-        float cs = cosf(ra), sn = sinf(ra);
-        float offx = kRot[i][0] * cs - kRot[i][1] * sn;
-        float offy = kRot[i][0] * sn + kRot[i][1] * cs;
-        float edge = 1.1f + sinf(s_vtime + 1.57f * (float)i);
-        float inten = 0.15f * (1.0f - 0.75f * sinf(s_vtime * 2.0f + 0.785f * (float)i));
-        float r1, g1, b1, r2, g2, b2;
-        hsl_to_rgb(s_web_col[i][0], s_web_col[i][1], s_web_col[i][2], &r1, &g1, &b1);
-        hsl_to_rgb(s_web_col[i + 3][0], s_web_col[i + 3][1], s_web_col[i + 3][2], &r2, &g2, &b2);
-        // hsl_to_rgb отдаёт 0..255 — ядру нужно 0..1.
-        r1 *= 0.0039215686f; g1 *= 0.0039215686f; b1 *= 0.0039215686f;
-        r2 *= 0.0039215686f; g2 *= 0.0039215686f; b2 *= 0.0039215686f;
-        for (q = 0; q < 4; q++) {
-            s_fprmT[i][0][q] = 1.0f / edge;
-            s_fprmT[i][1][q] = inten;
-            s_fprmT[i][2][q] = offx;
-            s_fprmT[i][3][q] = offy;
-        }
-        s_fcolT[i][0][0][0] = s_fcolT[i][0][0][1] = s_fcolT[i][0][0][2] = s_fcolT[i][0][0][3] = r1;
-        s_fcolT[i][0][1][0] = s_fcolT[i][0][1][1] = s_fcolT[i][0][1][2] = s_fcolT[i][0][1][3] = r2;
-        s_fcolT[i][1][0][0] = s_fcolT[i][1][0][1] = s_fcolT[i][1][0][2] = s_fcolT[i][1][0][3] = g1;
-        s_fcolT[i][1][1][0] = s_fcolT[i][1][1][1] = s_fcolT[i][1][1][2] = s_fcolT[i][1][1][3] = g2;
-        s_fcolT[i][2][0][0] = s_fcolT[i][2][0][1] = s_fcolT[i][2][0][2] = s_fcolT[i][2][0][3] = b1;
-        s_fcolT[i][2][1][0] = s_fcolT[i][2][1][1] = s_fcolT[i][2][1][2] = s_fcolT[i][2][1][3] = b2;
-    }
-}
-
-// Шумовые сетки float с паддингом (стадия 2). Та же математика, что web_build_fields.
-// Пишет в parity-буфер (double-buffer для по-кадровой интерполяции).
-static void vfpu_build_grids(sfix vt)
-{
-    float (*dst)[19][33] = s_gridParity ? s_fgridB : s_fgridA;
-    float kx = WEB_EX * 1.2f * WEB_NOISE_ZOOM;
-    float ky = WEB_EY * 1.2f * WEB_NOISE_ZOOM;
-    int f, j, i;
-    for (f = 0; f < 3; f++) {
-        sfix off = f == 0 ? 0 : (f == 1 ? 102944 : 205887);
-        for (j = 0; j < NF_H; j++) {
-            float evy = (((float)j / (float)(NF_H - 1)) * 2.0f - 1.0f) * ky;
-            sfix evy_s = (sfix)(evy * 65536.0f);
-            for (i = 0; i < NF_W; i++) {
-                float eux = (((float)i / (float)(NF_W - 1)) * 2.0f - 1.0f) * kx;
-                sfix eux_s = (sfix)(eux * 65536.0f);
-                sfix r = snoise3_fx(eux_s + off, evy_s + off, vt + off);
-                dst[f][j][i] = ((float)r / 65536.0f + 1.0f) * 0.5f;
-            }
-            dst[f][j][NF_W] = dst[f][j][NF_W - 1];
-        }
-        for (i = 0; i <= NF_W; i++) {
-            dst[f][NF_H][i] = dst[f][NF_H - 1][i];
-        }
-    }
-    sceKernelDcacheWritebackRange(dst, sizeof(s_fgridA));
-}
-
-// По-кадровая интерполяция сеток: L = lerp(prev, curr, 1-age/3). ~0.3мс.
-static void vfpu_lerp_grids(void)
-{
-    float (*prv)[19][33] = s_gridParity ? s_fgridA : s_fgridB;
-    float (*cur)[19][33] = s_gridParity ? s_fgridB : s_fgridA;
-    float k = 1.0f - (float)s_gridAge * (1.0f / 3.0f);
-    int f, j, i;
-    if (k < 0.0f) k = 0.0f;
-    for (f = 0; f < 3; f++) {
-        for (j = 0; j <= NF_H; j++) {
-            for (i = 0; i <= NF_W; i++) {
-                float a = prv[f][j][i];
-                s_fgridL[f][j][i] = a + (cur[f][j][i] - a) * k;
-            }
-        }
-    }
-    sceKernelDcacheWritebackRange(s_fgridL, sizeof(s_fgridL));
-}
-
-// Спарк-LUT шейдера во float (стадия 3). Та же математика, что C-путь.
-static void vfpu_build_sparklut(sfix vtf)
-{
-    int i;
-    for (i = 0; i < SPARK_N; i++) {
-        sfix a = ((sfix)i * 65536) / (SPARK_N - 1) - 32768;
-        sfix v = raw_spark_fx(a, vtf);
-        sfix s2, sp, gi, gate;
-        if (v < 0) v = 0;
-        if (v > 65536) v = 65536;
-        s2 = fx_mul(v, v);
-        sp = fx_mul(v, 13107) + fx_mul(fx_mul(fx_mul(s2, s2), s2), s2);
-        gi = fx_div(19661, sp + 1);
-        if (gi > 65536) gi = 65536;
-        gate = fx_mul(fx_mul(gi, gi), 196608 - 2 * gi);
-        s_fsparkLUT[i] = (float)fx_mul(sp, gate) / 65536.0f;
-    }
-}
-
-// Построчные спарк и recip/circle (стадия 3). brad/bwidH/bmul — литералы кругов.
-static void vfpu_build_sparkrow(int y)
-{
-    static const float kBrad[3] = { 0.95f, 0.80f, 0.65f };
-    static const float kBwidH[3] = { 0.40f, 0.30f, 0.20f };
-    static const float kBmul[3] = { 1.0f, 0.70f, 0.40f };
-    int xq, i, q;
-    float vc = (float)y * (1.0f / (GLOW_H - 1));
-    float uvy = (vc * 2.0f - 1.0f) * WEB_EY;
-    for (xq = 0; xq < 60; xq++) {
-        float uc = ((float)(4 * xq) + 1.5f) * (1.0f / (GLOW_W - 1));
-        float uvx = (uc * 2.0f - 1.0f) * WEB_EX;
-        float ang = fast_atan2(uvy, uvx) * 0.15915494f + 0.5f;
-        float fi, ft, spark;
-        int i0, i1;
-        if (ang < 0.0f) ang = 0.0f;
-        if (ang > 1.0f) ang = 1.0f;
-        fi = ang * (float)(SPARK_N - 1);
-        i0 = (int)fi;
-        if (i0 < 0) i0 = 0;
-        if (i0 > SPARK_N - 1) i0 = SPARK_N - 1;
-        ft = fi - (float)i0;
-        i1 = i0 + 1;
-        if (i1 > SPARK_N - 1) i1 = SPARK_N - 1;
-        spark = s_fsparkLUT[i0] + (s_fsparkLUT[i1] - s_fsparkLUT[i0]) * ft;
-        for (q = 0; q < 4; q++) s_sparkQR[xq][q] = spark;
-        for (i = 0; i < 3; i++) {
-            float outer = kBrad[i] + kBwidH[i] + kBmul[i] * spark;
-            float recip = 1.0f / (outer - 0.5f);
-            for (q = 0; q < 4; q++) s_recipQQR[i][xq][q] = recip;
-        }
-    }
-}
-
-// Стадия 1: фон + круги (const lay/spark), полное разрешение.
-// Регистры: R000=uvx R100=uvy R001=K41 R101=KHALF R103=ONE R200-202=cr/cg/cb.
-// Круги: R300-303=offx/offy/invedge/inten R400/R401=brad/bwidH R002/R003=c1/c2.
-// Временные: R500=blen R501/R502=dx/dy R503=llen R600-603 R700-703.
-#define VFPU_CIRCLE(po_, coff_, gi_, rq_) \
-        "lw %[s0], " #gi_ "(%[BL])\n\t" \
-        "addu %[s0], %[s0], %[Y0B]\n\t" \
-        "addu %[s1], %[s0], 132\n\t" \
-        "addu %[s0], %[s0], %[X0B]\n\t" \
-        "addu %[s1], %[s1], %[X0B]\n\t" \
-        "vsub.q R700, R103, R402\n\t" \
-        "vsub.q R702, R103, R403\n\t" \
-        "vzero.q R701\n\t" \
-        "lv.s S300, 0(%[s0])\n\t" \
-        "vmul.q R703, R700, R702\n\t" \
-        "vscl.q R703, R703, S300\n\t" \
-        "vadd.q R701, R701, R703\n\t" \
-        "lv.s S300, 4(%[s0])\n\t" \
-        "vmul.q R703, R402, R702\n\t" \
-        "vscl.q R703, R703, S300\n\t" \
-        "vadd.q R701, R701, R703\n\t" \
-        "lv.s S300, 0(%[s1])\n\t" \
-        "vmul.q R703, R700, R403\n\t" \
-        "vscl.q R703, R703, S300\n\t" \
-        "vadd.q R701, R701, R703\n\t" \
-        "lv.s S300, 4(%[s1])\n\t" \
-        "vmul.q R703, R402, R403\n\t" \
-        "vscl.q R703, R703, S300\n\t" \
-        "vadd.q R701, R701, R703\n\t" \
-        "lw %[s0], 24(%[BL])\n\t" \
-        "addu %[s0], %[s0], " #po_ "\n\t" \
-        "lv.q R300, 32(%[s0])\n\t" \
-        "lv.q R301, 48(%[s0])\n\t" \
-        "lv.q R302, 0(%[s0])\n\t" \
-        "lv.q R303, 16(%[s0])\n\t" \
-        "vadd.q R501, R000, R300\n\t" \
-        "vadd.q R502, R100, R301\n\t" \
-        "vabs.q R501, R501\n\t" \
-        "vabs.q R502, R502\n\t" \
-        "vmax.q R503, R501, R502\n\t" \
-        "vmin.q R700, R501, R502\n\t" \
-        "vmul.q R700, R700, R001\n\t" \
-        "vadd.q R503, R503, R700\n\t" \
-        "vsub.q R601, R500, R101\n\t" \
-        "addu %[s2], %[RQX], " #rq_ "\n\t" \
-        "lv.q R700, 0(%[s2])\n\t" \
-        "vmul.q R602, R601, R700\n\t" \
-        "vsat0.q R602, R602\n\t" \
-        "vmul.q R603, R602, R602\n\t" \
-        "vsub.q R700, R103, R602\n\t" \
-        "vadd.q R700, R700, R700\n\t" \
-        "vadd.q R700, R103, R700\n\t" \
-        "vmul.q R603, R603, R700\n\t" \
-        "vsub.q R602, R103, R603\n\t" \
-        "vsub.q R600, R503, R701\n\t" \
-        "vmul.q R700, R600, R302\n\t" \
-        "vsat0.q R700, R700\n\t" \
-        "vsub.q R601, R103, R700\n\t" \
-        "vmul.q R601, R601, R602\n\t" \
-        "vabs.q R600, R600\n\t" \
-        "lw %[s2], 76(%[BL])\n\t" \
-        "lv.q R603, 0(%[s2])\n\t" \
-        "vmul.q R600, R600, R603\n\t" \
-        "vadd.q R600, R600, R103\n\t" \
-        "vdiv.q R602, R303, R600\n\t" \
-        "vadd.q R603, R100, R301\n\t" \
-        "vadd.q R603, R603, R603\n\t" \
-        "vsat0.q R603, R603\n\t" \
-        "lw %[s1], 20(%[BL])\n\t" \
-        "addu %[s1], %[s1], " #coff_ "\n\t"
-
-#define VFPU_CHAN(cr_, c1o_, c2o_) \
-        "lv.q R002, " #c1o_ "(%[s1])\n\t" \
-        "lv.q R003, " #c2o_ "(%[s1])\n\t" \
-        "vsub.q R700, R003, R002\n\t" \
-        "vmul.q R700, R700, R603\n\t" \
-        "vadd.q R700, R700, R002\n\t" \
-        "vadd.q R700, R700, R602\n\t" \
-        "vsat0.q R700, R700\n\t" \
-        "vsub.q R700, R700, R" #cr_ "\n\t" \
-        "vmul.q R700, R700, R601\n\t" \
-        "vadd.q R" #cr_ ", R" #cr_ ", R700\n\t"
-
-static void vfpu_render_pack(float bright)
-{
-    // Байер 4x4 для дитеринга (±0.5 LSB): разбивает 8-битные bands градиента.
-    static const float kDith[16] = {
-        0.0f/16.0f,  8.0f/16.0f,  2.0f/16.0f, 10.0f/16.0f,
-        12.0f/16.0f,  4.0f/16.0f, 14.0f/16.0f,  6.0f/16.0f,
-        3.0f/16.0f, 11.0f/16.0f,  1.0f/16.0f,  9.0f/16.0f,
-        15.0f/16.0f,  7.0f/16.0f, 13.0f/16.0f,  5.0f/16.0f
-    };
-    int y, xq;
-#if VFPU_DUMP
-    {
-        static int dumped = 0;
-        if (!dumped) {
-            int yy, xx;
-            dumped = 1;
-            logLine("vfdump colT0: %f %f %f / %f %f %f\n",
-                s_fcolT[0][0][0][0], s_fcolT[0][1][0][0], s_fcolT[0][2][0][0],
-                s_fcolT[0][0][1][0], s_fcolT[0][1][1][0], s_fcolT[0][2][1][0]);
-            logLine("vfdump prmT0: inv=%f inten=%f off=(%f,%f) brad=%f bwidH=%f\n",
-                s_fprmT[0][0][0], s_fprmT[0][1][0], s_fprmT[0][2][0],
-                s_fprmT[0][3][0], s_fprmT[0][4][0], s_fprmT[0][5][0]);
-            logLine("vfdump bgT0=%f bgT59=%f uvx0=%f uvx59=%f\n",
-                s_fbgT[0][0][0], s_fbgT[59][0][3], s_fuvxq[0][0], s_fuvxq[59][3]);
-            (void)yy; (void)xx;
-        }
-    }
-#endif
-    for (y = 0; y < GLOW_H; y++) {
-        const float *uy = &s_fuvyq[y][0];
-        const float *vt = &s_fvigt[y][0];
-        const float *tyr = &s_fty2[y][0];
-        const float *rqx = &s_recipQQR[0][0][0];
-        int y0b = (int)s_fy0r[y] * 132;
-        if ((s_web_tick % 3) == 0) {
-            vfpu_build_sparkrow(y);
-            sceKernelDcacheWritebackRange(s_sparkQR, sizeof(s_sparkQR));
-            sceKernelDcacheWritebackRange(s_recipQQR, sizeof(s_recipQQR));
-        }
-        for (xq = 0; xq < 60; xq++) {
-            const float *T = &s_ftmp[xq][0][0];
-            const float *BG = &s_fbgT[xq][0][0];
-            const float *UX = &s_fuvxq[xq][0];
-            const float *NX = &s_fnx2q[xq][0];
-            const float *TX = &s_ftxq[xq][0];
-            int x0b = (int)s_fx0q[xq] * 4;
-            const VfpuBlob *BL = &s_vblob;
-            void *s0, *s1, *s2;
-            __asm__ volatile (
-                "lw %[s2], 48(%[BL])\n\t"
-                "lv.q R103, 0(%[s2])\n\t"
-                "lw %[s2], 60(%[BL])\n\t"
-                "lv.q R001, 0(%[s2])\n\t"
-                "lw %[s2], 64(%[BL])\n\t"
-                "lv.q R101, 0(%[s2])\n\t"
-                "lv.q R402, 0(%[TX])\n\t"
-                "lv.q R403, 0(%[TYR])\n\t"
-                "lv.q R000, 0(%[UX])\n\t"
-                "lv.q R100, 0(%[UY])\n\t"
-                "vabs.q R501, R000\n\t"
-                "vabs.q R502, R100\n\t"
-                "vmax.q R503, R501, R502\n\t"
-                "vmin.q R700, R501, R502\n\t"
-                "vmul.q R700, R700, R001\n\t"
-                "vadd.q R500, R503, R700\n\t"
-                "lv.q R200, 0(%[BG])\n\t"
-                "lv.q R201, 16(%[BG])\n\t"
-                "lv.q R202, 32(%[BG])\n\t"
-                VFPU_CIRCLE(0, 0, 0, 0)
-                VFPU_CHAN(200, 0, 16)
-                VFPU_CHAN(201, 32, 48)
-                VFPU_CHAN(202, 64, 80)
-                VFPU_CIRCLE(128, 96, 4, 960)
-                VFPU_CHAN(200, 0, 16)
-                VFPU_CHAN(201, 32, 48)
-                VFPU_CHAN(202, 64, 80)
-                VFPU_CIRCLE(256, 192, 8, 1920)
-                VFPU_CHAN(200, 0, 16)
-                VFPU_CHAN(201, 32, 48)
-                VFPU_CHAN(202, 64, 80)
-                "lv.q R601, 0(%[NX])\n\t"
-                "lw %[s2], 68(%[BL])\n\t"
-                "lv.q R102, 0(%[s2])\n\t"
-                "lv.q R600, 0(%[VT])\n\t"
-                "lw %[s2], 72(%[BL])\n\t"
-                "lv.q R603, 0(%[s2])\n\t"
-                "vmul.q R601, R601, R102\n\t"
-                "vadd.q R601, R601, R600\n\t"
-                "vmul.q R601, R601, R603\n\t"
-                "vsub.q R600, R103, R601\n\t"
-                "vmul.q R200, R200, R600\n\t"
-                "vmul.q R201, R201, R600\n\t"
-                "vmul.q R202, R202, R600\n\t"
-                "sv.q R200, 0(%[T])\n\t"
-                "sv.q R201, 16(%[T])\n\t"
-                "sv.q R202, 32(%[T])\n\t"
-                : [s0]"=&r"(s0), [s1]"=&r"(s1), [s2]"=&r"(s2)
-                : [BL]"r"(BL), [T]"r"(T), [BG]"r"(BG), [UX]"r"(UX),
-                  [NX]"r"(NX), [UY]"r"(uy), [VT]"r"(vt), [TX]"r"(TX),
-                  [TYR]"r"(tyr), [Y0B]"r"(y0b), [X0B]"r"(x0b), [RQX]"r"(rqx)
-                : "memory");
-        }
-        // Строка s_ftmp только что записана VFPU мимо CPU-кэша: инвалидировать.
-        sceKernelDcacheInvalidateRange(&s_ftmp[0][0][0], sizeof(s_ftmp));
-        {
-            unsigned char *dst = s_buf + (size_t)y * GLOW_PITCH * 4;
-            for (xq = 0; xq < 60; xq++) {
-                int lane;
-                for (lane = 0; lane < 4; lane++) {
-                    int px = xq * 4 + lane;
-                    float r = s_ftmp[xq][0][lane];
-                    float g = s_ftmp[xq][1][lane];
-                    float b = s_ftmp[xq][2][lane];
-                    int ri, gi, bi;
-                    r = s_fbgq[px][0] + (r - s_fbgq[px][0]) * bright;
-                    g = s_fbgq[px][1] + (g - s_fbgq[px][1]) * bright;
-                    b = s_fbgq[px][2] + (b - s_fbgq[px][2]) * bright;
-                    if (s_liked) {
-                        r += 0.0392f; g -= 0.0157f; b -= 0.0392f;
-                    }
-                    {
-                        float dth = (kDith[(px & 3) | ((y & 3) << 2)] - 0.5f) * (1.0f / 255.0f);
-                        r += dth; g += dth; b += dth;
-                    }
-                    ri = (int)(r * 255.0f + 0.5f);
-                    gi = (int)(g * 255.0f + 0.5f);
-                    bi = (int)(b * 255.0f + 0.5f);
-                    if (ri < 0) ri = 0; else if (ri > 255) ri = 255;
-                    if (gi < 0) gi = 0; else if (gi > 255) gi = 255;
-                    if (bi < 0) bi = 0; else if (bi > 255) bi = 255;
-                    dst[px * 4 + 0] = (unsigned char)ri;
-                    dst[px * 4 + 1] = (unsigned char)gi;
-                    dst[px * 4 + 2] = (unsigned char)bi;
-                    dst[px * 4 + 3] = 255;
-                }
-            }
-        }
-    }
-}
-#endif
 static float s_vtime = 0.0f;
 static unsigned long long s_last_us = 0;
+// Сколько строк текстуры заполнено (классика/нити).
+static int s_tex_rows = GLOW_H;
 static unsigned s_web_tick = 0;
 static int s_web_init = 0;
 
@@ -874,15 +248,6 @@ static float fast_atan2(float y, float x)
     if (x < 0.0f) r = 3.14159274f - r;
     if (y < 0.0f) r = -r;
     return r;
-}
-
-// Быстрая длина вектора в fixed (погрешность ~4%) — для мягких масок годится.
-static sfix fast_len_fx(sfix x, sfix y)
-{
-    sfix ax = fx_abs(x), ay = fx_abs(y);
-    sfix m = ax > ay ? ax : ay;
-    sfix n = ax > ay ? ay : ax;
-    return m + fx_mul(n, 26870);  // +0.41*min
 }
 
 // Simplex-шум 3D в fixed (Ashima snoise, как в шейдере Яндекса).
@@ -1107,6 +472,7 @@ LocaleKey glow_bg_style_name_key(int style)
     switch (style) {
     case GLOW_STYLE_CLASSIC: return LOCALE_GLOW_STYLE_CLASSIC;
     case GLOW_STYLE_STRANDS: return LOCALE_GLOW_STYLE_STRANDS;
+    case GLOW_STYLE_MESH: return LOCALE_GLOW_STYLE_MESH;
     default: return LOCALE_GLOW_STYLE_WEB;
     }
 }
@@ -1531,24 +897,6 @@ static void strands_update(void)
 }
 
 // Веб-стиль: поля simplex-шума для трёх колец (fixed).
-static void web_build_fields(sfix vt)
-{
-    sfix kx = (sfix)(WEB_EX * 1.2f * WEB_NOISE_ZOOM * 65536.0f);
-    sfix ky = (sfix)(WEB_EY * 1.2f * WEB_NOISE_ZOOM * 65536.0f);
-    int x, y;
-    for (y = 0; y < NF_H; y++) {
-        sfix vf = ((sfix)y << 16) / (NF_H - 1);
-        sfix evy = fx_mul(vf + vf - 65536, ky);
-        for (x = 0; x < NF_W; x++) {
-            sfix uf = ((sfix)x << 16) / (NF_W - 1);
-            sfix eux = fx_mul(uf + uf - 65536, kx);
-            s_nfield[0][y][x] = (snoise3_fx(eux, evy, vt) + 65536) / 2;
-            s_nfield[1][y][x] = (snoise3_fx(eux + 102944, evy + 102944, vt + 102944) + 65536) / 2;
-            s_nfield[2][y][x] = (snoise3_fx(eux + 205887, evy + 205887, vt + 205887) + 65536) / 2;
-        }
-    }
-}
-
 // Веб-стиль: цели цветов из среднего цвета обложки (customColors шейдера:
 // top=(h,s+15,l+10), middle=(h,s+15,l+5), bottom=(h,s,l); на паузе — темно).
 static void web_update_targets(int playing, float k)
@@ -1611,7 +959,134 @@ static void web_init_state(void)
     s_web_init = 1;
 }
 
-// Веб-стиль: порт canvas-шейдера, hot path в fixed-point, полное разрешение.
+/* ------------------------------------------------------------------------
+ * WEB (порт веб-вайба Яндекса) на сетке вершин GPU.
+ * Та же математика, что в шейдере/старом попиксельном пути (фон-градиент
+ * бакета, 3 шумовых кольца со спарком, виньетка, пауза/лайк/пульс), но
+ * считается в вершинах сетки 63x35 (узлы шумовой сетки 32x18 + середины
+ * между ними, поэтому билинейка шума — это просто среднее), а GPU
+ * интерполирует цвет (Gouraud). Вместо ~16 тыс. пикселей — ~2,2 тыс. вершин;
+ * без текстуры, без VFPU-асма и без записи/сброса кэша: на железе нет
+ * проблем когерентности и порчи VFPU-контекста.
+ * ------------------------------------------------------------------------ */
+#define WG_COLS 63
+#define WG_ROWS 35
+
+static unsigned int s_wg_rgb[WG_ROWS + 1][WG_COLS + 1];
+static float s_wg_ux[WG_COLS + 1], s_wg_nx2[WG_COLS + 1];
+static float s_wg_uy[WG_ROWS + 1], s_wg_ny2[WG_ROWS + 1];
+static float s_wg_blen[WG_ROWS + 1][WG_COLS + 1];
+static float s_wg_ft[WG_ROWS + 1][WG_COLS + 1];       // доля LUT спарка
+static unsigned char s_wg_i0[WG_ROWS + 1][WG_COLS + 1];
+static unsigned char s_wg_ci0[WG_COLS + 1], s_wg_rj0[WG_ROWS + 1];
+static float s_wg_ctx[WG_COLS + 1], s_wg_rty[WG_ROWS + 1];
+static float s_wg_bg[WG_COLS + 1][3];                 // фон по колонкам 0..255
+
+// Шумовые поля: тройной буфер (prev/cur/build); строится ОДНО поле за кадр,
+// слой кадра = lerp(prev, cur, (фаза+1)/3) — монотонно, без скачков.
+static float s_wg_grid[3][3][NF_H][NF_W];
+static float s_wg_gridL[3][NF_H][NF_W];
+static int s_wg_prev = 0, s_wg_cur = 1, s_wg_build = 2;
+static int s_wg_ready = 0;
+static sfix s_wg_build_vt = 0;
+static float s_wg_lut[SPARK_N];        // спарк-LUT (запечён shapeSpark)
+static float s_wg_lut_next[SPARK_N];   // строится по третям за 3 кадра
+static sfix s_wg_lut_vt = 0;
+
+static float wg_len(float x, float y)  // быстрая длина (+0.41*min), как в вебе
+{
+    float ax = x < 0.0f ? -x : x, ay = y < 0.0f ? -y : y;
+    return ax > ay ? ax + 0.41f * ay : ay + 0.41f * ax;
+}
+
+static float wg_sat(float v)
+{
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+// Статическая геометрия вершин: один раз при инициализации.
+static void web_geom_init(void)
+{
+    int r, c;
+    for (c = 0; c <= WG_COLS; c++) {
+        float u = (float)c * (1.0f / WG_COLS);
+        float nx = u * 2.0f - 1.0f;
+        int i0 = c >> 1;
+        float tx = (c & 1) ? 0.5f : 0.0f;
+        if (i0 > NF_W - 2) { i0 = NF_W - 2; tx = 1.0f; }
+        s_wg_ux[c] = nx * WEB_EX;
+        s_wg_nx2[c] = nx * nx;
+        s_wg_ci0[c] = (unsigned char)i0;
+        s_wg_ctx[c] = tx;
+    }
+    for (r = 0; r <= WG_ROWS; r++) {
+        float v = (float)r * (1.0f / WG_ROWS);
+        float ny = v * 2.0f - 1.0f;
+        int j0 = r >> 1;
+        float ty = (r & 1) ? 0.5f : 0.0f;
+        if (j0 > NF_H - 2) { j0 = NF_H - 2; ty = 1.0f; }
+        s_wg_uy[r] = ny * WEB_EY;
+        s_wg_ny2[r] = ny * ny;
+        s_wg_rj0[r] = (unsigned char)j0;
+        s_wg_rty[r] = ty;
+    }
+    for (r = 0; r <= WG_ROWS; r++) {
+        for (c = 0; c <= WG_COLS; c++) {
+            float ang = fast_atan2(s_wg_uy[r], s_wg_ux[c]) * 0.15915494f + 0.5f;
+            float fi;
+            int i0;
+            if (ang < 0.0f) ang = 0.0f;
+            if (ang > 1.0f) ang = 1.0f;
+            fi = ang * (float)(SPARK_N - 1);
+            i0 = (int)fi;
+            if (i0 > SPARK_N - 2) i0 = SPARK_N - 2;
+            s_wg_i0[r][c] = (unsigned char)i0;
+            s_wg_ft[r][c] = fi - (float)i0;
+            s_wg_blen[r][c] = wg_len(s_wg_ux[c], s_wg_uy[r]);
+        }
+    }
+}
+
+// Одно поле f тройного буфера buf (та же математика, что в вебе).
+static void web_build_grid_field(int buf, int f, sfix vt)
+{
+    float (*dst)[NF_W] = s_wg_grid[buf][f];
+    sfix kx = (sfix)(WEB_EX * 1.2f * WEB_NOISE_ZOOM * 65536.0f);
+    sfix ky = (sfix)(WEB_EY * 1.2f * WEB_NOISE_ZOOM * 65536.0f);
+    sfix off = f == 0 ? 0 : (f == 1 ? 102944 : 205887);
+    int j, i;
+    for (j = 0; j < NF_H; j++) {
+        sfix vf = ((sfix)j << 16) / (NF_H - 1);
+        sfix evy = fx_mul(vf + vf - 65536, ky);
+        for (i = 0; i < NF_W; i++) {
+            sfix uf = ((sfix)i << 16) / (NF_W - 1);
+            sfix eux = fx_mul(uf + uf - 65536, kx);
+            sfix rr = snoise3_fx(eux + off, evy + off, vt + off);
+            dst[j][i] = ((float)rr * (1.0f / 65536.0f) + 1.0f) * 0.5f;
+        }
+    }
+}
+
+// Спарк-LUT: диапазон [from, to). Без деления на 3 кадра — нет пика.
+static void web_build_lut_range(int from, int to, sfix vtf)
+{
+    int i;
+    for (i = from; i < to; i++) {
+        sfix a = ((sfix)i * 65536) / (SPARK_N - 1) - 32768;
+        sfix v = raw_spark_fx(a, vtf);
+        sfix s2, sp, gi, gate;
+        if (v < 0) v = 0;
+        if (v > 65536) v = 65536;
+        s2 = fx_mul(v, v);
+        sp = fx_mul(v, 13107) + fx_mul(fx_mul(fx_mul(s2, s2), s2), s2);
+        gi = fx_div(19661, sp + 1);
+        if (gi > 65536) gi = 65536;
+        gate = fx_mul(fx_mul(gi, gi), 196608 - 2 * gi);
+        s_wg_lut_next[i] = (float)fx_mul(sp, gate) * (1.0f / 65536.0f);
+    }
+}
+
+// Веб-стиль: фон + кольца в вершинах сетки.
 static void web_update(float dt)
 {
     static const float kRot[3][3] = {
@@ -1619,13 +1094,11 @@ static void web_update(float dt)
     };
     float bright = s_playing ? 1.0f : 0.55f;
     float pulse = 1.0f;
-    sfix ex = (sfix)(WEB_EX * 65536.0f);
-    sfix ey = (sfix)(WEB_EY * 65536.0f);
-    sfix offx[3], offy[3], edge[3], inten[3], inv_edge[3];
-    sfix brad0[3], bwid_[3], bmul_[3];
-    sfix wrgb[6][3];
-    sfix bright_fx;
-    int i, x, y;
+    float offx[3], offy[3], inv_edge[3], inten[3], brad0[3], bwidH[3], bmul[3];
+    float c1[3][3], c2[3][3];
+    float lr = s_liked ? 10.0f : 0.0f, lg = s_liked ? -4.0f : 0.0f,
+          lb = s_liked ? -10.0f : 0.0f;
+    int phase, i, r, c;
 
     if (!s_web_init) {
         web_init_state();
@@ -1638,216 +1111,394 @@ static void web_update(float dt)
     s_vtime += dt * (s_playing ? 0.2f : 0.06f);
     if (s_vtime > 86400.0f) s_vtime -= 86400.0f;
     web_update_targets(s_playing, dt > 1.0f ? 1.0f : dt);
-#if VFPU_STAGE
-    // VFPU-путь (полное разрешение): float-таблицы + ядро + пак. C-путь ниже
-    // остаётся как сохранённый быстрый вариант (VFPU_STAGE 0).
-    if ((s_web_tick % 3) == 0) {
-        sfix vt = (sfix)(s_vtime * 32768.0f);
-        sfix vtf = (sfix)(s_vtime * 65536.0f);
-        s_gridParity ^= 1;
-        vfpu_build_grids(vt);
-        vfpu_build_sparklut(vtf);
-        sceKernelDcacheWritebackRange(s_fsparkLUT, sizeof(s_fsparkLUT));
-        s_gridAge = 0;
-    } else if (s_gridAge < 2) {
-        s_gridAge++;
-    }
-    vfpu_lerp_grids();
-    vfpu_build_frame(bright);
-    // Кадровые таблицы в RAM для VFPU.
-    sceKernelDcacheWritebackRange(s_fbgT, sizeof(s_fbgT));
-    sceKernelDcacheWritebackRange(s_fcolT, sizeof(s_fcolT));
-    sceKernelDcacheWritebackRange(s_fprmT, sizeof(s_fprmT));
-    vfpu_render_pack(bright);
-    s_web_tick++;
-    return;
-#endif
-    for (i = 0; i < 6; i++) {
-        float r, g, b;
-        hsl_to_rgb(s_web_col[i][0], s_web_col[i][1], s_web_col[i][2], &r, &g, &b);
-        wrgb[i][0] = (sfix)(r * 256.0f);
-        wrgb[i][1] = (sfix)(g * 256.0f);
-        wrgb[i][2] = (sfix)(b * 256.0f);
-    }
-    bright_fx = (sfix)(bright * 65536.0f);
 
-    // Фон: градиент бакета по колонкам (угол 270°: свет справа).
-    for (x = 0; x < WEB_RW; x++) {
-        float pos = (1.0f - (float)x / (float)(WEB_RW - 1)) * 100.0f;
-        int s = 0;
-        float f;
-        while (s < WEB_STOPS - 2 && kWebStopPos[s + 1] < pos) s++;
-        f = (pos - kWebStopPos[s]) /
-            (kWebStopPos[s + 1] - kWebStopPos[s] + 1e-6f);
-        if (f < 0.0f) f = 0.0f;
-        if (f > 1.0f) f = 1.0f;
-        for (i = 0; i < 3; i++) {
-            s_wbg[x][i] = (sfix)(((s_web_stops[s][i] +
-                (s_web_stops[s + 1][i] - s_web_stops[s][i]) * f) * 0.62f) * 256.0f);
+    // --- Шум и спарк: тяжёлая часть, размазана по кадрам ---
+    phase = (int)(s_web_tick % 3);
+    if (!s_wg_ready) {
+        // Первый кадр: все буферы и LUT сразу (иначе 3 кадра тёмных колец).
+        sfix vt0 = (sfix)(s_vtime * 32768.0f);
+        int b, f;
+        for (b = 0; b < 3; b++) {
+            for (f = 0; f < 3; f++) web_build_grid_field(b, f, vt0);
+        }
+        s_wg_build_vt = vt0;
+        s_wg_lut_vt = (sfix)(s_vtime * 65536.0f);
+        web_build_lut_range(0, SPARK_N, s_wg_lut_vt);
+        memcpy(s_wg_lut, s_wg_lut_next, sizeof(s_wg_lut));
+        s_wg_ready = 1;
+    }
+    if (phase == 0) {
+        s_wg_build_vt = (sfix)(s_vtime * 32768.0f);
+        s_wg_lut_vt = (sfix)(s_vtime * 65536.0f);
+    }
+    web_build_grid_field(s_wg_build, phase, s_wg_build_vt);
+    {
+        int from = phase * ((SPARK_N + 2) / 3);
+        int to = from + (SPARK_N + 2) / 3;
+        if (to > SPARK_N) to = SPARK_N;
+        web_build_lut_range(from, to, s_wg_lut_vt);
+        if (phase == 2) {
+            memcpy(s_wg_lut, s_wg_lut_next, sizeof(s_wg_lut));
         }
     }
+    {
+        float k = (float)(phase + 1) * (1.0f / 3.0f);
+        float (*prv)[NF_H][NF_W] = s_wg_grid[s_wg_prev];
+        float (*cur)[NF_H][NF_W] = s_wg_grid[s_wg_cur];
+        int f, j;
+        for (f = 0; f < 3; f++) {
+            for (j = 0; j < NF_H; j++) {
+                for (i = 0; i < NF_W; i++) {
+                    float a = prv[f][j][i];
+                    s_wg_gridL[f][j][i] = a + (cur[f][j][i] - a) * k;
+                }
+            }
+        }
+    }
+    if (phase == 2) {
+        int old_prev = s_wg_prev;
+        s_wg_prev = s_wg_cur;
+        s_wg_cur = s_wg_build;
+        s_wg_build = old_prev;
+    }
+    s_web_tick++;
 
+    // --- Параметры колец и цвета кадра ---
     for (i = 0; i < WEB_CIRCLES; i++) {
         float ra = s_vtime * kRot[i][2];
         float cs = cosf(ra), sn = sinf(ra);
-        offx[i] = (sfix)((kRot[i][0] * cs - kRot[i][1] * sn) * 65536.0f);
-        offy[i] = (sfix)((kRot[i][0] * sn + kRot[i][1] * cs) * 65536.0f);
-        edge[i] = (sfix)((1.1f + sinf(s_vtime + 1.57f * (float)i)) * 65536.0f);
-        inten[i] = (sfix)((0.15f * (1.0f - 0.75f * sinf(s_vtime * 2.0f + 0.785f * (float)i))) * 65536.0f);
-        inv_edge[i] = fx_div(65536, edge[i]);
-        brad0[i] = (sfix)((0.95f - 0.15f * (float)i) * 65536.0f);
-        bwid_[i] = (sfix)((0.8f - 0.2f * (float)i) * 65536.0f);
-        bmul_[i] = 65536 - (sfix)((float)i * 19661.0f);
+        float edge = 1.1f + sinf(s_vtime + 1.57f * (float)i);
+        offx[i] = kRot[i][0] * cs - kRot[i][1] * sn;
+        offy[i] = kRot[i][0] * sn + kRot[i][1] * cs;
+        inv_edge[i] = 1.0f / edge;
+        inten[i] = 0.15f * (1.0f - 0.75f * sinf(s_vtime * 2.0f + 0.785f * (float)i));
+        brad0[i] = 0.95f - 0.15f * (float)i;
+        bwidH[i] = (0.8f - 0.2f * (float)i) * 0.5f;
+        bmul[i] = 1.0f - (float)i * 0.3f;
+        hsl_to_rgb(s_web_col[i][0], s_web_col[i][1], s_web_col[i][2],
+                   &c1[i][0], &c1[i][1], &c1[i][2]);
+        hsl_to_rgb(s_web_col[i + 3][0], s_web_col[i + 3][1], s_web_col[i + 3][2],
+                   &c2[i][0], &c2[i][1], &c2[i][2]);
     }
-
-    // Медленно морфирующие части — шум и спарк-LUT — раз в 3 пересчёта.
-    if ((s_web_tick % 3) == 0) {
-        sfix vt = (sfix)(s_vtime * 32768.0f);  // vtime*0.5
-        sfix vtf = (sfix)(s_vtime * 65536.0f);
-        web_build_fields(vt);
-
-        // Спарк-LUT по углу (triNoise3D шейдера с бесшовной склейкой).
-        // shapeSpark сразу запечён в LUT — попиксельно остаётся лишь lerp.
-        for (i = 0; i < SPARK_N; i++) {
-            sfix a = ((sfix)i * 65536) / (SPARK_N - 1) - 32768;
-            sfix v = raw_spark_fx(a, vtf);
-            sfix s2, sp, gi, gate;
-            if (v < 0) v = 0;
-            if (v > 65536) v = 65536;
-            s2 = fx_mul(v, v);
-            sp = fx_mul(v, 13107) + fx_mul(fx_mul(fx_mul(s2, s2), s2), s2);
-            gi = fx_div(19661, sp + 1);
-            if (gi > 65536) gi = 65536;
-            gate = fx_mul(fx_mul(gi, gi), 196608 - 2 * gi);
-            s_spark[i] = fx_mul(sp, gate);
+    // Фон: градиент бакета по колонкам (угол 270°: свет справа).
+    for (c = 0; c <= WG_COLS; c++) {
+        float pos = (1.0f - (float)c * (1.0f / WG_COLS)) * 100.0f;
+        int s = 0;
+        float f;
+        while (s < WEB_STOPS - 2 && kWebStopPos[s + 1] < pos) s++;
+        f = wg_sat((pos - kWebStopPos[s]) /
+                   (kWebStopPos[s + 1] - kWebStopPos[s] + 1e-6f));
+        for (i = 0; i < 3; i++) {
+            s_wg_bg[c][i] = (s_web_stops[s][i] +
+                (s_web_stops[s + 1][i] - s_web_stops[s][i]) * f) * 0.62f;
         }
     }
-    s_web_tick++;
 
-    for (y = 0; y < WEB_H2; y++) {
-        sfix vf, ny, uvy, ny2;
-        vf = s_vv2[y];
-        ny = vf + vf - 65536;
-        uvy = fx_mul(ny, ey);
-        ny2 = fx_mul(ny, ny);
+    // --- Вершины ---
+    for (r = 0; r <= WG_ROWS; r++) {
+        int j0 = s_wg_rj0[r];
+        float ty = s_wg_rty[r];
+        float uvy = s_wg_uy[r];
+        for (c = 0; c <= WG_COLS; c++) {
+            int i0 = s_wg_ci0[c];
+            float tx = s_wg_ctx[c];
+            float uvx = s_wg_ux[c];
+            float blen = s_wg_blen[r][c];
+            float w00 = (1.0f - tx) * (1.0f - ty), w10 = tx * (1.0f - ty);
+            float w01 = (1.0f - tx) * ty, w11 = tx * ty;
+            float ch[3];
+            float spark, vig, cr, cg, cb, bgr, bgg, bgb;
+            int i1;
 
-        for (x = 0; x < WEB_W2; x++) {
-            sfix uf = s_uu2[x];
-            sfix nx = uf + uf - 65536;
-            sfix uvx = fx_mul(nx, ex);
-            sfix blen = fast_len_fx(uvx, uvy);
-            sfix fi, ft, spark;
-            sfix ch0, ch1, ch2;
-            sfix cr, cg, cb, vig;
-            unsigned char *p = s_buf + (size_t)(y * GLOW_PITCH + x) * 4;
-            int i0, i1;
-
-            fi = fx_mul((sfix)s_spark_x2[y][x] * 257, 16711680);
-            i0 = (int)(fi >> 16);
-            if (i0 > SPARK_N - 1) i0 = SPARK_N - 1;
-            if (i0 < 0) i0 = 0;
-            ft = fi - ((sfix)i0 << 16);
-            i1 = i0 + 1;
-            if (i1 > SPARK_N - 1) i1 = SPARK_N - 1;
-            spark = s_spark[i0] + fx_mul(s_spark[i1] - s_spark[i0], ft);
-
-            // Три поля одним проходом: веса билинейки общие (та же математика).
-            {
-                sfix fx = fx_mul(uf, (sfix)((NF_W - 1) << 16));
-                sfix fy = fx_mul(vf, (sfix)((NF_H - 1) << 16));
-                int x0 = fx_floor(fx), y0 = fx_floor(fy);
-                int x1 = x0 + 1, y1 = y0 + 1;
-                sfix tx = fx - ((sfix)x0 << 16), ty = fy - ((sfix)y0 << 16);
-                sfix w00 = fx_mul(65536 - tx, 65536 - ty);
-                sfix w10 = fx_mul(tx, 65536 - ty);
-                sfix w01 = fx_mul(65536 - tx, ty);
-                sfix w11 = fx_mul(tx, ty);
-                if (x1 > NF_W - 1) x1 = NF_W - 1;
-                if (y1 > NF_H - 1) y1 = NF_H - 1;
-                ch0 = fx_mul(s_nfield[0][y0][x0], w00) + fx_mul(s_nfield[0][y0][x1], w10) +
-                      fx_mul(s_nfield[0][y1][x0], w01) + fx_mul(s_nfield[0][y1][x1], w11);
-                ch1 = fx_mul(s_nfield[1][y0][x0], w00) + fx_mul(s_nfield[1][y0][x1], w10) +
-                      fx_mul(s_nfield[1][y1][x0], w01) + fx_mul(s_nfield[1][y1][x1], w11);
-                ch2 = fx_mul(s_nfield[2][y0][x0], w00) + fx_mul(s_nfield[2][y0][x1], w10) +
-                      fx_mul(s_nfield[2][y1][x0], w01) + fx_mul(s_nfield[2][y1][x1], w11);
+            for (i1 = 0; i1 < 3; i1++) {
+                ch[i1] = s_wg_gridL[i1][j0][i0] * w00 +
+                         s_wg_gridL[i1][j0][i0 + 1] * w10 +
+                         s_wg_gridL[i1][j0 + 1][i0] * w01 +
+                         s_wg_gridL[i1][j0 + 1][i0 + 1] * w11;
             }
-
-            cr = s_wbg[x][0];
-            cg = s_wbg[x][1];
-            cb = s_wbg[x][2];
+            {
+                int k0 = s_wg_i0[r][c];
+                spark = s_wg_lut[k0] +
+                        (s_wg_lut[k0 + 1] - s_wg_lut[k0]) * s_wg_ft[r][c];
+            }
+            bgr = s_wg_bg[c][0]; bgg = s_wg_bg[c][1]; bgb = s_wg_bg[c][2];
+            cr = bgr; cg = bgg; cb = bgb;
 
             for (i = 0; i < WEB_CIRCLES; i++) {
-                sfix brad = brad0[i] + fx_mul(19661, ch0);
-                sfix bwid = bwid_[i];
-                sfix bmul = bmul_[i];
-                sfix bspark = fx_mul(bmul, spark);
-                sfix outer = brad + (bwid >> 1) + bspark;
-                sfix dx, dy, llen, dn, lay, alpha, om, glow, tt;
-                sfix rr, gg, bb;
-
+                float brad = brad0[i] + 0.3f * ch[0];
+                float outer = brad + bwidH[i] + bmul[i] * spark;
+                float dx, dy, llen, lay, dn, alpha, om, t2, glow, tt, d;
+                float rr, gg, bb;
                 if (blen >= outer) continue;
                 dx = uvx + offx[i];
                 dy = uvy + offy[i];
-                llen = fast_len_fx(dx, dy);
-                lay = i == 0 ? ch0 : (i == 1 ? ch1 : ch2);
+                llen = wg_len(dx, dy);
+                lay = ch[i];
                 dn = llen >= lay ? llen - lay : lay - llen;
-                alpha = 65536 - fx_clamp01(fx_mul(llen - lay, inv_edge[i]));
-                {
-                    // Было: t2 = (blen-0.5)/(outer-0.5) через div.
-                    // Стало: индекс в RECIP (1/(0.25+q/32), ошибка <2% — невидимо).
-                    int rq = (int)((outer - 49152) >> 11);
-                    sfix t2;
-                    if (rq < 0) rq = 0; else if (rq > RECIP_N - 1) rq = RECIP_N - 1;
-                    t2 = fx_clamp01(fx_mul(blen - 32768, s_recip[rq]));
-                    om = 65536 - fx_mul(fx_mul(t2, t2), 196608 - 2 * t2);
-                }
-                alpha = fx_mul(alpha, om);
-                if (alpha <= 0) continue;
-                {
-                    // Было: glow = inten/(1+11*dn) через div.
-                    // Стало: GLOWFALL (точное на узлах сетки 1/256).
-                    int gq = (int)(dn >> 8);
-                    if (gq > GLOWFALL_N - 1) gq = GLOWFALL_N - 1;
-                    glow = fx_mul(inten[i], s_glowfall[gq]);
-                }
-                tt = fx_clamp01((uvy + offy[i]) * 2);
-                rr = wrgb[i][0] + fx_mul(wrgb[i + 3][0] - wrgb[i][0], tt) + fx_mul(glow, 65280);
-                gg = wrgb[i][1] + fx_mul(wrgb[i + 3][1] - wrgb[i][1], tt) + fx_mul(glow, 65280);
-                bb = wrgb[i][2] + fx_mul(wrgb[i + 3][2] - wrgb[i][2], tt) + fx_mul(glow, 65280);
-                if (rr < 0) rr = 0; else if (rr > 65280) rr = 65280;
-                if (gg < 0) gg = 0; else if (gg > 65280) gg = 65280;
-                if (bb < 0) bb = 0; else if (bb > 65280) bb = 65280;
-                cr += fx_mul(rr - cr, alpha);
-                cg += fx_mul(gg - cg, alpha);
-                cb += fx_mul(bb - cb, alpha);
+                alpha = 1.0f - wg_sat((llen - lay) * inv_edge[i]);
+                d = outer - 0.5f;
+                if (d < 0.05f) d = 0.05f;
+                t2 = wg_sat((blen - 0.5f) / d);
+                om = 1.0f - t2 * t2 * (3.0f - 2.0f * t2);
+                alpha *= om;
+                if (alpha <= 0.0f) continue;
+                glow = inten[i] / (1.0f + 11.0f * dn) * 255.0f;
+                tt = wg_sat(dy * 2.0f);
+                rr = c1[i][0] + (c2[i][0] - c1[i][0]) * tt + glow;
+                gg = c1[i][1] + (c2[i][1] - c1[i][1]) * tt + glow;
+                bb = c1[i][2] + (c2[i][2] - c1[i][2]) * tt + glow;
+                if (rr < 0.0f) rr = 0.0f; else if (rr > 255.0f) rr = 255.0f;
+                if (gg < 0.0f) gg = 0.0f; else if (gg > 255.0f) gg = 255.0f;
+                if (bb < 0.0f) bb = 0.0f; else if (bb > 255.0f) bb = 255.0f;
+                cr += (rr - cr) * alpha;
+                cg += (gg - cg) * alpha;
+                cb += (bb - cb) * alpha;
             }
 
-            // На паузе кольца гаснут к фону.
-            cr = s_wbg[x][0] + fx_mul(cr - s_wbg[x][0], bright_fx);
-            cg = s_wbg[x][1] + fx_mul(cg - s_wbg[x][1], bright_fx);
-            cb = s_wbg[x][2] + fx_mul(cb - s_wbg[x][2], bright_fx);
-
-            if (s_liked) {
-                cr += 2560;
-                cg -= 1024;
-                cb -= 2560;
-            }
-
-            vig = 65536 - fx_mul(19661, fx_mul(fx_mul(nx, nx), 45875) +
-                                          fx_mul(ny2, 32768));
-            cr = fx_mul(cr, vig);
-            cg = fx_mul(cg, vig);
-            cb = fx_mul(cb, vig);
-
-            if (cr < 0) cr = 0; else if (cr > 65280) cr = 65280;
-            if (cg < 0) cg = 0; else if (cg > 65280) cg = 65280;
-            if (cb < 0) cb = 0; else if (cb > 65280) cb = 65280;
-            p[0] = (unsigned char)((cr + 128) >> 8);
-            p[1] = (unsigned char)((cg + 128) >> 8);
-            p[2] = (unsigned char)((cb + 128) >> 8);
-            p[3] = 255;
+            // На паузе кольца гаснут к фону; лайк — тёплый сдвиг; виньетка.
+            cr = bgr + (cr - bgr) * bright + lr;
+            cg = bgg + (cg - bgg) * bright + lg;
+            cb = bgb + (cb - bgb) * bright + lb;
+            vig = 1.0f - 0.3f * (s_wg_nx2[c] * 0.7f + s_wg_ny2[r] * 0.5f);
+            cr *= vig; cg *= vig; cb *= vig;
+            if (cr < 0.0f) cr = 0.0f; else if (cr > 255.0f) cr = 255.0f;
+            if (cg < 0.0f) cg = 0.0f; else if (cg > 255.0f) cg = 255.0f;
+            if (cb < 0.0f) cb = 0.0f; else if (cb > 255.0f) cb = 255.0f;
+            s_wg_rgb[r][c] = 0xFF000000u | ((unsigned int)(cb + 0.5f) << 16) |
+                             ((unsigned int)(cg + 0.5f) << 8) |
+                             (unsigned int)(cr + 0.5f);
         }
     }
+}
+
+/* ------------------------------------------------------------------------
+ * MESH — mesh gradient по мотивам Paper Shaders (paper-design/shaders,
+ * mesh-gradient.ts, Apache-2.0, (c) Lost Coast Labs): цветные пятна идут по
+ * Лиссажу, поле искажается органическим «дыханием» и закручивается вихрем,
+ * цвет в точке = среднее пятен с весом 1/(d^3.5 + 1e-3).
+ * На PSP считается не попиксельно, а в вершинах сетки 32x18, GPU
+ * интерполирует цвет по треугольникам (Gouraud). Без текстуры, без VFPU,
+ * без записи в память текстуры: ~600 вершин * 8 пятен на кадр.
+ * ------------------------------------------------------------------------ */
+#define MESH_COLS 32
+#define MESH_ROWS 18
+#define MESH_SPOTS 8
+#define MESH_DISTORTION 0.8f
+#define MESH_SWIRL 0.3f
+
+typedef struct {
+    unsigned int color;
+    short x, y, z, pad;   /* 12 байт: выравнивание вершины GU по цвету (4) */
+} MeshVert;
+
+static unsigned int s_mesh_rgb[MESH_ROWS + 1][MESH_COLS + 1];
+static float s_mesh_spot[MESH_SPOTS][3];
+static float s_mesh_time = 0.0f;
+static float s_mesh_speed = 0.3f;
+static float s_mesh_bright = 1.0f;
+static float s_mesh_like = 0.0f;
+static int s_mesh_inited = 0;
+
+static float mesh_smooth(float x)
+{
+    if (x <= 0.0f) return 0.0f;
+    if (x >= 1.0f) return 1.0f;
+    return x * x * (3.0f - 2.0f * x);
+}
+
+static void mesh_set_target(float *dst, const unsigned char *c, float k)
+{
+    dst[0] = (float)c[0] * k;
+    dst[1] = (float)c[1] * k;
+    dst[2] = (float)c[2] * k;
+}
+
+// Цели цветов пятен из палитры обложки: два акцента, оттенки, средний цвет
+// и тёмные пятна для контраста (иначе фон превращается в сплошную кашу).
+static void mesh_targets(float t[MESH_SPOTS][3])
+{
+    unsigned char mix[3];
+    int i;
+    for (i = 0; i < 3; i++) {
+        mix[i] = (unsigned char)(((int)s_pal[0][i] + (int)s_pal[2][i]) / 2);
+    }
+    mesh_set_target(t[0], s_pal[0], 1.0f);
+    mesh_set_target(t[1], s_pal[1], 1.0f);
+    mesh_set_target(t[2], s_pal[0], 0.55f);
+    mesh_set_target(t[3], s_pal[2], 0.9f);
+    mesh_set_target(t[4], s_pal[1], 0.5f);
+    mesh_set_target(t[5], mix, 0.9f);
+    mesh_set_target(t[6], s_pal[3], 1.0f);
+    mesh_set_target(t[7], s_pal[3], 1.0f);
+}
+
+static void mesh_update(float dt)
+{
+    float tgt[MESH_SPOTS][3];
+    float px[MESH_SPOTS], py[MESH_SPOTS];
+    float speed_t = s_playing ? 0.32f : 0.10f;
+    float bright_t = s_playing ? 1.0f : 0.6f;
+    float pulse = 1.0f;
+    float k, t, bright, like;
+    int i, r, c;
+
+    if (dt > 0.1f) dt = 0.1f;
+    k = dt * 3.0f;
+    if (k > 1.0f) k = 1.0f;
+
+    mesh_targets(tgt);
+    if (!s_mesh_inited) {
+        memcpy(s_mesh_spot, tgt, sizeof(s_mesh_spot));
+        s_mesh_bright = bright_t;
+        s_mesh_like = s_liked ? 1.0f : 0.0f;
+        s_mesh_speed = speed_t;
+        s_mesh_inited = 1;
+    } else {
+        // Плавная смена цветов при новой обложке и play/pause.
+        for (i = 0; i < MESH_SPOTS; i++) {
+            s_mesh_spot[i][0] += (tgt[i][0] - s_mesh_spot[i][0]) * k;
+            s_mesh_spot[i][1] += (tgt[i][1] - s_mesh_spot[i][1]) * k;
+            s_mesh_spot[i][2] += (tgt[i][2] - s_mesh_spot[i][2]) * k;
+        }
+        s_mesh_bright += (bright_t - s_mesh_bright) * k;
+        s_mesh_like += ((s_liked ? 1.0f : 0.0f) - s_mesh_like) * k;
+        s_mesh_speed += (speed_t - s_mesh_speed) * k;
+    }
+    s_mesh_time += dt * s_mesh_speed;
+
+    if (s_frame < s_pulse_until) {
+        pulse = 1.0f + 0.45f * (float)(s_pulse_until - s_frame) / 45.0f;
+    }
+    bright = s_mesh_bright * pulse;
+    like = s_mesh_like;
+
+    // t как в шейдере: .5 * (time + firstFrameOffset).
+    t = 0.5f * (s_mesh_time + 41.5f);
+
+    // getPosition(i, t) из шейдера: Лиссажу на пятно.
+    for (i = 0; i < MESH_SPOTS; i++) {
+        float fi = (float)i;
+        float a = fi * 0.37f;
+        float q = fi * (1.0f / 3.0f);
+        float q2 = (fi + 1.0f) * 0.25f;
+        float b = 0.6f + (q - floorf(q)) * 0.9f;
+        float cc = 0.8f + (q2 - floorf(q2));
+        px[i] = 0.5f + 0.5f * fsin(t * b + a);
+        py[i] = 0.5f + 0.5f * fsin(t * cc + a * 1.5f + 1.5707963f);
+    }
+
+    for (r = 0; r <= MESH_ROWS; r++) {
+        float v0 = (float)r * (1.0f / MESH_ROWS);
+        for (c = 0; c <= MESH_COLS; c++) {
+            float u0 = (float)c * (1.0f / MESH_COLS);
+            float uvx = u0, uvy = v0;
+            float dx = u0 - 0.5f, dy = v0 - 0.5f;
+            float rad = mesh_smooth(sqrtf(dx * dx + dy * dy));
+            float center = 1.0f - rad;
+            float ang, ca, sa, rx, ry;
+            float cr = 0.0f, cg = 0.0f, cb = 0.0f, tw = 0.0f, inv, kk;
+            int ii;
+
+            // Органическое искажение (два прохода как в шейдере).
+            for (ii = 1; ii <= 2; ii++) {
+                float fi = (float)ii;
+                float sy = mesh_smooth(uvy);
+                float sx;
+                uvx += MESH_DISTORTION * center / fi *
+                       fsin(t + fi * 0.4f * sy) *
+                       fsin(0.2f * t + fi * 2.4f * sy + 1.5707963f);
+                sx = mesh_smooth(uvx);
+                uvy += MESH_DISTORTION * center / fi *
+                       fsin(t + fi * 2.0f * sx + 1.5707963f);
+            }
+
+            // Вихрь: поворот пропорционален расстоянию от центра.
+            ang = 3.0f * MESH_SWIRL * rad;
+            ca = fsin(-ang + 1.5707963f);
+            sa = fsin(-ang);
+            rx = uvx - 0.5f;
+            ry = uvy - 0.5f;
+            {
+                float nx = ca * rx - sa * ry + 0.5f;
+                float ny = sa * rx + ca * ry + 0.5f;
+                uvx = nx;
+                uvy = ny;
+            }
+
+            for (ii = 0; ii < MESH_SPOTS; ii++) {
+                float ex = uvx - px[ii], ey = uvy - py[ii];
+                float d2 = ex * ex + ey * ey;
+                float d = sqrtf(d2);
+                float w = 1.0f / (d2 * d * sqrtf(d) + 1e-3f);  // d^3.5
+                cr += s_mesh_spot[ii][0] * w;
+                cg += s_mesh_spot[ii][1] * w;
+                cb += s_mesh_spot[ii][2] * w;
+                tw += w;
+            }
+            inv = 1.0f / (tw > 1e-4f ? tw : 1e-4f);
+            // Лёгкая виньетка: края темнее, чтобы текст интерфейса читался.
+            kk = inv * bright * (0.78f + 0.22f * center);
+            {
+                float fr = cr * kk + like * 10.0f;
+                float fg = cg * kk - like * 4.0f;
+                float fb = cb * kk - like * 10.0f;
+                unsigned int ir, ig, ib;
+                if (fr < 0.0f) fr = 0.0f; else if (fr > 255.0f) fr = 255.0f;
+                if (fg < 0.0f) fg = 0.0f; else if (fg > 255.0f) fg = 255.0f;
+                if (fb < 0.0f) fb = 0.0f; else if (fb > 255.0f) fb = 255.0f;
+                ir = (unsigned int)fr;
+                ig = (unsigned int)fg;
+                ib = (unsigned int)fb;
+                s_mesh_rgb[r][c] = 0xFF000000u | (ib << 16) | (ig << 8) | ir;
+            }
+        }
+    }
+}
+
+// Рисует сетку цветов вершин (rows+1 строк по cols+1 цветов ABGR) полосами
+// треугольников с Gouraud-интерполяцией. Общий путь для стилей MESH и WEB.
+static void grid_draw(const unsigned int *rgb, int cols, int rows,
+                      float x, float y, float w, float h)
+{
+    short xs[WG_COLS + 1], ys[WG_ROWS + 1];
+    MeshVert *base, *p;
+    int stride = cols + 1;
+    int r, c;
+
+    if (cols > WG_COLS || rows > WG_ROWS) return;
+    for (c = 0; c <= cols; c++) {
+        xs[c] = (short)(x + w * (float)c / (float)cols + 0.5f);
+    }
+    for (r = 0; r <= rows; r++) {
+        ys[r] = (short)(y + h * (float)r / (float)rows + 0.5f);
+    }
+    base = (MeshVert *)sceGuGetMemory(
+        (unsigned)(rows * stride * 2) * sizeof(MeshVert));
+    if (!base) return;
+
+    hal_gpu_set_texturing(0);
+    hal_gpu_set_blend(0, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
+    sceGuShadeModel(GU_SMOOTH);
+
+    p = base;
+    for (r = 0; r < rows; r++) {
+        MeshVert *strip = p;
+        for (c = 0; c <= cols; c++) {
+            p->color = rgb[r * stride + c];
+            p->x = xs[c]; p->y = ys[r]; p->z = 0; p->pad = 0;
+            p++;
+            p->color = rgb[(r + 1) * stride + c];
+            p->x = xs[c]; p->y = ys[r + 1]; p->z = 0; p->pad = 0;
+            p++;
+        }
+        sceGuDrawArray(GU_TRIANGLE_STRIP,
+                       GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
+                       2 * stride, 0, strip);
+    }
+
+    // Базовое состояние приложения: blend включён (см. glow_bg_draw).
+    hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
+    hal_gpu_invalidate_tex_state();
 }
 
 // Обновление текстуры: каждый стиль — каждый кадр (плавность без рывков).
@@ -1860,38 +1511,38 @@ static void glow_update(void)
         sin_tab_init();
     }
 
+    now = sceKernelGetSystemTimeWide();
+    dt = s_last_us ? (float)(now - s_last_us) / 1000000.0f : 0.033f;
+    if (dt < 0.0f) dt = 0.0f;
+    if (dt > 0.25f) dt = 0.25f;
+    s_last_us = now;
+
+    if (s_style == GLOW_STYLE_MESH) {
+        mesh_update(dt);
+        return;  // рисуется вершинами, текстура не нужна
+    }
+    if (s_style == GLOW_STYLE_WEB) {
+        web_update(dt);
+        return;  // то же: сетка вершин, без текстуры
+    }
     if (s_style == GLOW_STYLE_CLASSIC) {
         classic_update();
-    } else if (s_style == GLOW_STYLE_STRANDS) {
-        strands_update();
     } else {
-        now = sceKernelGetSystemTimeWide();
-        dt = s_last_us ? (float)(now - s_last_us) / 1000000.0f : 0.033f;
-        if (dt < 0.0f) dt = 0.0f;
-        if (dt > 0.25f) dt = 0.25f;
-        s_last_us = now;
-        web_update(dt);
+        strands_update();
     }
 
-    // Padding для LINEAR-фильтра: реплика последнего столбца/строки.
-    // VFPU-ядро (как классика/нити) рисует 240x136; C-путь веба — 120x68.
+    // Padding для LINEAR-фильтра: реплика последнего столбца/строки (240x136).
     {
-        int y, pw, ph;
-#if VFPU_STAGE
-        pw = GLOW_W;
-        ph = GLOW_H;
-#else
-        pw = (s_style == GLOW_STYLE_WEB) ? WEB_W2 : GLOW_W;
-        ph = (s_style == GLOW_STYLE_WEB) ? WEB_H2 : GLOW_H;
-#endif
-        for (y = 0; y < ph; y++) {
-            memcpy(s_buf + (size_t)(y * GLOW_PITCH + pw) * 4,
-                   s_buf + (size_t)(y * GLOW_PITCH + pw - 1) * 4,
-                   (size_t)(GLOW_PITCH - pw) * 4);
+        int y;
+        for (y = 0; y < GLOW_H; y++) {
+            memcpy(s_buf + (size_t)(y * GLOW_PITCH + GLOW_W) * 4,
+                   s_buf + (size_t)(y * GLOW_PITCH + GLOW_W - 1) * 4,
+                   (size_t)(GLOW_PITCH - GLOW_W) * 4);
         }
-        memcpy(s_buf + (size_t)(ph * GLOW_PITCH) * 4,
-               s_buf + (size_t)((ph - 1) * GLOW_PITCH) * 4,
+        memcpy(s_buf + (size_t)(GLOW_H * GLOW_PITCH) * 4,
+               s_buf + (size_t)((GLOW_H - 1) * GLOW_PITCH) * 4,
                (size_t)GLOW_PITCH * 4);
+        s_tex_rows = GLOW_H;
     }
 }
 
@@ -1900,70 +1551,16 @@ void glow_bg_init(void)
     if (s_buf) {
         return;
     }
-#if VFPU_PROBE
-    vfpu_probe_run();
-#endif
     s_buf = (unsigned char *)memalign(64, (size_t)GLOW_PITCH * GLOW_TEX_H * 4);
     if (s_buf) {
         memset(s_buf, 0, (size_t)GLOW_PITCH * GLOW_TEX_H * 4);
     }
     s_frame = 0;
     glow_config_load();
-
-    // Предрасчёты статической геометрии веб-стиля: разово, не в кадре.
     if (!s_sin_ready) {
         sin_tab_init();
     }
-    {
-        int x, y;
-        for (x = 0; x < GLOW_W; x++) {
-            s_uu[x] = ((sfix)x << 16) / (GLOW_W - 1);
-        }
-        for (y = 0; y < GLOW_H; y++) {
-            s_vv[y] = ((sfix)y << 16) / (GLOW_H - 1);
-        }
-        for (y = 0; y < GLOW_H; y++) {
-            float v = (float)y * (1.0f / (GLOW_H - 1));
-            float uvy = (v * 2.0f - 1.0f) * WEB_EY;
-            for (x = 0; x < GLOW_W; x++) {
-                float u = (float)x * (1.0f / (GLOW_W - 1));
-                float uvx = (u * 2.0f - 1.0f) * WEB_EX;
-                float ang = fast_atan2(uvy, uvx) * 0.15915494f + 0.5f;
-                if (ang < 0.0f) ang = 0.0f;
-                if (ang > 1.0f) ang = 1.0f;
-                s_spark_x[y][x] = (unsigned char)(ang * 255.0f);
-            }
-        }
-        // Половинная геометрия веб-стиля + LUT вместо попиксельных делений.
-        // Всё целочисленное, разово при инициализации.
-        for (x = 0; x < WEB_W2; x++) {
-            s_uu2[x] = (sfix)(((int64_t)(4 * x + 1) << 15) / (GLOW_W - 1));
-        }
-        for (y = 0; y < WEB_H2; y++) {
-            s_vv2[y] = (sfix)(((int64_t)(4 * y + 1) << 15) / (GLOW_H - 1));
-        }
-        for (y = 0; y < WEB_H2; y++) {
-            float v2 = ((float)(2 * y) + 0.5f) * (1.0f / (GLOW_H - 1));
-            float uvy2 = (v2 * 2.0f - 1.0f) * WEB_EY;
-            for (x = 0; x < WEB_W2; x++) {
-                float u2 = ((float)(2 * x) + 0.5f) * (1.0f / (GLOW_W - 1));
-                float uvx2 = (u2 * 2.0f - 1.0f) * WEB_EX;
-                float ang2 = fast_atan2(uvy2, uvx2) * 0.15915494f + 0.5f;
-                if (ang2 < 0.0f) ang2 = 0.0f;
-                if (ang2 > 1.0f) ang2 = 1.0f;
-                s_spark_x2[y][x] = (unsigned char)(ang2 * 255.0f);
-            }
-        }
-        for (x = 0; x < GLOWFALL_N; x++) {
-            s_glowfall[x] = (sfix)(16777216 / (256 + 11 * x));
-        }
-        for (x = 0; x < RECIP_N; x++) {
-            s_recip[x] = (sfix)(2097152 / (8 + x));
-        }
-#if VFPU_STAGE
-        vfpu_init_tables();
-#endif
-    }
+    web_geom_init();  // статическая геометрия вершин веб-стиля: разово
 }
 
 void glow_bg_free(void)
@@ -1984,7 +1581,17 @@ void glow_bg_draw(float x, float y, float w, float h)
     glow_update();
     s_frame++;
 
-    sceKernelDcacheWritebackRange(s_buf, (size_t)GLOW_PITCH * GLOW_TEX_H * 4);
+    if (s_style == GLOW_STYLE_MESH) {
+        grid_draw(&s_mesh_rgb[0][0], MESH_COLS, MESH_ROWS, x, y, w, h);
+        return;
+    }
+    if (s_style == GLOW_STYLE_WEB) {
+        grid_draw(&s_wg_rgb[0][0], WG_COLS, WG_ROWS, x, y, w, h);
+        return;
+    }
+
+    // Только заполненные строки (+1 строка паддинга), а не все 256 КБ.
+    sceKernelDcacheWritebackRange(s_buf, (size_t)GLOW_PITCH * (s_tex_rows + 1) * 4);
     hal_gpu_set_texturing(1);
     hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
     sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
@@ -2003,20 +1610,8 @@ void glow_bg_draw(float x, float y, float w, float h)
         v[0].x = (short)x;
         v[0].y = (short)y;
         v[0].z = 0;
-        v[1].u = (unsigned short)(
-#if VFPU_STAGE
-            GLOW_W
-#else
-            ((s_style == GLOW_STYLE_WEB) ? WEB_W2 : GLOW_W)
-#endif
-        );
-        v[1].v = (unsigned short)(
-#if VFPU_STAGE
-            GLOW_H
-#else
-            ((s_style == GLOW_STYLE_WEB) ? WEB_H2 : GLOW_H)
-#endif
-        );
+        v[1].u = (unsigned short)GLOW_W;
+        v[1].v = (unsigned short)s_tex_rows;
         v[1].x = (short)(x + w);
         v[1].y = (short)(y + h);
         v[1].z = 0;

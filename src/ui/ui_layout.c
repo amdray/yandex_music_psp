@@ -1,4 +1,5 @@
 #include "ui/ui_layout.h"
+#include "services/libc_guard.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -139,17 +140,17 @@ static int parse_widget(char *value, UiLayoutScreen *screen, int line_number)
         logLine("layout: invalid widget line=%d\n", line_number);
         return -1;
     }
-    widget->x = (float)strtod(f[2], &end);
+    widget->x = (float)ym_strtod(f[2], &end);
     if (!end || *end) return -1;
-    widget->y = (float)strtod(f[3], &end);
+    widget->y = (float)ym_strtod(f[3], &end);
     if (!end || *end) return -1;
-    widget->w = (float)strtod(f[4], &end);
+    widget->w = (float)ym_strtod(f[4], &end);
     if (!end || *end) return -1;
-    widget->h = (float)strtod(f[5], &end);
+    widget->h = (float)ym_strtod(f[5], &end);
     if (!end || *end) return -1;
     widget->step = 0.0f;
     if (count >= 9 && f[8][0]) {
-        widget->step = (float)strtod(f[8], &end);
+        widget->step = (float)ym_strtod(f[8], &end);
         if (!end || *end) return -1;
     }
     if (count >= 10 && f[9][0] &&

@@ -326,6 +326,10 @@ static void screens_sync_lifecycle(AppState *state)
     logLine("ui: screen change %s -> %s\n",
             screen_name(s_last_screen), screen_name(current));
     logger_flush();
+    /* Синхронная метка на карту: переживает обесточивание консоли,
+       в отличие от асинхронного app.log. */
+    logger_checkpoint("screen %s -> %s",
+                      screen_name(s_last_screen), screen_name(current));
 
     prev_desc = screen_desc(s_last_screen);
     if (prev_desc && prev_desc->on_exit) {

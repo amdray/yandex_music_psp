@@ -26,8 +26,9 @@ static void eq_edit_band(int band, float delta)
         eq_set_preset(EQ_PRESET_CUSTOM);
     }
     eq_set_custom_gain(band, eq_get_custom_gain(band) + delta);
-    logLine("eq: custom band %d %+g dB\n", band,
-            (double)eq_get_custom_gain(band));
+    /* без %g (dtoa не потокобезопасен): усиление в десятых дБ */
+    logLine("eq: custom band %d gain=%+d (x0.1 dB)\n", band,
+            (int)(eq_get_custom_gain(band) * 10.0f));
 }
 
 void ui_screen_eq_on_enter(AppState *state)
@@ -72,7 +73,13 @@ static void eq_band_label(int band, char *out, int out_size)
 {
     float f = eq_band_freq(band);
     if (f >= 1000.0f) {
-        snprintf(out, out_size, "%g kHz", (double)(f / 1000.0f));
+        /* Без %g: dtoa newlib не потокобезопасен (см. libc_guard.h). */
+        int khz10 = (int)(f / 100.0f + 0.5f);
+        if (khz10 % 10 == 0) {
+            snprintf(out, out_size, "%d kHz", khz10 / 10);
+        } else {
+            snprintf(out, out_size, "%d.%d kHz", khz10 / 10, khz10 % 10);
+        }
     } else {
         snprintf(out, out_size, "%d Hz", (int)(f + 0.5f));
     }

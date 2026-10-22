@@ -6,15 +6,27 @@
 #include <mbedtls/base64.h>
 #include <mbedtls/md.h>
 #include <cjson/cJSON.h>
+#include "services/libc_guard.h"
 
 #include "core/logger.h"
 #include "services/net_http.h"
 
 #define YM_FILE_INFO_SECRET "kzqU4XhfCaY6B6JTHODeq5"
-#define YM_FILE_INFO_CODECS "mp3"
+#define YM_FILE_INFO_CODECS_MP3 "mp3"
+/* Полный список кодеков как у ymd/старого native: сервер сам выберет
+ * лучший доступный (flac-mp4 / aac-mp4 / he-aac-mp4 / mp3). Ключевой
+ * момент: sign считается по списку БЕЗ запятых (nc), а в query идёт
+ * список с запятыми — с коротким "flac" сервер молча отдаёт mp3. */
+#define YM_FILE_INFO_CODECS_FULL \
+    "flac,flac-mp4,mp3,aac,he-aac,aac-mp4,he-aac-mp4"
+#define YM_FILE_INFO_CODECS_FULL_NC \
+    "flacflac-mp4mp3aache-aacaac-mp4he-aac-mp4"
 #define YM_FILE_INFO_TRANSPORTS "raw"
 
-// Качество MP3: "nq" (192) / "hq" (320), проверено пробой get-file-info.
+// Качество: "lq" / "nq" (192) / "hq" (320) / "mp3" (формат: codecs=mp3,
+// 192 kbps — серверу отдаём как nq), проверено пробой get-file-info
+// с полным списком кодеков: lq -> he-aac-mp4@64, nq -> aac-mp4@192,
+// hq -> aac-mp4@256, lossless -> flac-mp4 (mp3 при codecs=mp3).
 // Действует со следующего трека (текущий уже тянется своим URL).
 /* Both values have static lifetime; an aligned pointer store publishes the
  * selection without modifying bytes that a download worker may be reading. */
@@ -22,16 +34,32 @@ static const char * volatile s_quality = "nq";
 
 void ym_api_download_set_quality(const char *q)
 {
-    if (q && (strcmp(q, "nq") == 0 || strcmp(q, "hq") == 0)) {
-        s_quality = strcmp(q, "hq") == 0 ? "hq" : "nq";
-        logLine("ym_api_download: quality %s\n", s_quality);
-        logger_flush();
+    /* Только статические литералы: eq.c отдаёт буфер из стека. */
+    if (q && strcmp(q, "lq") == 0) {
+        s_quality = "lq";
+    } else if (q && strcmp(q, "hq") == 0) {
+        s_quality = "hq";
+    } else if (q && strcmp(q, "nq") == 0) {
+        s_quality = "nq";
+    } else if (q && strcmp(q, "mp3") == 0) {
+        s_quality = "mp3";
+    } else {
+        return;
     }
+    logLine("ym_api_download: quality %s\n", s_quality);
+    logger_flush();
 }
 
 const char *ym_api_download_quality(void)
 {
     return s_quality;
+}
+
+/* Сервер знает только lq/nq/hq: выбранный формат "mp3" отдаём как nq —
+ * при codecs=mp3 это 192 kbps (см. комментарий выше). */
+static const char *ym_download_http_quality(void)
+{
+    return (s_quality && strcmp(s_quality, "mp3") == 0) ? "nq" : s_quality;
 }
 
 static int ym_url_encode_component(const char *in, char *out, size_t out_size)
@@ -69,22 +97,24 @@ static int ym_url_encode_component(const char *in, char *out, size_t out_size)
 
 static int ym_download_build_file_info_url(const char *track_id,
                                              const char *quality,
-                                             const char *codecs,
+                                             const char *codecs_query,
+                                             const char *codecs_sign,
                                              const char *transports,
                                              char *out_url, size_t out_size)
 {
     const mbedtls_md_info_t *md_info;
     time_t now;
     char ts[24];
-    char sign_input[96];
+    char sign_input[128];
     unsigned char digest[32];
     unsigned char sign_b64_raw[64];
     char sign_b64[64];
-    char sign_query[96];
+    char sign_query[144];
     size_t olen = 0;
     int url_len;
 
-    if (!track_id || !quality || !codecs || !transports || !out_url || out_size == 0) {
+    if (!track_id || !quality || !codecs_query || !codecs_sign ||
+        !transports || !out_url || out_size == 0) {
         return -1;
     }
 
@@ -96,9 +126,10 @@ static int ym_download_build_file_info_url(const char *track_id,
     snprintf(ts, sizeof(ts), "%ld", (long)now);
     ts[sizeof(ts) - 1] = '\0';
 
+    /* Подпись — по списку кодеков БЕЗ запятых (проверено живым API). */
     snprintf(sign_input, sizeof(sign_input), "%s%s%s%s%s",
              ts, track_id, quality,
-             codecs, transports);
+             codecs_sign, transports);
     sign_input[sizeof(sign_input) - 1] = '\0';
 
     md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -133,7 +164,7 @@ static int ym_download_build_file_info_url(const char *track_id,
     url_len = snprintf(out_url, out_size,
                        "https://api.music.yandex.net/get-file-info"
                        "?ts=%s&trackId=%s&quality=%s&codecs=%s&sign=%s&transports=%s",
-                       ts, track_id, quality, codecs,
+                       ts, track_id, quality, codecs_query,
                        sign_query, transports);
     if (url_len < 0 || (size_t)url_len >= out_size) {
         logLine("ym_api_download: URL truncated need=%d have=%u\n",
@@ -149,16 +180,33 @@ static int ym_json_string_nonempty(cJSON *node)
     return node && cJSON_IsString(node) && node->valuestring && node->valuestring[0] != '\0';
 }
 
+/* Сервер отдаёт кодек-семейство в плоской форме: flac-mp4 (контейнер MP4),
+ * aac-mp4 / he-aac-mp4 и т.д. want — семейство ("flac"/"aac"/"mp3"). */
+static int ym_codec_family_match(const char *want, const char *got)
+{
+    if (!want || !got || !got[0]) return 0;
+    if (strcmp(want, "mp3") == 0) return strcmp(got, "mp3") == 0;
+    if (strcmp(want, "flac") == 0) {
+        return strcmp(got, "flac") == 0 || strcmp(got, "flac-mp4") == 0;
+    }
+    if (strcmp(want, "aac") == 0) {
+        return strcmp(got, "aac") == 0 || strcmp(got, "he-aac") == 0 ||
+               strcmp(got, "aac-mp4") == 0 || strcmp(got, "he-aac-mp4") == 0;
+    }
+    return strcmp(want, got) == 0;
+}
+
 static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
                                             const char *track_id,
                                             const char *quality,
-                                            const char *codecs,
+                                            const char *codecs_query,
+                                            const char *codecs_sign,
                                             const char *transports,
                                             const char *want_codec,
                                             YmDownloadVariant *out)
 {
     NetHttpResponse response;
-    char url[256];
+    char url[384];
     cJSON *root = NULL;
     cJSON *result = NULL;
     cJSON *download_info = NULL;
@@ -171,8 +219,9 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
     int bitrate_kbps = 0;
     int ret;
 
-    if (!ctx || !ctx->oauth_token || !track_id || !quality || !codecs ||
-        !transports || !want_codec || !out || track_id[0] == '\0') {
+    if (!ctx || !ctx->oauth_token || !track_id || !quality || !codecs_query ||
+        !codecs_sign || !transports || !want_codec || !out ||
+        track_id[0] == '\0') {
         logLine("ym_api_download: invalid args ctx=%d token=%d track_id=%d out=%d\n",
                 ctx ? 1 : 0,
                 (ctx && ctx->oauth_token) ? 1 : 0,
@@ -183,8 +232,9 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
     }
     memset(out, 0, sizeof(*out));
 
-    if (ym_download_build_file_info_url(track_id, quality, codecs,
-                                          transports, url, sizeof(url)) != 0) {
+    if (ym_download_build_file_info_url(track_id, quality, codecs_query,
+                                          codecs_sign, transports,
+                                          url, sizeof(url)) != 0) {
         logger_flush();
         return YM_ERR_PARSE;
     }
@@ -222,7 +272,7 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
     logLine("ym_api_download: response status=%d size=%d\n",
             response.status_code, response.body_size);
 
-    root = cJSON_Parse(response.body);
+    root = ym_json_parse(response.body);
     net_http_response_free(&response);
     memset(&response, 0, sizeof(response));
 
@@ -249,9 +299,16 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
     bitrate = cJSON_GetObjectItemCaseSensitive(download_info, "bitrate");
     key = cJSON_GetObjectItemCaseSensitive(download_info, "key");
 
-    if (!ym_json_string_nonempty(codec) || strcmp(codec->valuestring, want_codec) != 0) {
-        logLine("ym_api_download: rejected codec='%s'\n",
-                (codec && cJSON_IsString(codec) && codec->valuestring) ? codec->valuestring : "(missing)");
+    if (!ym_json_string_nonempty(codec) ||
+        !ym_codec_family_match(want_codec, codec->valuestring)) {
+        logLine("ym_api_download: rejected codec='%s' want_family=%s\n",
+                (codec && cJSON_IsString(codec) && codec->valuestring)
+                    ? codec->valuestring : "(missing)",
+                want_codec);
+        if (ym_json_string_nonempty(codec) &&
+            strlen(codec->valuestring) < sizeof(out->codec)) {
+            strncpy(out->codec, codec->valuestring, sizeof(out->codec) - 1);
+        }
         cJSON_Delete(root);
         logger_flush();
         return YM_ERR_UNSUPPORTED;
@@ -307,12 +364,12 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
 
     strncpy(out->url, direct_url, sizeof(out->url) - 1);
     out->url[sizeof(out->url) - 1] = '\0';
-    strncpy(out->codec, want_codec, sizeof(out->codec) - 1);
-    out->codec[sizeof(out->codec) - 1] = '\0';
+    /* Фактический кодек сервера (flac-mp4 / aac-mp4 / he-aac-mp4 / mp3). */
+    snprintf(out->codec, sizeof(out->codec), "%s", codec->valuestring);
     strcpy(out->transport, "raw");
     out->bitrate_kbps = bitrate_kbps;
     out->encrypted = 0;
-    logLine("ym_api_download: direct %s url ok codec=%s transport=raw bitrate=%d key=none url_len=%u\n",
+    logLine("ym_api_download: direct url ok family=%s codec=%s transport=raw bitrate=%d key=none url_len=%u\n",
             want_codec, out->codec,
             out->bitrate_kbps, (unsigned int)strlen(out->url));
     cJSON_Delete(root);
@@ -324,8 +381,9 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
                                      const char *track_id,
                                      YmDownloadVariant *out)
 {
-    return ym_download_fetch_variant(ctx, track_id, s_quality,
-                                     YM_FILE_INFO_CODECS,
+    return ym_download_fetch_variant(ctx, track_id, ym_download_http_quality(),
+                                     YM_FILE_INFO_CODECS_MP3,
+                                     YM_FILE_INFO_CODECS_MP3,
                                      YM_FILE_INFO_TRANSPORTS, "mp3", out);
 }
 
@@ -334,5 +392,17 @@ YmStatus ym_api_download_get_flac_raw(YmApiContext *ctx,
                                       YmDownloadVariant *out)
 {
     return ym_download_fetch_variant(ctx, track_id, "lossless",
-                                     "flac", "raw", "flac", out);
+                                     YM_FILE_INFO_CODECS_FULL,
+                                     YM_FILE_INFO_CODECS_FULL_NC,
+                                     YM_FILE_INFO_TRANSPORTS, "flac", out);
+}
+
+YmStatus ym_api_download_get_aac_raw(YmApiContext *ctx,
+                                     const char *track_id,
+                                     YmDownloadVariant *out)
+{
+    return ym_download_fetch_variant(ctx, track_id, ym_download_http_quality(),
+                                     YM_FILE_INFO_CODECS_FULL,
+                                     YM_FILE_INFO_CODECS_FULL_NC,
+                                     YM_FILE_INFO_TRANSPORTS, "aac", out);
 }

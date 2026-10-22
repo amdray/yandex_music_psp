@@ -24,7 +24,10 @@ int ym_api_parse_track_id_node(const cJSON *id_node, char *out, size_t out_size)
         return 0;
     }
     if (cJSON_IsNumber(id_node)) {
-        written = snprintf(out, out_size, "%.0f", id_node->valuedouble);
+        /* Без %.0f (dtoa не потокобезопасен): id < 2^53 — целое. */
+        double v = id_node->valuedouble;
+        written = snprintf(out, out_size, "%lld",
+                           (long long)(v >= 0 ? v + 0.5 : v - 0.5));
         if (written <= 0 || (size_t)written >= out_size) {
             return -1;
         }

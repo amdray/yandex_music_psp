@@ -14,9 +14,9 @@
 #define IMPOSE_MAIN_VOLUME   0x1u
 #define VOLUME_POLL_US       100000ULL
 #define BATTERY_POLL_US      5000000ULL
-#define BATTERY_LOG_US       30000000ULL
+#define BATTERY_LOG_US       300000000ULL
 #define CPU_SAMPLE_US        1000000ULL
-#define CPU_LOG_US           5000000ULL
+#define CPU_LOG_US           60000000ULL
 #define CPU_LOG_FLUSH_US     30000000ULL
 #define CPU_LOG_PATH         "data/logs/cpu.txt"
 #define CPU_LOG_BUFFER_SIZE  (4 * 1024)
@@ -59,85 +59,33 @@ static unsigned int s_cpu_sample_count;
 static unsigned int s_cpu_busy_min_bp;
 static unsigned int s_cpu_busy_max_bp;
 static SceUID s_cpu_log_fd = -1;
-static char s_cpu_log_buffer[CPU_LOG_BUFFER_SIZE];
 static size_t s_cpu_log_used;
 static unsigned int s_cpu_log_dropped;
 static u64 s_last_cpu_log_flush_us;
 
-static void cpu_log_disable(const char *operation, int rc)
-{
-    logLine("cpu_telemetry: %s failed rc=%d\n", operation, rc);
-    if (s_cpu_log_fd >= 0) {
-        fs_close(s_cpu_log_fd);
-        s_cpu_log_fd = -1;
-    }
-    s_cpu_log_used = 0;
-}
-
+/* Телеметрия CPU идёт в общий лог (фоновый писатель), а не в отдельный
+ * data/logs/cpu.txt: отдельный файл писался из UI-потока, и на медленной
+ * карте каждый сброс замораживал меню на ~2 с. Строки — с префиксом "cpu: ". */
 static void cpu_log_flush(void)
 {
-    int written;
-
-    if (s_cpu_log_fd < 0 || s_cpu_log_used == 0) {
-        return;
-    }
-
-    written = fs_write(s_cpu_log_fd, s_cpu_log_buffer, s_cpu_log_used);
-    if (written != (int)s_cpu_log_used) {
-        cpu_log_disable("write", written);
-        return;
-    }
-    s_cpu_log_used = 0;
-
-    if (s_cpu_log_dropped != 0) {
-        char line[64];
-        int len = snprintf(line, sizeof(line), "# dropped_rows=%u\n",
-                           s_cpu_log_dropped);
-        s_cpu_log_dropped = 0;
-        if (len > 0) {
-            written = fs_write(s_cpu_log_fd, line, (size_t)len);
-            if (written != len) {
-                cpu_log_disable("write dropped marker", written);
-            }
-        }
-    }
 }
 
 static void cpu_log_append(const char *line, size_t len)
 {
-    if (s_cpu_log_fd < 0 || len == 0) {
+    if (len == 0) {
         return;
     }
-    if (len > CPU_LOG_BUFFER_SIZE - s_cpu_log_used) {
-        s_cpu_log_dropped++;
-        return;
-    }
-    memcpy(s_cpu_log_buffer + s_cpu_log_used, line, len);
-    s_cpu_log_used += len;
+    logLine("cpu: %.*s", (int)len, line);
 }
 
 static void cpu_log_init(void)
 {
-    static const char header[] =
-        "ms\twindow_us\tidle_us\tactive_us\tstatus\tidle_wakeups\t"
-        "thread_switches\tvfpu_switches\tcpu_mhz\tbus_mhz\tsamples\t"
-        "busy_avg_bp\tbusy_min_bp\tbusy_max_bp\n";
-    int written;
-
     s_cpu_log_used = 0;
     s_cpu_log_dropped = 0;
     s_last_cpu_log_flush_us = 0;
-    s_cpu_log_fd = fs_open(CPU_LOG_PATH,
-                           PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0666);
-    if (s_cpu_log_fd < 0) {
-        logLine("cpu_telemetry: open failed rc=%d path='%s'\n",
-                s_cpu_log_fd, CPU_LOG_PATH);
-        return;
-    }
-    written = fs_write(s_cpu_log_fd, header, sizeof(header) - 1);
-    if (written != (int)(sizeof(header) - 1)) {
-        cpu_log_disable("write header", written);
-    }
+    logLine("cpu: ms\twindow_us\tidle_us\tactive_us\tstatus\tidle_wakeups\t"
+            "thread_switches\tvfpu_switches\tcpu_mhz\tbus_mhz\tsamples\t"
+            "busy_avg_bp\tbusy_min_bp\tbusy_max_bp\n");
 }
 
 static u32 find_impose_get_param(void)

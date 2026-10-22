@@ -70,6 +70,12 @@ void audio_cache_prefetch_start(const TrackEntry *track, const char *token);
 int  audio_cache_prefetch_swap(void);
 AudioCacheState audio_cache_prefetch_get_state(void);
 
+/* Подсказка для чистки cache_music: id следующего трека очереди.
+ * trim идёт до пота prefetch-задания — без подсказки файл будущего
+ * prefetch вычищается и его приходится качать заново. NULL/пусто —
+ * сброс. Вызывать при старте трека (playback_controller). */
+void audio_cache_hint_next(const char *track_id);
+
 /* Cheap polling — reads volatile s_state without locking.
  * Use for per-frame UI status checks.
  * MUST NOT be used to infer path or other related fields. */

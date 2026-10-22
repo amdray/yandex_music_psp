@@ -16,6 +16,7 @@
 #include "fonts/text.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_screens.h"
+#include "services/libc_guard.h"
 #include "services/image_loader.h"
 #include "services/cover_manager.h"
 #include "services/eq.h"
@@ -69,11 +70,15 @@ static void log_heap_state(const char *stage)
     }
     free_bytes = cap > used ? cap - used : 0;
 
-    logLine("mem: heap stage=%s used=%u free=%u cap=%u\n",
+    /* sys_free/sys_max — свободная СИСТЕМНАЯ память (стеки потоков, ядро),
+     * не куча: на PSP-1000 её после старта остаётся ~1,5 МБ. */
+    logLine("mem: heap stage=%s used=%u free=%u cap=%u sys_free=%d sys_max=%d\n",
             stage ? stage : "periodic",
             (unsigned int)used,
             (unsigned int)free_bytes,
-            (unsigned int)cap);
+            (unsigned int)cap,
+            (int)sceKernelTotalFreeMemSize(),
+            (int)sceKernelMaxFreeMemSize());
 }
 
 typedef enum {
@@ -129,6 +134,11 @@ static void power_callback(int unknown, int power_info)
 {
     (void)unknown;
     s_power_event = power_info;
+    /* Диагностика внезапных выключений: что именно сообщила прошивка. */
+    logLine("power: callback info=0x%08X battery=%d%% low=%d\n",
+            (unsigned int)power_info, (int)scePowerGetBatteryLifePercent(),
+            (int)scePowerIsLowBattery());
+    logger_flush_now();
 }
 
 /* Callback thread - handles system callbacks */
@@ -177,8 +187,17 @@ static int setup_callbacks(void)
 
 PSP_MODULE_INFO("YMPSP", 0, 1, 1);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
-PSP_MAIN_THREAD_STACK_SIZE_KB(2048);  // 2MB stack - increased from 512KB for large JSON parsing (875 tracks)
+/* Приоритет main — дефолтный 0x20. НЕ понижать: на реальной PSP с main
+ * ниже 0x20 (пробовали 0x2C) каждая операция с Memory Stick и кадр ждали
+ * кратно ~2.1 с при простое CPU (запуск 7 c -> 100+ c). Чтобы сеть не
+ * голодала под тяжёлым кадром, наоборот подняты потоки сетевого стека:
+ * callout/netintr = 0x1F (net_client.c), т.е. выше main. */
+PSP_MAIN_THREAD_STACK_SIZE_KB(1024);  // 1 МБ: парсинг JSON идёт в рабочих потоках; на PSP-1000 системной памяти мало
+#ifdef YM_PSPLINK_DEBUG
+PSP_HEAP_SIZE_KB(12288);  // под PSPLINK часть пользовательской памяти занята им
+#else
 PSP_HEAP_SIZE_KB(16384);  // 16MB heap - increased from 8MB for cJSON (149k allocations, ~4MB peak)
+#endif
 
 int main(int argc, char *argv[])
 {
@@ -186,6 +205,14 @@ int main(int argc, char *argv[])
     u64 last_log_flush_us = 0;
     u64 last_heap_log_us = 0;
 
+#ifdef YM_PSPLINK_DEBUG
+    /* Отладка через PSPLINK: PRX запускается как host0:/ympsp.prx, и cwd из
+     * argv[0] указал бы на ПК. Данные (токен, кэш, шрифты, ассеты) лежат на
+     * карте консоли — переходим туда. */
+    (void)argc;
+    (void)argv;
+    sceIoChdir("ms0:/PSP/GAME/yandex_music_psp");
+#else
     // Set CWD from argv[0] - required for relative paths to work
     if (argc > 0 && argv[0]) {
         char cwd[256];
@@ -197,10 +224,14 @@ int main(int argc, char *argv[])
             sceIoChdir(cwd);
         }
     }
+#endif
 
     // Максимальная частота CPU: без этого PSP работает на 222 МГц и весь
     // интерфейс (не только свечение) тормозит. Игнорируем ошибку keeper'ов.
     scePowerSetClockFrequency(333, 333, 166);
+
+    /* Мьютекс для strtod/cJSON до старта любых потоков (libc_guard.h). */
+    ym_libc_guard_init();
 
     // Initialize fs module
     if (fs_init() != 0) {
@@ -348,7 +379,7 @@ int main(int argc, char *argv[])
         ui_screens_render(&s_app_state);
         playback_controller_service();
 
-        if (last_heap_log_us == 0 || now_us - last_heap_log_us >= 10000000ULL) {
+        if (last_heap_log_us == 0 || now_us - last_heap_log_us >= 120000000ULL) {
             log_heap_state("periodic");
             last_heap_log_us = now_us;
         }

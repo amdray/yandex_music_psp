@@ -11,6 +11,8 @@
 #include "core/logger.h"
 #include "core/fs.h"
 #include "services/ya_auth.h"
+#include "services/ya_qr_auth.h"
+#include "fonts/text.h"
 #include "services/qrcodegen.h"
 #include "services/net_client.h"
 #include "services/net_tls.h"
@@ -28,17 +30,25 @@ static volatile int s_lastrc = 0;
 static volatile unsigned long long s_codes_us = 0;  // когда получены коды
 static UserInfo s_user;
 static SceUID s_tid = -1;
+// Режим: 0 = QR через Яндекс Паспорт (по умолчанию), 1 = код (device flow).
+static volatile int s_mode = 0;
+// Сколько живёт QR до автообновления (сек). Magic-ссылка Паспорта живёт
+// несколько минут; обновляем заранее, чтобы телефон не открыл протухшую.
+#define QR_REFRESH_S 180
+#define QR_POLL_S 2
+#define QR_MAX_REGEN 6
 
 // QR ссылки для телефона (альтернатива ручному вводу адреса).
 // Кодируется один раз при получении кодов, рисуется из s_qr_data.
-#define QR_MAX_VERSION 10
+#define QR_MAX_VERSION 15
 static uint8_t s_qr_tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
 static uint8_t s_qr_data[qrcodegen_BUFFER_LEN_FOR_VERSION(QR_MAX_VERSION)];
-static int s_qr_size = 0;  // 0 = нет кода
-static char s_qr_text[160];  // полный URL для QR (страница + код)
+static volatile int s_qr_size = 0;  // 0 = нет кода
+static char s_qr_text[YA_QR_LINK_MAX];  // URL для QR
 
 static void login_qr_encode(const char *text)
 {
+    int size;
     s_qr_size = 0;
     if (!text || !text[0]) {
         return;
@@ -50,32 +60,56 @@ static void login_qr_encode(const char *text)
         logger_flush();
         return;
     }
-    s_qr_size = qrcodegen_getSize(s_qr_data);
+    size = qrcodegen_getSize(s_qr_data);
+    s_qr_size = size;  // публикуем только готовый код (рендер в другом потоке)
     logLine("login: qr size=%d\n", s_qr_size);
     logger_flush();
 }
+// QR справа: максимально крупно (модуль 2..5 px), тёмные модули строки
+// склеиваются в один прямоугольник (меньше примитивов на кадр).
+static float login_qr_box(int *out_scale)
+{
+    int size = s_qr_size;
+    int scale;
+    if (size <= 0) {
+        *out_scale = 0;
+        return 0.0f;
+    }
+    scale = 216 / (size + 8);
+    if (scale > 5) scale = 5;
+    if (scale < 2) scale = 2;
+    *out_scale = scale;
+    return (float)((size + 8) * scale);
+}
+
 static void login_draw_qr(void)
 {
-    int r, c;
+    int r, c, scale;
     const int border = 4;
-    const int scale = 2;
-    const float y0 = 48.0f;
-    float box;
-    float x0;
+    const float y0 = 44.0f;
+    int size = s_qr_size;
+    float box, x0;
 
-    if (s_qr_size <= 0) {
+    if (size <= 0) {
         return;
     }
-    box = (float)((s_qr_size + border * 2) * scale);
+    box = login_qr_box(&scale);
     x0 = 472.0f - box;
     ui_draw_rect(x0, y0, box, box, 0xFFFFFFFF);
-    for (r = 0; r < s_qr_size; r++) {
-        for (c = 0; c < s_qr_size; c++) {
-            if (qrcodegen_getModule(s_qr_data, c, r)) {
-                ui_draw_rect(x0 + (float)((border + c) * scale),
-                             y0 + (float)((border + r) * scale),
-                             (float)scale, (float)scale, 0xFF000000);
+    for (r = 0; r < size; r++) {
+        c = 0;
+        while (c < size) {
+            int run;
+            if (!qrcodegen_getModule(s_qr_data, c, r)) {
+                c++;
+                continue;
             }
+            run = c;
+            while (run < size && qrcodegen_getModule(s_qr_data, run, r)) run++;
+            ui_draw_rect(x0 + (float)((border + c) * scale),
+                         y0 + (float)((border + r) * scale),
+                         (float)((run - c) * scale), (float)scale, 0xFF000000);
+            c = run;
         }
     }
 }
@@ -141,6 +175,95 @@ static int login_save_token(const char *token)
     return 0;
 }
 
+// Проверить токен (как ya_init), сохранить. 0 = ок (s_result уже 0).
+static int login_finish(const char *tok)
+{
+    int frc = net_client_fetch_user_info(tok, &s_user);
+    logLine("login: user info rc=%d\n", frc);
+    if (frc != 0) {
+        snprintf(s_msg, sizeof(s_msg), "Ошибка сети. (%d)", frc);
+        s_result = -1;
+        return -1;
+    }
+    if (login_save_token(tok) != 0) {
+        snprintf(s_msg, sizeof(s_msg), "Ошибка записи.");
+        s_result = -1;
+        return -1;
+    }
+    s_result = 0;
+    logLine("login: ok\n");
+    logger_flush();
+    return 0;
+}
+
+// Вход по QR (Яндекс Паспорт). QR обновляется сам по таймеру/протуханию.
+static void login_qr_flow(void)
+{
+    char tok[256];
+    int regen, net_err = 0;
+
+    for (regen = 0; regen < QR_MAX_REGEN && !s_cancel; regen++) {
+        int r;
+        s_codes_ready = 0;
+        s_qr_size = 0;
+        s_msg[0] = '\0';
+        r = ya_qr_begin(s_qr_text, sizeof(s_qr_text), s_msg, sizeof(s_msg));
+        if (s_cancel) break;
+        if (r != 0) {
+            if (!s_msg[0]) snprintf(s_msg, sizeof(s_msg), "Не вышло (%d)", r);
+            s_result = -1;
+            logLine("login: qr begin failed %d\n", r);
+            return;
+        }
+        login_qr_encode(s_qr_text);
+        if (s_qr_size <= 0) {
+            snprintf(s_msg, sizeof(s_msg), "QR не помещается.");
+            s_result = -1;
+            return;
+        }
+        s_dc.expires_in = QR_REFRESH_S;
+        s_codes_us = sceKernelGetSystemTimeWide();
+        s_codes_ready = 1;
+        logLine("login: qr shown (regen %d), polling\n", regen);
+        logger_flush();
+
+        for (;;) {
+            login_sleep_s(QR_POLL_S);
+            if (s_cancel) return;
+            if (login_elapsed_s() >= QR_REFRESH_S) {
+                logLine("login: qr refresh by timer\n");
+                break;  // новый QR
+            }
+            s_tries++;
+            r = ya_qr_poll(tok, sizeof(tok), s_msg, sizeof(s_msg));
+            s_lastrc = r;
+            if (r == 1) {
+                s_msg[0] = '\0';
+                login_finish(tok);
+                memset(tok, 0, sizeof(tok));
+                return;
+            }
+            if (r == 0) {
+                net_err = 0;
+                continue;
+            }
+            if (r == -2) {
+                break;  // QR протух — новый
+            }
+            // Сеть/API: даём пару шансов, потом показываем ошибку.
+            if (++net_err >= 3) {
+                s_result = -1;
+                logLine("login: qr poll failed %d\n", r);
+                return;
+            }
+        }
+    }
+    if (!s_cancel && s_result != 0) {
+        snprintf(s_msg, sizeof(s_msg), "QR не подтверждён. X: заново");
+        s_result = -1;
+    }
+}
+
 static int login_worker(SceSize args, void *argp)
 {
     char tok[256];
@@ -149,8 +272,21 @@ static int login_worker(SceSize args, void *argp)
 
     (void)args;
     (void)argp;
-    logLine("login: worker start\n");
+    logLine("login: worker start mode=%d\n", s_mode);
     net_tls_cancel_bind((volatile int *)&s_cancel);
+    if (s_mode == 0) {
+        login_qr_flow();
+        ya_qr_reset();
+        net_tls_cancel_unbind();
+        if (s_cancel) {
+            logLine("login: cancelled\n");
+        } else if (s_result != 0) {
+            s_result = -1;
+            logLine("login: failed\n");
+        }
+        logger_flush();
+        return 0;
+    }
     if (!s_device_id[0]) {
         ya_device_id(s_device_id, sizeof(s_device_id));
     }
@@ -201,23 +337,10 @@ static int login_worker(SceSize args, void *argp)
         r = ya_device_poll(s_dc.device_code, tok, sizeof(tok));
         s_lastrc = r;
         if (r == 1) {
-            int frc;
             // Проверка токена (как ya_init) и сохранение.
-            frc = net_client_fetch_user_info(tok, &s_user);
-            logLine("login: user info rc=%d\n", frc);
-            if (frc != 0) {
-                snprintf(s_msg, sizeof(s_msg), "Ошибка сети. (%d)", r);
-                s_result = -1;
+            if (login_finish(tok) != 0) {
                 break;
             }
-            if (login_save_token(tok) != 0) {
-                snprintf(s_msg, sizeof(s_msg), "Ошибка записи. (%d)", r);
-                s_result = -1;
-                break;
-            }
-            s_result = 0;
-            logLine("login: ok\n");
-            logger_flush();
             net_tls_cancel_unbind();
             return 0;
         }
@@ -328,7 +451,14 @@ void ui_screen_device_login_update(AppState *state)
 void ui_screen_device_login_handle_input(AppState *state, const InputState *input)
 {
     (void)state;
-    if (input->pressed & PSP_CTRL_CROSS) {
+    if (s_result == 0) {
+        return;  // вход уже выполнен, ждём перехода в меню
+    }
+    if (input->pressed & PSP_CTRL_TRIANGLE) {
+        s_mode = s_mode ? 0 : 1;
+        logLine("login: mode -> %s\n", s_mode ? "code" : "qr");
+        login_start_worker();
+    } else if (input->pressed & PSP_CTRL_CROSS) {
         logLine("login: retry requested\n");
         login_start_worker();
     }
@@ -338,35 +468,69 @@ void ui_screen_device_login_render(const AppState *state)
 {
     char line[192];
     int left = 0;
+    int scale = 0;
+    float text_w = 440.0f;
 
     (void)state;
     ui_draw_clear(UI_COLOR_BACKGROUND);
     ui_common_draw_header(locale_get(LOCALE_LOGIN_TITLE));
 
-    if (s_result == 0) {
-        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_OK), UI_COLOR_ACTIVE);
-    } else if (!s_codes_ready && s_result == -2) {
-        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_REQUEST), UI_COLOR_ACCENT);
-    } else if (s_codes_ready) {
-        if (s_dc.expires_in > 0) {
-            left = s_dc.expires_in - login_elapsed_s();
-            if (left < 0) {
-                left = 0;
-            }
-        }
-        ui_draw_text(16.0f, 52.0f, locale_get(LOCALE_LOGIN_OPEN), UI_COLOR_PRIMARY);
-        snprintf(line, sizeof(line), "%.60s", s_dc.verify_url);
-        ui_draw_text(16.0f, 68.0f, line, UI_COLOR_ACTIVE);
-        ui_draw_text(16.0f, 92.0f, locale_get(LOCALE_LOGIN_ENTER_CODE), UI_COLOR_PRIMARY);
-        snprintf(line, sizeof(line), "%.20s", s_dc.user_code);
-        ui_draw_text(100.0f, 116.0f, line, UI_COLOR_ACCENT);
-        snprintf(line, sizeof(line), locale_get(LOCALE_LOGIN_LEFT),
-                 left, s_tries);
-        ui_draw_text(16.0f, 150.0f, line, UI_COLOR_ACTIVE);
-        login_draw_qr();
+    if (s_codes_ready && s_qr_size > 0) {
+        // Текст слева от QR, с отступом.
+        text_w = 472.0f - login_qr_box(&scale) - 16.0f - 16.0f;
+        if (text_w < 120.0f) text_w = 120.0f;
     }
-    if (s_msg[0]) {
-        ui_draw_text(16.0f, 170.0f, s_msg, UI_COLOR_ERROR);
+    if (s_codes_ready && s_dc.expires_in > 0) {
+        left = s_dc.expires_in - login_elapsed_s();
+        if (left < 0) {
+            left = 0;
+        }
     }
 
+    if (s_result == 0) {
+        ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_OK), UI_COLOR_ACTIVE);
+    } else if (s_mode == 0) {
+        if (!s_codes_ready && s_result == -2) {
+            ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_QR_REQUEST),
+                         UI_COLOR_ACCENT);
+        } else if (s_codes_ready) {
+            text_render_clipped(16.0f, 56.0f, locale_get(LOCALE_LOGIN_QR_SCAN),
+                                UI_COLOR_PRIMARY, text_w);
+            text_render_clipped(16.0f, 74.0f, locale_get(LOCALE_LOGIN_QR_CONFIRM),
+                                UI_COLOR_PRIMARY, text_w);
+            snprintf(line, sizeof(line), locale_get(LOCALE_LOGIN_QR_LEFT),
+                     left, s_tries);
+            text_render_clipped(16.0f, 110.0f, line, UI_COLOR_ACTIVE, text_w);
+            login_draw_qr();
+        }
+    } else {
+        if (!s_codes_ready && s_result == -2) {
+            ui_draw_text(16.0f, 60.0f, locale_get(LOCALE_LOGIN_REQUEST), UI_COLOR_ACCENT);
+        } else if (s_codes_ready) {
+            text_render_clipped(16.0f, 52.0f, locale_get(LOCALE_LOGIN_OPEN),
+                                UI_COLOR_PRIMARY, text_w);
+            snprintf(line, sizeof(line), "%.60s", s_dc.verify_url);
+            text_render_clipped(16.0f, 68.0f, line, UI_COLOR_ACTIVE, text_w);
+            text_render_clipped(16.0f, 92.0f, locale_get(LOCALE_LOGIN_ENTER_CODE),
+                                UI_COLOR_PRIMARY, text_w);
+            snprintf(line, sizeof(line), "%.20s", s_dc.user_code);
+            ui_draw_text(40.0f, 116.0f, line, UI_COLOR_ACCENT);
+            snprintf(line, sizeof(line), locale_get(LOCALE_LOGIN_LEFT),
+                     left, s_tries);
+            text_render_clipped(16.0f, 150.0f, line, UI_COLOR_ACTIVE, text_w);
+            login_draw_qr();
+        }
+    }
+    if (s_msg[0]) {
+        text_render_clipped(16.0f, 172.0f, s_msg, UI_COLOR_ERROR, text_w);
+    }
+    if (s_result != 0) {
+        text_render_clipped(16.0f, 230.0f,
+                            locale_get(s_mode ? LOCALE_LOGIN_TO_QR : LOCALE_LOGIN_TO_CODE),
+                            UI_COLOR_INACTIVE, text_w);
+        if (s_result == -1) {
+            text_render_clipped(16.0f, 246.0f, locale_get(LOCALE_LOGIN_RETRY_PROMPT),
+                                UI_COLOR_INACTIVE, text_w);
+        }
+    }
 }

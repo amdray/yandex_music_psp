@@ -12,7 +12,7 @@
 
 void ui_screen_account_handle_input(AppState *state, const InputState *input)
 {
-    // Без профиля X ведёт на вход по коду (ya_auth).
+    // Без профиля X ведёт на вход (по умолчанию QR Паспорта, △ — код).
     if ((input->pressed & PSP_CTRL_CROSS) && state->currentUser.uid <= 0) {
         logLine("account: login requested\n");
         ui_screens_navigate(state, SCREEN_DEVICE_LOGIN);
@@ -61,6 +61,7 @@ void ui_screen_account_render(const AppState *state)
             }
         } else {
             ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_ACCOUNT_LOAD_ERROR), UI_COLOR_ERROR);
+            ui_draw_text(16.0f, 72.0f, locale_get(LOCALE_ACCOUNT_LOGIN_PROMPT), UI_COLOR_ACCENT);
         }
     }
 }

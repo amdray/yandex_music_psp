@@ -24,6 +24,7 @@ typedef struct {
     int              sample_rate;
     int              channels;
     int              bitrate_kbps;
+    char             codec[8];
     char             track_id[40];
     char             title[128];
     char             artist[256];

@@ -3,6 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pspkernel.h>
+
+#include "core/fs.h"
+#include "core/logger.h"
 
 #define ATLAS_SIZE 512
 #define GLYPH_CAPACITY 2048
@@ -23,28 +27,48 @@ static uint32_t s_cluts[CBMF_FONT_COUNT][16] __attribute__((aligned(16)));
 static CbmfPspGlyph s_glyphs[CBMF_FONT_COUNT][GLYPH_CAPACITY];
 static CbmfFace s_faces[CBMF_FONT_COUNT];
 
+/* Весь файл одним fs_read (раньше fopen/fread через newlib читал мелкими
+ * кусками: на медленной карте это ~9 с на старте). */
+static void *read_whole_file(const char *path, size_t *out_size)
+{
+    SceIoStat st;
+    SceUID fd;
+    void *data;
+    size_t size, done = 0;
+
+    if (fs_getstat(path, &st) != 0 || st.st_size <= 0) return NULL;
+    size = (size_t)st.st_size;
+    fd = fs_open(path, PSP_O_RDONLY, 0);
+    if (fd < 0) return NULL;
+    data = malloc(size);
+    if (!data) {
+        fs_close(fd);
+        return NULL;
+    }
+    while (done < size) {
+        int n = fs_read(fd, (uint8_t *)data + done, size - done);
+        if (n <= 0) break;
+        done += (size_t)n;
+    }
+    fs_close(fd);
+    if (done != size) {
+        free(data);
+        return NULL;
+    }
+    *out_size = size;
+    return data;
+}
+
 static int load_face(CbmfFontId id)
 {
     CbmfFace *face = &s_faces[id];
-    FILE *file = fopen(s_paths[id], "rb");
-    if (!file) return -1;
-
-    long size = -1;
-    if (fseek(file, 0, SEEK_END) == 0) size = ftell(file);
-    if (size <= 0 || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return -1;
-    }
-    void *data = malloc((size_t)size);
-    if (!data) {
-        fclose(file);
-        return -1;
-    }
-    size_t bytes = fread(data, 1, (size_t)size, file);
-    int close_rc = fclose(file);
-    int rc = -1;
-    if (bytes == (size_t)size && close_rc == 0)
-        rc = cbmf_mount(&face->font, data, (size_t)size);
+    size_t size = 0;
+    u64 t0 = sceKernelGetSystemTimeWide();
+    void *data = read_whole_file(s_paths[id], &size);
+    if (!data) return -1;
+    logLine("text: font %d read %u bytes in %u ms\n", (int)id, (unsigned)size,
+            (unsigned)((sceKernelGetSystemTimeWide() - t0) / 1000));
+    int rc = cbmf_mount(&face->font, data, size);
     if (rc == CBMF_OK) {
         const CbmfPspRendererDesc desc = {
             .texture_pixels = s_textures[id],
@@ -57,6 +81,8 @@ static int load_face(CbmfFontId id)
         };
         rc = cbmf_psp_init(&face->renderer, &face->font, &desc);
     }
+    logLine("text: font %d ready rc=%d total %u ms\n", (int)id, rc,
+            (unsigned)((sceKernelGetSystemTimeWide() - t0) / 1000));
     if (rc != 0) {
         free(data);
         memset(face, 0, sizeof(*face));

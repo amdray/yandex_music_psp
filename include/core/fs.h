@@ -31,5 +31,10 @@ void fs_log_open(const char *path);
 int fs_ensure_dir(const char *path);
 // Удалить самые старые файлы каталога, оставив keep самых свежих.
 void fs_evict_oldest(const char *dir, int keep);
+/* Удалить все файлы каталога, кроме тех, чьё имя (до первой точки)
+ * совпадает с одним из keep_ids. Пустые keep_ids пропускаются.
+ * Политика «текущий + предзагруженный». Вызывать из worker-потоков. */
+void fs_evict_except(const char *dir, const char *const *keep_ids,
+                     int keep_count);
 
 #endif

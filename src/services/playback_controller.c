@@ -288,6 +288,19 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
         logLine("pb: reject unavailable track_id='%s'\n", track->id);
         return PLAYBACK_INTENT_REJECTED;
     }
+
+    /* Подсказка для ac_trim_music: файл следующего трека очереди должен
+     * пережить чистку — trim идёт до поста prefetch-задания, когда о
+     * будущем prefetch в кэше ещё никто не знает. */
+    {
+        TrackEntry nxt;
+        if (playback_queue_get_next(&nxt) == PLAYBACK_QUEUE_OK &&
+            nxt.id[0] != '\0') {
+            audio_cache_hint_next(nxt.id);
+        } else {
+            audio_cache_hint_next(NULL);
+        }
+    }
     if (s_resume_seek_pending &&
         strcmp(s_resume_track_id, track->id) != 0) {
         s_resume_seek_pending = 0;
@@ -751,10 +764,15 @@ void playback_controller_service(void)
     if (!s_prefetch_triggered && net_stack_is_ready() &&
         pb_now_us() >= s_prefetch_retry_after_us) {
         AudioPlayerSnapshot snap;
+        AudioCacheStatus ac_cur;
         audio_player_get_snapshot(&snap);
+        audio_cache_get_status(&ac_cur);
+        /* Предзагрузка следующего трека — только после ПОЛНОЙ докачки
+         * текущего (требование пользователя); позиция не важна. */
         if (snap.state == AUDIO_PLAYER_PLAYING &&
-            snap.duration_ms > 30000 &&
-            snap.position_ms >= snap.duration_ms - 30000) {
+            ac_cur.complete &&
+            g_playback.current_track.id[0] != '\0' &&
+            strcmp(ac_cur.track_id, g_playback.current_track.id) == 0) {
             TrackEntry next;
             int rc = playback_queue_get_next(&next);
             if (rc == PLAYBACK_QUEUE_OK) {

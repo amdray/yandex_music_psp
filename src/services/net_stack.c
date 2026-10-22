@@ -8,8 +8,11 @@
 #include <pspwlan.h>
 #include <pspthreadman.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include "core/fs.h"
 #include "core/logger.h"
 #include "services/dns.h"
 #include "services/net_link_accumulator.h"
@@ -64,7 +67,7 @@ static volatile unsigned int s_connect_attempt_id;
 static volatile int s_connect_attempt_profile;
 
 static const NetTlsNetworkConfig s_default_config = {
-    128 * 1024, 42, 4 * 1024, 42, 4 * 1024, 0x1800, 48, 0
+    128 * 1024, 0x1F, 4 * 1024, 0x1F, 4 * 1024, 0x1800, 48, 0
 };
 
 static void supervisor_set_phase(NetSupervisorPhase phase)
@@ -153,33 +156,12 @@ static void log_apctl_info_uint(int code, const char *name)
 
 static void log_apctl_info_snapshot(void)
 {
-    union SceNetApctlInfo info;
-    int rc;
-
-    log_apctl_info_string(PSP_NET_APCTL_INFO_PROFILE_NAME, "profile_name");
-    memset(&info, 0, sizeof(info));
-    rc = sceNetApctlGetInfo(PSP_NET_APCTL_INFO_BSSID, &info);
-    logLine("netmgr: apctl_info code=%d name=bssid rc=0x%08X value=%02X:%02X:%02X:%02X:%02X:%02X\n",
-            PSP_NET_APCTL_INFO_BSSID, (unsigned int)rc,
-            info.bssid[0], info.bssid[1], info.bssid[2],
-            info.bssid[3], info.bssid[4], info.bssid[5]);
+    /* Каждый sceNetApctlGetInfo ~10 мс: логируем только нужное. */
     log_apctl_info_string(PSP_NET_APCTL_INFO_SSID, "ssid");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_SSID_LENGTH, "ssid_length");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_SECURITY_TYPE, "security_type");
     log_apctl_info_uint(PSP_NET_APCTL_INFO_STRENGTH, "strength");
     log_apctl_info_uint(PSP_NET_APCTL_INFO_CHANNEL, "channel");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_POWER_SAVE, "power_save");
     log_apctl_info_string(PSP_NET_APCTL_INFO_IP, "ip");
-    log_apctl_info_string(PSP_NET_APCTL_INFO_SUBNETMASK, "subnet_mask");
     log_apctl_info_string(PSP_NET_APCTL_INFO_GATEWAY, "gateway");
-    log_apctl_info_string(PSP_NET_APCTL_INFO_PRIMDNS, "primary_dns");
-    log_apctl_info_string(PSP_NET_APCTL_INFO_SECDNS, "secondary_dns");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_USE_PROXY, "use_proxy");
-    log_apctl_info_string(PSP_NET_APCTL_INFO_PROXY_URL, "proxy_url");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_PROXY_PORT, "proxy_port");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_8021_EAP_TYPE, "eap_type");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_START_BROWSER, "start_browser");
-    log_apctl_info_uint(PSP_NET_APCTL_INFO_WIFISP, "wifisp");
 }
 
 static void log_profile_param_string(int profile, int param, const char *name,
@@ -219,19 +201,6 @@ static void log_profile_snapshot(int profile)
     log_profile_param_string(profile, PSP_NETPARAM_NAME, "name", 0);
     log_profile_param_string(profile, PSP_NETPARAM_SSID, "ssid", 0);
     log_profile_param_uint(profile, PSP_NETPARAM_SECURE, "secure");
-    log_profile_param_string(profile, PSP_NETPARAM_WEPKEY, "wep_key", 1);
-    log_profile_param_uint(profile, PSP_NETPARAM_IS_STATIC_IP, "is_static_ip");
-    log_profile_param_string(profile, PSP_NETPARAM_IP, "ip", 0);
-    log_profile_param_string(profile, PSP_NETPARAM_NETMASK, "netmask", 0);
-    log_profile_param_string(profile, PSP_NETPARAM_ROUTE, "route", 0);
-    log_profile_param_uint(profile, PSP_NETPARAM_MANUAL_DNS, "manual_dns");
-    log_profile_param_string(profile, PSP_NETPARAM_PRIMARYDNS, "primary_dns", 0);
-    log_profile_param_string(profile, PSP_NETPARAM_SECONDARYDNS, "secondary_dns", 0);
-    log_profile_param_uint(profile, PSP_NETPARAM_USE_PROXY, "use_proxy");
-    log_profile_param_string(profile, PSP_NETPARAM_PROXY_SERVER, "proxy_server", 0);
-    log_profile_param_uint(profile, PSP_NETPARAM_PROXY_PORT, "proxy_port");
-    log_profile_param_uint(profile, PSP_NETPARAM_UNKNOWN1, "unknown1");
-    log_profile_param_uint(profile, PSP_NETPARAM_UNKNOWN2, "unknown2");
 }
 
 static void log_all_profile_snapshots(void)
@@ -449,6 +418,36 @@ static int startup_try_profile(int profile)
     }
 }
 
+/* Последний рабочий Wi-Fi-профиль: без него старт перебирает 1,2,3,... и
+ * каждый неподходящий профиль стоит ~2,8 с до ошибки. Пишется только при
+ * смене профиля (редко), читается один раз. */
+#define WIFI_PROFILE_FILE "config/wifi_profile.cfg"
+
+static int wifi_profile_load(void)
+{
+    char buf[8] = {0};
+    SceUID fd = fs_open(WIFI_PROFILE_FILE, PSP_O_RDONLY, 0);
+    int n, v;
+    if (fd < 0) return 0;
+    n = fs_read(fd, buf, sizeof(buf) - 1);
+    fs_close(fd);
+    if (n <= 0) return 0;
+    v = atoi(buf);
+    return (v > 0 && v <= PSP_NET_PROFILE_MAX) ? v : 0;
+}
+
+static void wifi_profile_save(int profile)
+{
+    char buf[8];
+    int len = snprintf(buf, sizeof(buf), "%d\n", profile);
+    SceUID fd;
+    if (len <= 0) return;
+    fd = fs_open(WIFI_PROFILE_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0666);
+    if (fd < 0) return;
+    (void)fs_write(fd, buf, (size_t)len);
+    fs_close(fd);
+}
+
 static int connect_initial_profile(int preferred)
 {
     int i;
@@ -572,6 +571,7 @@ int net_stack_init(const NetTlsNetworkConfig *config)
     const NetTlsNetworkConfig *cfg = config ? config : &s_default_config;
     int rc;
     int profile;
+    int preferred_profile;
     int retry_profile;
     if (s_stack_started) return 0;
     memset((void *)&s_link, 0, sizeof(s_link));
@@ -609,10 +609,15 @@ int net_stack_init(const NetTlsNetworkConfig *config)
 
     s_stack_started = 1;
     if (dns_init() < 0) return NET_STACK_ERR_FATAL_LIVE_RUNTIME;
-    profile = connect_initial_profile(cfg->wifi_profile_id);
+    preferred_profile = cfg->wifi_profile_id > 0 ? cfg->wifi_profile_id
+                                                  : wifi_profile_load();
+    profile = connect_initial_profile(preferred_profile);
     if (profile == NET_STACK_ERR_FATAL_LIVE_RUNTIME)
         return NET_STACK_ERR_FATAL_LIVE_RUNTIME;
-    if (profile > 0) s_last_profile = profile;
+    if (profile > 0) {
+        s_last_profile = profile;
+        if (profile != preferred_profile) wifi_profile_save(profile);
+    }
     s_supervisor_running = 1;
     s_supervisor_thread = sceKernelCreateThread("net_supervisor", supervisor_main,
                                                 0x19, 8 * 1024,

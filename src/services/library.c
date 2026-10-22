@@ -76,6 +76,7 @@ static void ensure_loading(AppState *s, NetPlaylistLoadKind kind)
         load->error_code = 0;
         logLine("library: playlist load start kind=%d uid=%d generation=%d\n",
                 kind, s->currentUser.uid, generation);
+        logger_checkpoint("pllist load kind=%d gen=%d", kind, generation);
     } else if (rc < 0) {
         load->generation = generation;
         load->status = PLAYLIST_LOAD_ERROR;
@@ -169,6 +170,7 @@ int library_open_playlist(AppState *s, const PlaylistEntry *entry, int tab, int 
         net_client_track_store_unlock();
         return -1;
     }
+    logger_checkpoint("pl open '%s' gen=%d", entry->title, s->track_boot.generation);
     return 0;
 }
 

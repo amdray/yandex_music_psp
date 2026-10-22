@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <cjson/cJSON.h>
+#include "services/libc_guard.h"
 
 #include "core/fs.h"
 #include "core/logger.h"
@@ -47,7 +48,7 @@ static int ym_api_request_and_log(const HttpRequest *request,
         return -1;
     }
 
-    if (log_path) {
+    if (YM_DEBUG_RESPONSE_DUMPS && log_path) {
         fs_ensure_dir(log_path);
         SceUID fd = fs_open(log_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
         if (fd >= 0) {
@@ -277,7 +278,7 @@ static int ym_api_parse_track_id(const char *item_json,
     if (!item_json || item_size == 0 || !out_id || out_size == 0) {
         return -1;
     }
-    root = cJSON_ParseWithLength(item_json, item_size);
+    root = ym_json_parse_len(item_json, item_size);
     if (!root) {
         return 1;
     }
@@ -293,7 +294,9 @@ static int ym_api_parse_track_id(const char *item_json,
         }
         snprintf(out_id, out_size, "%s", id->valuestring);
     } else if (cJSON_IsNumber(id)) {
-        int written = snprintf(out_id, out_size, "%.0f", id->valuedouble);
+        double v = id->valuedouble;  /* без %.0f: см. libc_guard.h */
+        int written = snprintf(out_id, out_size, "%lld",
+                               (long long)(v >= 0 ? v + 0.5 : v - 0.5));
         if (written <= 0 || (size_t)written >= out_size) {
             cJSON_Delete(root);
             return 1;
@@ -394,7 +397,7 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
         return -1;
     }
 
-    root = cJSON_ParseWithLength(response.body, (size_t)response.body_size);
+    root = ym_json_parse_len(response.body, (size_t)response.body_size);
     net_http_response_free(&response);
     if (!root) {
         if (out_status) {

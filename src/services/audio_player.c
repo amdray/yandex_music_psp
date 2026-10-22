@@ -15,6 +15,7 @@
 #include "services/audio_cache.h"
 #include "services/eq.h"
 #include "services/ym_flac.h"
+#include "services/ym_aac.h"
 #include "services/audio_stream_buf.h"
 #include "services/net_http.h"
 #include "services/net_stack.h"
@@ -37,7 +38,8 @@
  * при умершем кэше переходит в ERROR вместо зависания навсегда. */
 #define AUDIO_PLAYER_WAIT_DEADLINE_US  (45ULL * 1000000ULL)
 #define AUDIO_PLAYER_MP3_BUF_SIZE      (16 * 1024)
-#define AUDIO_PLAYER_PCM_BUF_SIZE      (16 * (1152 / 2))
+/* Буфер PCM под 4096-кадровые куски FLAC/AAC (+запас под AAC-хвост). */
+#define AUDIO_PLAYER_PCM_BUF_SIZE      ((4096 + 32) * 4)
 /* SEEK: upper bound on garbage/EOS probe decodes after a decoder restart
  * while waiting for sceMp3 frame sync. See audio_player_apply_seek(). */
 #define AUDIO_PLAYER_SEEK_RESYNC_FRAMES 8
@@ -73,6 +75,15 @@ static int s_mp3_modules_loaded = 0;
 static int s_mp3_resource_initialized = 0;
 static unsigned char s_mp3_buf[AUDIO_PLAYER_MP3_BUF_SIZE] __attribute__((aligned(64)));
 static unsigned char s_pcm_buf[AUDIO_PLAYER_PCM_BUF_SIZE] __attribute__((aligned(64)));
+/* Ping-pong выходные буферы. sceAudioSRCOutputBlocking блокируется до конца
+ * предыдущего буфера и отдаёт текущий в очередь: SRC-DMA читает его
+ * асинхронно следующие ~93 мс, пока декодер готовит следующий блок. Один
+ * общий буфер = перезапись во время чтения DMA → порча начала каждого блока
+ * на реальном PSP (периодический треск); PPSSPP копирует контент в момент
+ * постановки в очередь и это маскирует. Два буфера: HW читает один, CPU
+ * декодирует в другой. */
+static unsigned char s_out_buf[2][AUDIO_PLAYER_PCM_BUF_SIZE] __attribute__((aligned(64)));
+static int s_out_idx = 0;
 /* SEEK: pending time-based seek request. The UI thread sets
  * s_seek_target_ms and s_seek_pending = 1 and returns immediately (never
  * blocks); the worker thread consumes the flag once per decode iteration
@@ -106,6 +117,7 @@ static void set_track_snapshot(const TrackEntry *track)
     s_status.sample_rate = 0;
     s_status.channels = 0;
     s_status.bitrate_kbps = 0;
+    s_status.codec[0] = '\0';
 
     if (track) {
         s_status.duration_ms = track->duration_ms;
@@ -132,6 +144,20 @@ static void set_bitrate_snapshot(int bitrate_kbps)
         sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
     }
     s_status.bitrate_kbps = bitrate_kbps;
+    if (s_mutex_initialized) {
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    }
+}
+
+static void set_codec_snapshot(const char *codec)
+{
+    if (s_mutex_initialized) {
+        sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    }
+    if (codec && codec[0]) {
+        strncpy(s_status.codec, codec, sizeof(s_status.codec) - 1);
+    }
+    s_status.codec[sizeof(s_status.codec) - 1] = '\0';
     if (s_mutex_initialized) {
         sceKernelUnlockLwMutex(&s_status_mutex, 1);
     }
@@ -356,6 +382,44 @@ int audio_player_take_terminal_snapshot(char *out_track_id,
     return present ? 0 : -1;
 }
 
+/* Детекция недоёма SRC-канала. sceAudioSRCOutputBlocking блокируется до
+ * конца предыдущего буфера: здоровый ритм подачи = длительность буфера;
+ * ритм дольше бюджета (+15 мс запас) означает, что канал стоял — на
+ * реальном PSP слышен щелчок/обрыв. Ожидаемые паузы (буферизация, пауза,
+ * seek, смена трека) сбрасывают маркер и не считаются. */
+static u64 s_out_submit_us;
+static int s_out_gap_count;
+static int s_out_gap_logged;
+
+static void ap_note_output(int frames, const char *tag)
+{
+    u64 now = sceKernelGetSystemTimeWide();
+    u64 budget = (u64)frames * 1000000ULL / 44100ULL;
+
+    if (s_out_submit_us != 0 && now > s_out_submit_us + budget + 15000ULL) {
+        s_out_gap_count++;
+        if (s_out_gap_logged < 5 || (s_out_gap_count % 25) == 0) {
+            s_out_gap_logged++;
+            logLine("ap: gap %s +%dms budget=%dms count=%d\n",
+                    tag, (int)((now - s_out_submit_us - budget) / 1000ULL),
+                    (int)(budget / 1000ULL), s_out_gap_count);
+        }
+    }
+    s_out_submit_us = now;
+}
+
+static void ap_forget_output_timing(void)
+{
+    s_out_submit_us = 0;
+}
+
+static void ap_reset_output_stats(void)
+{
+    s_out_submit_us = 0;
+    s_out_gap_count = 0;
+    s_out_gap_logged = 0;
+}
+
 static int wait_while_paused(const char *track_id)
 {
     if (!s_pause_requested) {
@@ -369,6 +433,7 @@ static int wait_while_paused(const char *track_id)
     while (s_pause_requested && !s_stop_requested) {
         sceKernelDelayThread(AUDIO_PLAYER_WAIT_US);
     }
+    ap_forget_output_timing();
     return s_stop_requested ? AUDIO_PLAYER_ERR_STOP : 0;
 }
 
@@ -445,6 +510,7 @@ static int ensure_backend_ready(void)
 static int wait_for_source(const char *track_id, AudioSourceSnapshot *source)
 {
     u64 deadline = sceKernelGetSystemTimeWide() + AUDIO_PLAYER_WAIT_DEADLINE_US;
+    int64_t last_bytes = -1;
 
     while (!s_stop_requested) {
         AudioCacheStatus status;
@@ -474,6 +540,15 @@ static int wait_for_source(const char *track_id, AudioSourceSnapshot *source)
                 logLine("ap: wait_for_source cancelled track_id='%s'\n", track_id);
                 return AUDIO_PLAYER_ERR_CACHE;
             }
+
+            /* Идёт здоровое скачивание (в т.ч. длинные непрогрессивные
+             * загрузки flac-mp4 ~40+ c): рост байтов продлевает дедлайн,
+             * чтобы не обрывать ещё не готовый источник. */
+            if (status.state == AUDIO_CACHE_DOWNLOADING &&
+                status.downloaded_bytes != last_bytes) {
+                last_bytes = status.downloaded_bytes;
+                deadline = sceKernelGetSystemTimeWide() + AUDIO_PLAYER_WAIT_DEADLINE_US;
+            }
         }
 
         {
@@ -500,6 +575,9 @@ static int wait_for_more_data(const char *track_id, int64_t required_bytes)
     u64 stall_deadline = sceKernelGetSystemTimeWide() + AUDIO_PLAYER_WAIT_DEADLINE_US;
     int64_t last_bytes = -1;
 
+    /* Ожидание данных — ожидаемый обрыв звука (уже виден по 'buffering
+     * wait' в логе), в подаче вывода не считаем. */
+    ap_forget_output_timing();
     set_active_status(AUDIO_PLAYER_BUFFERING, track_id);
     logLine("ap: buffering wait track_id='%s' required=%d\n",
             track_id, (int)required_bytes);
@@ -544,6 +622,16 @@ static int wait_for_more_data(const char *track_id, int64_t required_bytes)
             return 0;
         }
         if (status.complete) {
+            if (required_bytes <= status.downloaded_bytes) {
+                /* Файл докачан целиком и bytes для required уже на диске:
+                 * даём декодеру ещё шанс прочитать, а не уводим трек в
+                 * ложный FINISHED (пользователь видел смену трека). */
+                logLine("ap: buffering complete, retry track_id='%s' have=%d required=%d\n",
+                        track_id,
+                        (int)status.downloaded_bytes,
+                        (int)required_bytes);
+                return 0;
+            }
             logLine("ap: buffering eof track_id='%s' have=%d required=%d\n",
                     track_id,
                     (int)status.downloaded_bytes,
@@ -912,13 +1000,25 @@ static int64_t flac_file_avail_cb(void *user){
     return status.downloaded_bytes;
 }
 
+/* Колбэк ожидания фронтира для ym_flac: чтение блокируется прямо в
+ * декодере, пока данные не доедут. Так dr_flac не получает 0 посреди
+ * трека (ложный EOF -> автоскип, который видел пользователь). */
+static int flac_wait_cb(void *user, int64_t need_bytes)
+{
+    const char *track_id = (const char *)user;
+    return wait_for_more_data(track_id, need_bytes) == 0 ? 0 : -1;
+}
+
 /* FLAC-цикл: файл (прогрессивный или готовый) -> dr_flac -> PCM s16 ->
  * тот же SRC-вывод/EQ/позиция, что у MP3. MP3-путь ниже не тронут. */
-#define FLAC_DECODE_FRAMES 1152
+/* 4096 кадров (~93 мс) вместо 1152 (~26 мс): на реальном PSP декодер+fs+
+ * сеть легко проскакивают 26 мс, канал замирает — слышно щелчки. 93 мс
+ * дают запас; предел sceAudioSRCChReserve в этой версии — 4111 кадров. */
+#define FLAC_DECODE_FRAMES 4096
 
 static int audio_player_flac_file_run(const TrackEntry *track,
                                       const AudioSourceSnapshot *source,
-                                      int fd,
+                                      int *fd,
                                       YmFlacAvailFn avail_fn, void *avail_user,
                                       int *rate_ptr, int *channels_ptr,
                                       int64_t *played_ptr,
@@ -932,17 +1032,26 @@ static int audio_player_flac_file_run(const TrackEntry *track,
     YmFlacFormat fmt;
     int64_t played = 0;
     int seek_wait_left;
+    int flac_stuck = 0;
 
     memset(&fmt, 0, sizeof(fmt));
-    flac = ym_flac_open_file(fd, 0, avail_fn, avail_user);
+    {
+        const char *dot = strrchr(source->path, '.');
+        if (dot && strcmp(dot, ".mp4") == 0) {
+            flac = ym_flac_open_mp4(fd, source->path, avail_fn, avail_user);
+        } else {
+            flac = ym_flac_open_file(fd, source->path, avail_fn, avail_user);
+        }
+    }
     if (!flac) {
         logLine("ap: flac open failed track_id='%s'\n", track->id);
         return AUDIO_PLAYER_ERR_SOURCE;
     }
+    ym_flac_set_wait(flac, flac_wait_cb, (void *)track->id);
     if (ym_flac_format(flac, &fmt) != 0 ||
         fmt.sample_rate != 44100 || fmt.channels != 2 ||
-        fmt.bits_per_sample != 16) {
-        logLine("ap: flac format rejected track_id='%s' %d/%d/%d (need 44100/2/16)\n",
+        fmt.bits_per_sample < 16 || fmt.bits_per_sample > 32) {
+        logLine("ap: flac format rejected track_id='%s' %d/%d/%d (need 44100/2/16..32)\n",
                 track->id, fmt.sample_rate, fmt.channels, fmt.bits_per_sample);
         ym_flac_close(flac);
         return AUDIO_PLAYER_ERR_SOURCE;
@@ -952,7 +1061,13 @@ static int audio_player_flac_file_run(const TrackEntry *track,
     *rate_ptr = 44100;
     *channels_ptr = 2;
     set_format_snapshot(44100, 2);
-    set_bitrate_snapshot(source->bitrate_kbps);
+    set_bitrate_snapshot(source->bitrate_kbps > 0
+                             ? source->bitrate_kbps
+                             : (track->duration_ms > 0 &&
+                                        source->content_length > 0
+                                    ? (int)((source->content_length * 8) /
+                                            track->duration_ms)
+                                    : 0));
     eq_reset();
     set_active_status(AUDIO_PLAYER_PLAYING, track->id);
 
@@ -1013,7 +1128,7 @@ static int audio_player_flac_file_run(const TrackEntry *track,
             continue;
         }
 
-        got = ym_flac_read_s16(flac, (short *)s_pcm_buf, FLAC_DECODE_FRAMES);
+        got = ym_flac_read_s16(flac, (short *)s_out_buf[s_out_idx], FLAC_DECODE_FRAMES);
         if (got < 0) {
             ym_flac_close(flac);
             return AUDIO_PLAYER_ERR_SOURCE;
@@ -1027,8 +1142,11 @@ static int audio_player_flac_file_run(const TrackEntry *track,
                 return AUDIO_PLAYER_ERR_TRACK_MISMATCH;
             }
             if (!status.complete) {
+                /* Ждём сдвиг счётчика (как mp3-путь): +64K сверх текущего
+                 * на докачанном файле не добирается никогда и давал ложный
+                 * EOF сразу после complete. */
                 rc = wait_for_more_data(track->id,
-                                        status.downloaded_bytes + 65536);
+                                        status.downloaded_bytes);
                 if (rc == AUDIO_PLAYER_EOF) {
                     *stop_state_ptr = 1;
                     break;
@@ -1039,25 +1157,54 @@ static int audio_player_flac_file_run(const TrackEntry *track,
                 }
                 continue;
             }
-            logLine("ap: eof decode terminal (flac) track_id='%s' played_ms=%d\n",
+            if (ym_flac_at_end(flac)) {
+                /* Настоящий конец: декодер дошёл до total_frames. */
+                logLine("ap: eof decode terminal (flac) track_id='%s' played_ms=%d have=%d len=%d\n",
+                        track->id, (int)((played * 1000) / 44100),
+                        (int)status.downloaded_bytes, (int)status.content_length);
+                logger_flush();
+                *stop_state_ptr = 1;
+                break;
+            }
+            /* Данные целиком на диске, а кадр не читается — раньше это
+             * считалось концом трека и уводило на следующий. Даём
+             * ресинку ym_flac (переоткрытие + возврат на кадр) несколько
+             * попыток, не объявляя ложный EOF. */
+            if (++flac_stuck <= 5) {
+                logLine("ap: flac resync retry %d track_id='%s' have=%d\n",
+                        flac_stuck, track->id, (int)status.downloaded_bytes);
+                continue;
+            }
+            logLine("ap: flac decode stuck track_id='%s' played_ms=%d -> source error\n",
                     track->id, (int)((played * 1000) / 44100));
-            logger_flush();
-            *stop_state_ptr = 1;
-            break;
+            ym_flac_close(flac);
+            return AUDIO_PLAYER_ERR_SOURCE;
         }
+        flac_stuck = 0;
 
-        bytes_decoded = (int)got * 4;
         if (eq_is_active()) {
-            eq_process((short *)s_pcm_buf, (int)got, 2, 44100);
-            sceKernelDcacheWritebackInvalidateRange(s_pcm_buf, bytes_decoded);
+            eq_process((short *)s_out_buf[s_out_idx], (int)got, 2, 44100);
         }
+        /* Короткий хвост добиваем тишиной до FLAC_DECODE_FRAMES: размер
+         * выхода константен → резерв SRC-канала ровно один раз за трек
+         * (без release/reserve посреди игры) и DMA всегда читает полный
+         * блок. */
+        if (got < FLAC_DECODE_FRAMES) {
+            memset((unsigned char *)s_out_buf[s_out_idx] + (size_t)got * 4, 0,
+                   (size_t)(FLAC_DECODE_FRAMES - (int)got) * 4);
+        }
+        bytes_decoded = FLAC_DECODE_FRAMES * 4;
+        /* PCM декодируется CPU в кэш: выталкиваем ВЕСЬ выходной буфер в RAM
+         * до вывода ВСЕГДА, иначе на реальном PSP SRC-DMA читает старые строки
+         * кэша (PPSSPP это маскирует) — звук «хрипит». */
+        sceKernelDcacheWritebackRange(s_out_buf[s_out_idx], bytes_decoded);
 
         if (!*audio_reserved_ptr || *reserved_bytes_ptr != bytes_decoded) {
             if (*audio_reserved_ptr) {
                 release_audio_src_channel();
                 *audio_reserved_ptr = 0;
             }
-            sample_count = (int)got;
+            sample_count = bytes_decoded / 4;
             if (sample_count < 17 || sample_count > 4111) {
                 ym_flac_close(flac);
                 return AUDIO_PLAYER_ERR_SOURCE;
@@ -1078,11 +1225,13 @@ static int audio_player_flac_file_run(const TrackEntry *track,
         }
 
         out_rc = sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX,
-                                           (short *)s_pcm_buf);
+                                           (short *)s_out_buf[s_out_idx]);
         if (out_rc < 0) {
             ym_flac_close(flac);
             return out_rc;
         }
+        s_out_idx ^= 1;
+        ap_note_output(FLAC_DECODE_FRAMES, "flac");
 
         played += got;
         *played_ptr = played;
@@ -1097,6 +1246,227 @@ static int audio_player_flac_file_run(const TrackEntry *track,
     }
 
     ym_flac_close(flac);
+    return 0;
+}
+
+/* AAC: файл .aac (MP4, esds/ASC) -> faad2 -> PCM s16 44100/stereo ->
+ * тот же SRC-вывод/EQ/позиция, что у FLAC/MP3. */
+static int audio_player_aac_file_run(const TrackEntry *track,
+                                     const AudioSourceSnapshot *source,
+                                     int *fd,
+                                     YmFlacAvailFn avail_fn, void *avail_user,
+                                     int *rate_ptr, int *channels_ptr,
+                                     int64_t *played_ptr,
+                                     int *audio_reserved_ptr,
+                                     int *reserved_bytes_ptr,
+                                     int *first_pcm_done_ptr,
+                                     unsigned worker_generation,
+                                     int *stop_state_ptr)
+{
+    YmAac *aac = NULL;
+    YmAacFormat fmt;
+    int64_t played = 0;
+    int seek_wait_left;
+    int aac_stuck = 0;
+
+    memset(&fmt, 0, sizeof(fmt));
+    aac = ym_aac_open_file(fd, source->path, avail_fn, avail_user);
+    if (!aac) {
+        logLine("ap: aac open failed track_id='%s'\n", track->id);
+        return AUDIO_PLAYER_ERR_SOURCE;
+    }
+    if (ym_aac_format(aac, &fmt) != 0 ||
+        fmt.sample_rate != 44100 || fmt.channels != 2) {
+        logLine("ap: aac format rejected track_id='%s' %d/%d (need 44100/2)\n",
+                track->id, fmt.sample_rate, fmt.channels);
+        ym_aac_close(aac);
+        return AUDIO_PLAYER_ERR_SOURCE;
+    }
+    logLine("ap: aac ok track_id='%s' 44100/stereo total_frames=%d\n",
+            track->id, (int)fmt.total_frames);
+    *rate_ptr = 44100;
+    *channels_ptr = 2;
+    set_format_snapshot(44100, 2);
+    set_bitrate_snapshot(source->bitrate_kbps > 0
+                             ? source->bitrate_kbps
+                             : (track->duration_ms > 0 &&
+                                        source->content_length > 0
+                                    ? (int)((source->content_length * 8) /
+                                            track->duration_ms)
+                                    : 0));
+    eq_reset();
+    set_active_status(AUDIO_PLAYER_PLAYING, track->id);
+
+    while (!s_stop_requested) {
+        int64_t got;
+        int bytes_decoded;
+        int sample_count;
+        int out_rc;
+
+        if (wait_while_paused(track->id) != 0) {
+            *stop_state_ptr = 1;
+            break;
+        }
+        if (s_seek_pending) {
+            int target_ms = s_seek_target_ms;
+            int64_t target_frame = ((int64_t)target_ms * 44100) / 1000;
+            int64_t est = target_frame * 4 + 8192;
+            int rc;
+            s_seek_pending = 0;
+            rc = wait_for_more_data(track->id, est);
+            if (rc == AUDIO_PLAYER_EOF) {
+                *stop_state_ptr = 1;
+                break;
+            }
+            if (rc != 0) {
+                ym_aac_close(aac);
+                return rc;
+            }
+            seek_wait_left = 3;
+            for (;;) {
+                rc = ym_aac_seek_frame(aac, target_frame);
+                if (rc == 0) break;
+                if (rc != -1 || seek_wait_left-- <= 0) {
+                    logLine("ap: aac seek failed track_id='%s' rc=%d\n",
+                            track->id, rc);
+                    ym_aac_close(aac);
+                    return AUDIO_PLAYER_ERR_SOURCE;
+                }
+                rc = wait_for_more_data(track->id, est + 65536);
+                if (rc == AUDIO_PLAYER_EOF) {
+                    *stop_state_ptr = 1;
+                    break;
+                }
+                if (rc != 0) {
+                    ym_aac_close(aac);
+                    return rc;
+                }
+            }
+            if (rc == AUDIO_PLAYER_EOF) {
+                break;
+            }
+            played = target_frame;
+            *played_ptr = played;
+            set_position_snapshot(target_ms);
+            eq_reset();
+            logLine("ap: aac seek ok track_id='%s' target_ms=%d\n",
+                    track->id, target_ms);
+            continue;
+        }
+
+        got = ym_aac_read_s16(aac, (short *)s_out_buf[s_out_idx], FLAC_DECODE_FRAMES);
+        if (got < 0) {
+            ym_aac_close(aac);
+            return AUDIO_PLAYER_ERR_SOURCE;
+        }
+        if (got == 0) {
+            AudioCacheStatus status;
+            int rc;
+            audio_cache_get_status(&status);
+            if (strcmp(status.track_id, track->id) != 0) {
+                ym_aac_close(aac);
+                return AUDIO_PLAYER_ERR_TRACK_MISMATCH;
+            }
+            if (!status.complete) {
+                /* См. комментарий в flac-цикле: ждём только сдвиг
+                 * счётчика, иначе complete даёт ложный EOF. */
+                rc = wait_for_more_data(track->id,
+                                        status.downloaded_bytes);
+                if (rc == AUDIO_PLAYER_EOF) {
+                    *stop_state_ptr = 1;
+                    break;
+                }
+                if (rc != 0) {
+                    ym_aac_close(aac);
+                    return rc;
+                }
+                continue;
+            }
+            if (ym_aac_at_end(aac)) {
+                logLine("ap: eof decode terminal (aac) track_id='%s' played_ms=%d have=%d len=%d\n",
+                        track->id, (int)((played * 1000) / 44100),
+                        (int)status.downloaded_bytes, (int)status.content_length);
+                logger_flush();
+                *stop_state_ptr = 1;
+                break;
+            }
+            /* Сэмплы целиком на диске, а чтение возвращает 0 — не EOF:
+             * несколько повторов, затем ошибка (как в flac-цикле). */
+            if (++aac_stuck <= 5) {
+                logLine("ap: aac resync retry %d track_id='%s' have=%d\n",
+                        aac_stuck, track->id, (int)status.downloaded_bytes);
+                continue;
+            }
+            logLine("ap: aac decode stuck track_id='%s' played_ms=%d -> source error\n",
+                    track->id, (int)((played * 1000) / 44100));
+            ym_aac_close(aac);
+            return AUDIO_PLAYER_ERR_SOURCE;
+        }
+        aac_stuck = 0;
+
+        if (eq_is_active()) {
+            eq_process((short *)s_out_buf[s_out_idx], (int)got, 2, 44100);
+        }
+        /* Хвост добиваем тишиной до FLAC_DECODE_FRAMES — см. комментарий
+         * в flac-цикле: константный размер выхода = один резерв SRC за трек
+         * и полный блок на чтение DMA (в т.ч. хвост < 17 кадров). */
+        if (got < FLAC_DECODE_FRAMES) {
+            memset((unsigned char *)s_out_buf[s_out_idx] + (size_t)got * 4, 0,
+                   (size_t)(FLAC_DECODE_FRAMES - (int)got) * 4);
+        }
+        bytes_decoded = FLAC_DECODE_FRAMES * 4;
+        sample_count = bytes_decoded / 4;
+        /* PCM декодируется CPU в кэш: выталкиваем ВЕСЬ выходной буфер в RAM
+         * до вывода ВСЕГДА, иначе на реальном PSP SRC-DMA читает старые строки
+         * кэша (PPSSPP это маскирует) — звук «хрипит». */
+        sceKernelDcacheWritebackRange(s_out_buf[s_out_idx], bytes_decoded);
+
+        if (!*audio_reserved_ptr || *reserved_bytes_ptr != bytes_decoded) {
+            if (*audio_reserved_ptr) {
+                release_audio_src_channel();
+                *audio_reserved_ptr = 0;
+            }
+            if (sample_count < 17 || sample_count > 4111) {
+                ym_aac_close(aac);
+                return AUDIO_PLAYER_ERR_SOURCE;
+            }
+            if (sceAudioSRCChReserve(sample_count, 44100, 2) < 0) {
+                ym_aac_close(aac);
+                return AUDIO_PLAYER_ERR_SOURCE;
+            }
+            *audio_reserved_ptr = 1;
+            *reserved_bytes_ptr = bytes_decoded;
+            logLine("ap: sceAudioSRCChReserve ok (aac) track_id='%s' samples=%d\n",
+                    track->id, sample_count);
+        }
+
+        if (wait_while_paused(track->id) != 0) {
+            *stop_state_ptr = 1;
+            break;
+        }
+
+        out_rc = sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX,
+                                           (short *)s_out_buf[s_out_idx]);
+        if (out_rc < 0) {
+            ym_aac_close(aac);
+            return out_rc;
+        }
+        s_out_idx ^= 1;
+        ap_note_output(sample_count, "aac");
+
+        played += got;
+        *played_ptr = played;
+        if (!*first_pcm_done_ptr) {
+            *first_pcm_done_ptr = 1;
+            audio_report_publish_first_pcm(track->id, worker_generation);
+        }
+        set_position_snapshot((int)((played * 1000) / 44100));
+        if (s_state != AUDIO_PLAYER_PLAYING) {
+            set_active_status(AUDIO_PLAYER_PLAYING, track->id);
+        }
+    }
+
+    ym_aac_close(aac);
     return 0;
 }
 
@@ -1143,7 +1513,21 @@ static int audio_player_worker(SceSize args, void *argp)
         goto cleanup;
     }
     source_acquired = 1;
+    ap_reset_output_stats();
     set_bitrate_snapshot(source.bitrate_kbps);
+    {
+        /* Codec badge: по расширению кэш-файла: .flac -> FLAC,
+         * .mp4 -> FLAC (flac-mp4 без демукса), .aac -> AAC (mp4), всё
+         * остальное (диск .mp3 и live RAM stream) декодится как MP3. */
+        const char *dot = (!source.use_stream_buf && source.path[0])
+                              ? strrchr(source.path, '.')
+                              : NULL;
+        const char *codec = "mp3";
+        if (dot && strcmp(dot, ".flac") == 0) codec = "flac";
+        else if (dot && strcmp(dot, ".mp4") == 0) codec = "flac";
+        else if (dot && strcmp(dot, ".aac") == 0) codec = "aac";
+        set_codec_snapshot(codec);
+    }
 
     if (!s_backend_ready) {
         error_code = s_backend_error != 0 ? s_backend_error : AUDIO_PLAYER_ERR_SOURCE;
@@ -1171,13 +1555,35 @@ static int audio_player_worker(SceSize args, void *argp)
                 track.id, source.path);
     }
 
-    /* FLAC: файл .flac -> софт-декод dr_flac. MP3 идёт старым путём ниже. */
+    /* FLAC: файл .flac либо flac-mp4 (декод прямой, без демукса) ->
+     * софт-декод dr_flac. AAC: файл .aac (MP4) -> faad2. MP3 идёт
+     * старым путём ниже. */
     {
         const char *dot = source.path[0] ? strrchr(source.path, '.') : NULL;
         if (!sbuf && fd >= 0 && dot && strcmp(dot, ".flac") == 0) {
             logLine("ap: flac file mode track_id='%s' path='%s'\n",
                     track.id, source.path);
-            error_code = audio_player_flac_file_run(&track, &source, fd,
+            error_code = audio_player_flac_file_run(&track, &source, &fd,
+                flac_file_avail_cb, (void *)track.id,
+                &sampling_rate, &num_channels, &played_samples,
+                &audio_reserved, &reserved_bytes,
+                &first_pcm_done, worker_generation, &stop_state);
+            goto cleanup;
+        }
+        if (!sbuf && fd >= 0 && dot && strcmp(dot, ".mp4") == 0) {
+            logLine("ap: flac file mode track_id='%s' path='%s'\n",
+                    track.id, source.path);
+            error_code = audio_player_flac_file_run(&track, &source, &fd,
+                flac_file_avail_cb, (void *)track.id,
+                &sampling_rate, &num_channels, &played_samples,
+                &audio_reserved, &reserved_bytes,
+                &first_pcm_done, worker_generation, &stop_state);
+            goto cleanup;
+        }
+        if (!sbuf && fd >= 0 && dot && strcmp(dot, ".aac") == 0) {
+            logLine("ap: aac file mode track_id='%s' path='%s'\n",
+                    track.id, source.path);
+            error_code = audio_player_aac_file_run(&track, &source, &fd,
                 flac_file_avail_cb, (void *)track.id,
                 &sampling_rate, &num_channels, &played_samples,
                 &audio_reserved, &reserved_bytes,
@@ -1411,6 +1817,12 @@ static int audio_player_worker(SceSize args, void *argp)
                 sceKernelDcacheWritebackInvalidateRange(pcm_ptr, bytes_decoded);
             }
 
+            /* Ping-pong: PCM копируется в буфер, который SRC-DMA сейчас НЕ
+             * читает (см. s_out_buf), иначе на реальном PSP следующий вызов
+             * sceMp3Decode затирает буфер во время воспроизведения. */
+            memcpy(s_out_buf[s_out_idx], pcm_ptr, (size_t)bytes_decoded);
+            sceKernelDcacheWritebackRange(s_out_buf[s_out_idx], bytes_decoded);
+
             if (!audio_reserved || reserved_bytes != bytes_decoded) {
                 int sample_count;
                 if (audio_reserved) {
@@ -1443,11 +1855,14 @@ static int audio_player_worker(SceSize args, void *argp)
             /* sceAudioSRCOutputBlocking returns the sample count on success
              * (e.g. 1152); keep that out of error_code so a normal stop does
              * not log a bogus "error=0x480". Only a negative value is a fault. */
-            int out_rc = sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, pcm_ptr);
+            int out_rc = sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX,
+                                                   (short *)s_out_buf[s_out_idx]);
             if (out_rc < 0) {
                 error_code = out_rc;
                 goto cleanup;
             }
+            s_out_idx ^= 1;
+            ap_note_output(bytes_decoded / (2 * num_channels), "mp3");
 
             played_samples += bytes_decoded / (2 * num_channels);
             /* WAVE-REPORT: first really-audible block of this run. */
@@ -1608,6 +2023,7 @@ int audio_player_start_current(void)
     /* SEEK: a new track starts with no queued seek. */
     s_seek_pending = 0;
     logLine("ap: start_current accepted track_id='%s'\n", g_playback.current_track.id);
+    logger_checkpoint("play start id='%s'", g_playback.current_track.id);
     set_status(AUDIO_PLAYER_OPENING, g_playback.current_track.id, 0);
 
     s_worker_thread = sceKernelCreateThread("audio_player_worker",
@@ -1724,6 +2140,7 @@ int audio_player_seek_to_ms(int target_ms)
     }
     s_seek_target_ms = target_ms;
     s_seek_pending = 1;
+    ap_forget_output_timing();
     logLine("ap: seek requested target_ms=%d state=%s\n",
             target_ms, audio_player_state_name(state));
     return 0;

@@ -10,6 +10,7 @@
 
 #include "core/logger.h"
 #include "services/net_http.h"
+#include "services/net_speed.h"
 
 #define YM_FILE_INFO_SECRET "kzqU4XhfCaY6B6JTHODeq5"
 #define YM_FILE_INFO_CODECS_MP3 "mp3"
@@ -18,10 +19,11 @@
  * момент: sign считается по списку БЕЗ запятых (nc), а в query идёт
  * список с запятыми — с коротким "flac" сервер молча отдаёт mp3. */
 #define YM_FILE_INFO_CODECS_FULL \
-    "flac,flac-mp4,mp3,aac,he-aac,aac-mp4,he-aac-mp4"
+    "flac,flac-mp4,aac-mp4,he-aac-mp4,aac,he-aac,mp3"
 #define YM_FILE_INFO_CODECS_FULL_NC \
-    "flacflac-mp4mp3aache-aacaac-mp4he-aac-mp4"
+    "flacflac-mp4aac-mp4he-aac-mp4aache-aacmp3"
 #define YM_FILE_INFO_TRANSPORTS "raw"
+#define YM_FILE_INFO_TRANSPORTS_ENC "encraw"
 
 // Качество: "lq" / "nq" (192) / "hq" (320) / "mp3" (формат: codecs=mp3,
 // 192 kbps — серверу отдаём как nq), проверено пробой get-file-info
@@ -43,6 +45,10 @@ void ym_api_download_set_quality(const char *q)
         s_quality = "nq";
     } else if (q && strcmp(q, "mp3") == 0) {
         s_quality = "mp3";
+    } else if (q && strcmp(q, "auto") == 0) {
+        s_quality = "auto";
+    } else if (q && strcmp(q, "flac") == 0) {
+        s_quality = "flac";
     } else {
         return;
     }
@@ -55,11 +61,34 @@ const char *ym_api_download_quality(void)
     return s_quality;
 }
 
-/* Сервер знает только lq/nq/hq: выбранный формат "mp3" отдаём как nq —
- * при codecs=mp3 это 192 kbps (см. комментарий выше). */
+/* Качество, которое реально уходит серверу: он знает только lq/nq/hq.
+ *  mp3  -> nq (при codecs=mp3 это 192 kbps, см. комментарий выше);
+ *  auto -> по измеренной скорости загрузки (net_speed): lq / nq / hq;
+ *  flac -> hq (тестовый режим: сначала lossless, при отказе — AAC 256). */
+const char *ym_api_download_effective_quality(void)
+{
+    const char *q = s_quality;
+    if (!q) return "nq";
+    if (strcmp(q, "mp3") == 0) return "nq";
+    if (strcmp(q, "flac") == 0) return "hq";
+    if (strcmp(q, "auto") == 0) {
+        switch (net_speed_auto_level()) {
+        case 0:  return "lq";
+        case 2:  return "hq";
+        default: return "nq";
+        }
+    }
+    return q;
+}
+
+int ym_api_download_flac_enabled(void)
+{
+    return s_quality && strcmp(s_quality, "flac") == 0;
+}
+
 static const char *ym_download_http_quality(void)
 {
-    return (s_quality && strcmp(s_quality, "mp3") == 0) ? "nq" : s_quality;
+    return ym_api_download_effective_quality();
 }
 
 static int ym_url_encode_component(const char *in, char *out, size_t out_size)
@@ -217,6 +246,7 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
     cJSON *url_node = NULL;
     const char *direct_url = NULL;
     int bitrate_kbps = 0;
+    int want_enc = 0;
     int ret;
 
     if (!ctx || !ctx->oauth_token || !track_id || !quality || !codecs_query ||
@@ -301,10 +331,13 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
 
     if (!ym_json_string_nonempty(codec) ||
         !ym_codec_family_match(want_codec, codec->valuestring)) {
-        logLine("ym_api_download: rejected codec='%s' want_family=%s\n",
+        cJSON *q = cJSON_GetObjectItemCaseSensitive(download_info, "quality");
+        logLine("ym_api_download: rejected codec='%s' want_family=%s server_quality='%s' transports=%s\n",
                 (codec && cJSON_IsString(codec) && codec->valuestring)
                     ? codec->valuestring : "(missing)",
-                want_codec);
+                want_codec,
+                (q && cJSON_IsString(q) && q->valuestring) ? q->valuestring : "?",
+                transports);
         if (ym_json_string_nonempty(codec) &&
             strlen(codec->valuestring) < sizeof(out->codec)) {
             strncpy(out->codec, codec->valuestring, sizeof(out->codec) - 1);
@@ -314,7 +347,9 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
         return YM_ERR_UNSUPPORTED;
     }
 
-    if (!ym_json_string_nonempty(transport) || strcmp(transport->valuestring, "raw") != 0) {
+    want_enc = (strcmp(transports, YM_FILE_INFO_TRANSPORTS_ENC) == 0);
+    if (!ym_json_string_nonempty(transport) ||
+        strcmp(transport->valuestring, want_enc ? "encraw" : "raw") != 0) {
         logLine("ym_api_download: rejected transport='%s'\n",
                 (transport && cJSON_IsString(transport) && transport->valuestring) ? transport->valuestring : "(missing)");
         cJSON_Delete(root);
@@ -322,7 +357,29 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
         return YM_ERR_UNSUPPORTED;
     }
 
-    if (key && !cJSON_IsNull(key) && !(cJSON_IsString(key) && (!key->valuestring || key->valuestring[0] == '\0'))) {
+    if (want_enc) {
+        /* encraw: key — 32 hex-символа (AES-128), режим CTR, nonce = 0. */
+        const char *hex = (key && cJSON_IsString(key)) ? key->valuestring : NULL;
+        size_t i;
+        if (!hex || strlen(hex) != 32) {
+            logLine("ym_api_download: encraw key missing/bad len=%d\n",
+                    hex ? (int)strlen(hex) : -1);
+            cJSON_Delete(root);
+            logger_flush();
+            return YM_ERR_UNSUPPORTED;
+        }
+        for (i = 0; i < 16; i++) {
+            unsigned int v = 0;
+            char pair[3] = { hex[2 * i], hex[2 * i + 1], 0 };
+            if (sscanf(pair, "%2x", &v) != 1) {
+                logLine("ym_api_download: encraw key not hex\n");
+                cJSON_Delete(root);
+                logger_flush();
+                return YM_ERR_UNSUPPORTED;
+            }
+            out->aes_key[i] = (unsigned char)v;
+        }
+    } else if (key && !cJSON_IsNull(key) && !(cJSON_IsString(key) && (!key->valuestring || key->valuestring[0] == '\0'))) {
         logLine("ym_api_download: rejected encrypted response key_present=1\n");
         cJSON_Delete(root);
         logger_flush();
@@ -366,12 +423,13 @@ static YmStatus ym_download_fetch_variant(YmApiContext *ctx,
     out->url[sizeof(out->url) - 1] = '\0';
     /* Фактический кодек сервера (flac-mp4 / aac-mp4 / he-aac-mp4 / mp3). */
     snprintf(out->codec, sizeof(out->codec), "%s", codec->valuestring);
-    strcpy(out->transport, "raw");
+    strcpy(out->transport, want_enc ? "encraw" : "raw");
     out->bitrate_kbps = bitrate_kbps;
-    out->encrypted = 0;
-    logLine("ym_api_download: direct url ok family=%s codec=%s transport=raw bitrate=%d key=none url_len=%u\n",
-            want_codec, out->codec,
-            out->bitrate_kbps, (unsigned int)strlen(out->url));
+    out->encrypted = want_enc ? 1 : 0;
+    logLine("ym_api_download: direct url ok family=%s codec=%s transport=%s bitrate=%d key=%s url_len=%u\n",
+            want_codec, out->codec, out->transport,
+            out->bitrate_kbps, want_enc ? "aes128-ctr" : "none",
+            (unsigned int)strlen(out->url));
     cJSON_Delete(root);
     logger_flush();
     return YM_OK;
@@ -387,14 +445,53 @@ YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
                                      YM_FILE_INFO_TRANSPORTS, "mp3", out);
 }
 
+/* Негативный кэш lossless: если сервер раз за разом отдаёт не-lossless (нет
+ * Плюса / нет lossless у каталога), каждая попытка стоит 2-3 TLS-рукопожатия
+ * (~3-4 с на трек). После двух подряд отказов пропускаем попытки на 10 минут;
+ * любой успех сбрасывает счётчик. */
+static int s_flac_rejects = 0;
+static unsigned long long s_flac_deny_until_us = 0;
+
 YmStatus ym_api_download_get_flac_raw(YmApiContext *ctx,
                                       const char *track_id,
                                       YmDownloadVariant *out)
 {
-    return ym_download_fetch_variant(ctx, track_id, "lossless",
-                                     YM_FILE_INFO_CODECS_FULL,
-                                     YM_FILE_INFO_CODECS_FULL_NC,
-                                     YM_FILE_INFO_TRANSPORTS, "flac", out);
+    /* Lossless отдаётся только по encraw (AES-128-CTR) и только с Плюсом;
+     * без Плюса сервер молча даёт aac. Сначала encraw, затем raw (на случай
+     * аккаунтов/треков, где lossless идёт открытым потоком). */
+    unsigned long long now = sceKernelGetSystemTimeWide();
+    YmStatus st;
+    /* Режим «FLAC (тест)»: пользователь хочет видеть результат каждой попытки
+     * в логе — негативный кэш обходим и пробуем оба транспорта. */
+    int test_mode = ym_api_download_flac_enabled();
+    if (!test_mode && s_flac_deny_until_us && now < s_flac_deny_until_us) {
+        return YM_ERR_UNSUPPORTED;
+    }
+    st = ym_download_fetch_variant(ctx, track_id, "lossless",
+                                   YM_FILE_INFO_CODECS_FULL,
+                                   YM_FILE_INFO_CODECS_FULL_NC,
+                                   YM_FILE_INFO_TRANSPORTS_ENC,
+                                   "flac", out);
+    if (st == YM_ERR_UNSUPPORTED && (s_flac_rejects == 0 || test_mode)) {  /* raw — только до первого отказа */
+        /* raw-вариант пробуем лишь пока ни разу не было отказа. */
+        st = ym_download_fetch_variant(ctx, track_id, "lossless",
+                                       YM_FILE_INFO_CODECS_FULL,
+                                       YM_FILE_INFO_CODECS_FULL_NC,
+                                       YM_FILE_INFO_TRANSPORTS, "flac", out);
+    }
+    if (st == YM_OK) {
+        s_flac_rejects = 0;
+        s_flac_deny_until_us = 0;
+    } else if (st == YM_ERR_UNSUPPORTED) {
+        /* Отказ по аккаунту (сервер понизил quality до nq/hq — нет Плюса)
+         * повторяется на каждом треке: после первого отказа 3 мин паузы,
+         * после второго подряд — 10 мин. */
+        s_flac_rejects++;
+        s_flac_deny_until_us = now + (s_flac_rejects >= 2 ? 600ULL : 180ULL) * 1000000ULL;
+        logLine("ym_api_download: lossless unavailable x%d -> skip flac for %d min\n",
+                s_flac_rejects, s_flac_rejects >= 2 ? 10 : 3);
+    }
+    return st;
 }
 
 YmStatus ym_api_download_get_aac_raw(YmApiContext *ctx,

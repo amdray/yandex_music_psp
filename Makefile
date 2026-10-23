@@ -26,6 +26,9 @@ OBJS = src/main.o \
        src/ui/ui_screen_search.o \
        src/ui/ui_wave_carousel.o \
        src/ui/ui_glow_bg.o \
+       src/ui/ui_viz.o \
+       src/ui/ui_idle.o \
+       src/ui/ui_theme.o \
        src/ui/ui_screen_help.o \
        src/ui/ui_screen_memory.o \
        src/ui/ui_screen_eq.o \
@@ -95,6 +98,7 @@ OBJS = src/main.o \
        src/services/playback_queue.o \
        src/services/playback_controller.o \
        src/services/speed_test.o \
+       src/services/net_speed.o \
        src/services/video_player.o
 EXIT_STAGE ?= 0
 PSP_CONFIG ?= psp-config

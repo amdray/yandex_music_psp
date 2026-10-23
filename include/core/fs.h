@@ -23,6 +23,12 @@ int fs_rename(const char *old_path, const char *new_path);
 int fs_remove_siblings(const char *dir, const char *prefix, const char *keep_name);
 int fs_mkdir(const char *path, int mode);
 int fs_write_atomic(const char *path, const void *data, size_t size);
+/* Отложенная запись небольших конфигов (<=256 Б): возвращается сразу, пишет
+ * фоновый поток через ~1.2 с после последнего вызова (повторные записи того
+ * же пути склеиваются). Запись на карту PSP занимает секунды — из UI-потока
+ * её звать нельзя. fs_flush_deferred() — дописать всё синхронно (выход). */
+int fs_write_deferred(const char *path, const void *data, size_t size);
+void fs_flush_deferred(void);
 
 // From new fs.h
 int fs_get_cwd(char *out, size_t size);

@@ -3,6 +3,7 @@
 #include "fonts/cbmf.h"
 #include "hal/hal_gpu.h"
 #include "core/logger.h"
+#include "ui/ui_draw.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -32,9 +33,20 @@ static CbmfFontId text_font_id(TextFont font)
     return (CbmfFontId)font;
 }
 
+static int s_text_shadow = 0;
+
+void text_set_shadow(int on)
+{
+    s_text_shadow = on ? 1 : 0;
+}
+
 static void text_draw(TextFont font, int x, int y, const char *text,
                       u32 color_abgr)
 {
+    color_abgr = ui_draw_apply_alpha(color_abgr);
+    if ((color_abgr >> 24) == 0) {
+        return;
+    }
     CbmfPspRenderer *r = cbmf_fonts_get_renderer(text_font_id(font));
     if (!r) {
         return;
@@ -47,6 +59,11 @@ static void text_draw(TextFont font, int x, int y, const char *text,
     sceGuEnable(GU_ALPHA_TEST);
     sceGuAlphaFunc(GU_GREATER, 0, 0xFF);
 
+    if (s_text_shadow && (color_abgr >> 24) != 0) {
+        /* тень: чёрная, альфа ~75% от альфы текста */
+        u32 a = ((color_abgr >> 24) * 3u) >> 2;
+        cbmf_psp_draw_utf8(r, x + 1, y + 1, text, a << 24);
+    }
     cbmf_psp_draw_utf8(r, x, y, text, color_abgr);
 
     sceGuDisable(GU_ALPHA_TEST);

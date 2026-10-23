@@ -138,6 +138,7 @@ static void power_callback(int unknown, int power_info)
     logLine("power: callback info=0x%08X battery=%d%% low=%d\n",
             (unsigned int)power_info, (int)scePowerGetBatteryLifePercent(),
             (int)scePowerIsLowBattery());
+    fs_flush_deferred();  /* настройки не должны потеряться при сне/выключении */
     logger_flush_now();
 }
 
@@ -449,6 +450,7 @@ cleanup:
         (void)ui_screens_shutdown();
         logLine("app: shutdown\n");
         LOG_FLUSH();
+        fs_flush_deferred();
         LOG_SHUTDOWN();
         fs_shutdown();
         sceKernelExitGame();
@@ -469,6 +471,7 @@ cleanup:
     }
     logLine("app: shutdown\n");
     LOG_FLUSH();
+    fs_flush_deferred();
     LOG_SHUTDOWN();
     fs_shutdown();
     sceKernelExitGame();

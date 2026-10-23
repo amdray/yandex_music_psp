@@ -16,8 +16,10 @@
 #include "services/track_download.h"
 #include "services/cover_manager.h"
 #include "services/ym_api.h"
+#include "services/net_speed.h"
 #include "services/audio_stream_buf.h"
 #include "services/mp4_track.h"
+#include <mbedtls/aes.h>
 
 #define AUDIO_CACHE_PROGRESSIVE_THRESHOLD (256 * 1024)
 /* FLAC раньше стартовал с 256 КБ (~1-2 с аудио) и на медленной сети PSP
@@ -431,7 +433,30 @@ typedef struct {
     int bitrate_kbps;       /* из download-info, 0 если сервер не дал */
     int duration_ms;        /* длительность трека, 0 если неизвестна */
     int64_t progressive_need;
+    /* Буфер между сетью и картой. Memory Stick на реальной PSP отвечает
+     * секундами; без буфера приём из сети стоял на fs_write, TCP-окно
+     * закрывалось и сервер рвал соединение (errno 104, 0 КБ/с). Теперь сеть
+     * кладёт данные в ОЗУ-кольцо, отдельный поток пишет их в файл. */
+    unsigned char *wbuf;
+    size_t wb_head, wb_tail, wb_used;       /* под wmutex */
+    SceLwMutexWorkarea wmutex;
+    int wmutex_ok;
+    SceUID wsema;
+    SceUID wthread;
+    volatile int wstop;                     /* дописать остаток и выйти */
+    volatile int werror;
+    volatile int64_t flushed;               /* байт записано в файл (сессия) */
+    /* AES-128-CTR для encraw (flac): счётчик по абсолютной позиции файла. */
+    int use_aes;
+    mbedtls_aes_context aes;
+    unsigned char aes_nonce[16];
+    unsigned char aes_stream[16];
+    size_t aes_off;
 } AcFileDlCtx;
+
+#define AC_WBUF_SIZE   (192 * 1024)
+#define AC_WRITE_CHUNK (24 * 1024)
+#define AC_WRITE_MIN   (12 * 1024)
 
 /* Сколько байт дождаться перед стартом плеера. FLAC — 10 с трека:
  * 1) точно по размеру файла и длительности (когда content_length уже
@@ -465,63 +490,36 @@ static void ac_log_speed(const char *track_id, int64_t absolute,
                          int64_t total, u64 *last_us, int64_t *last_bytes)
 {
     u64 now = sceKernelGetSystemTimeWide();
+    static u64 s_log_us = 0;
 
     if (*last_us == 0) {
         *last_us = now;
         *last_bytes = absolute;
         return;
     }
-    if (now - *last_us >= 5000000ULL) {
+    /* Окно 2 с: скармливаем оценщику скорости (режим качества «Авто»).
+     * Лог — не чаще раза в 5 с, как и раньше. */
+    if (now - *last_us >= 2000000ULL) {
         int64_t delta = absolute - *last_bytes;
-        int secs = (int)((now - *last_us) / 1000000ULL);
-        if (secs > 0 && delta >= 0) {
-            logLine("ac: dl speed track='%s' %d/%d %d KB/s\n",
-                    track_id, (int)absolute, (int)total,
-                    (int)(delta / (int64_t)secs / 1024));
+        if (delta >= 0) {
+            net_speed_note(delta, now - *last_us);
+            if (now - s_log_us >= 5000000ULL) {
+                logLine("ac: dl speed track='%s' %d/%d %d KB/s (ema %d)\n",
+                        track_id, (int)absolute, (int)total,
+                        (int)(delta * 1000000LL / (int64_t)(now - *last_us) / 1024),
+                        net_speed_kbps());
+                s_log_us = now;
+            }
         }
         *last_us = now;
         *last_bytes = absolute;
     }
 }
 
-static int flac_file_chunk(const char *data, int size, void *user)
+/* Статус закачки: байты, УЖЕ записанные в файл (их может читать плеер). */
+static void ac_file_status_update(AcFileDlCtx *ctx, int64_t absolute)
 {
-    AcFileDlCtx *ctx = (AcFileDlCtx *)user;
-    int rc;
-    if (!ctx || !data || size <= 0) return -1;
-    if (ctx->slot->job_cancel || s_shutdown) {
-        return NET_HTTP_STREAM_CANCELLED;
-    }
-    if (ctx->fd < 0) return -1;
-    rc = fs_write(ctx->fd, data, (SceSize)size);
-    if (rc != size) {
-        logLine("ac: flac file write short slot=%d rc=%d\n",
-                ctx->slot->slot_id, rc);
-        return -1;
-    }
-    ctx->session_written += size;
-    return 0;
-}
-
-static int flac_file_progress(int written_total, int content_length, void *user)
-{
-    AcFileDlCtx *ctx = (AcFileDlCtx *)user;
-    int64_t absolute;
-    int progressive;
-    if (!ctx) return -1;
-    if (ctx->attempt_total <= 0 && content_length > 0) {
-        ctx->attempt_total = content_length;
-    }
-    /* net_http отдаёт УЖЕ абсолютный прогресс (progress_base включает
-     * range_start), и content_length — полный размер объекта. Прибавлять
-     * base_size повторно нельзя: счётчик обгонял файл ровно на base_size,
-     * читатель проходил ворота avail и упирался в короткое чтение —
-     * вечный «short read/wait» на фронтире докачки. */
-    absolute = (int64_t)written_total;
-    /* Размер объекта стал известен — уточняем пребафер (для FLAC это
-     * 10 с трека по длительности, не больше полного файла). */
-    ctx->progressive_need = ac_prebuffer_need(ctx);
-    progressive = absolute >= ctx->progressive_need;
+    int progressive = absolute >= ctx->progressive_need;
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
     if (strcmp(ctx->slot->status.track_id, ctx->track_id) == 0) {
         ctx->slot->status.downloaded_bytes = absolute;
@@ -537,8 +535,166 @@ static int flac_file_progress(int written_total, int content_length, void *user)
         }
     }
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
+}
+
+/* Поток записи: сливает кольцо в файл кусками, обновляет статус. */
+static int ac_writer_main(SceSize args, void *argp)
+{
+    AcFileDlCtx *ctx = *(AcFileDlCtx **)argp;
+    (void)args;
+    for (;;) {
+        SceUInt timeout = 200000;
+        size_t n, tail;
+        (void)sceKernelWaitSema(ctx->wsema, 1, &timeout);
+        for (;;) {
+            int rc;
+            sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
+            n = ctx->wb_used;
+            tail = ctx->wb_tail;
+            sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+            if (n > AC_WRITE_CHUNK) n = AC_WRITE_CHUNK;
+            if (n > AC_WBUF_SIZE - tail) n = AC_WBUF_SIZE - tail;
+            if (n == 0) break;
+            /* Мелкие порции копим, кроме финала/таймаута-слива. */
+            if (n < AC_WRITE_MIN && !ctx->wstop && ctx->wb_used < AC_WRITE_MIN &&
+                timeout == 0) {
+                break;
+            }
+            rc = fs_write(ctx->fd, ctx->wbuf + tail, (SceSize)n);
+            if (rc != (int)n) {
+                logLine("ac: file write short slot=%d rc=%d\n",
+                        ctx->slot->slot_id, rc);
+                ctx->werror = 1;
+                sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
+                ctx->wb_used = 0;
+                sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+                return sceKernelExitDeleteThread(0);
+            }
+            sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
+            ctx->wb_tail = (ctx->wb_tail + n) % AC_WBUF_SIZE;
+            ctx->wb_used -= n;
+            sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+            ctx->flushed += (int64_t)n;
+            ctx->session_written = ctx->flushed;
+            ac_file_status_update(ctx, ctx->base_size + ctx->flushed);
+        }
+        sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
+        n = ctx->wb_used;
+        sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+        if (ctx->wstop && n == 0) break;
+    }
+    return sceKernelExitDeleteThread(0);
+}
+
+static int ac_writer_start(AcFileDlCtx *ctx)
+{
+    AcFileDlCtx *self = ctx;
+    ctx->wbuf = (unsigned char *)malloc(AC_WBUF_SIZE);
+    if (!ctx->wbuf) return -1;
+    ctx->wb_head = ctx->wb_tail = ctx->wb_used = 0;
+    ctx->wstop = 0;
+    ctx->werror = 0;
+    ctx->flushed = 0;
+    ctx->wmutex_ok = (sceKernelCreateLwMutex(&ctx->wmutex, "ac_wbuf", 0, 0, NULL) >= 0);
+    ctx->wsema = sceKernelCreateSema("ac_wsem", 0, 0, 1, NULL);
+    if (!ctx->wmutex_ok || ctx->wsema < 0) goto fail;
+    ctx->wthread = sceKernelCreateThread("ac_writer", ac_writer_main,
+                                         0x20, 0x4000, 0, NULL);
+    if (ctx->wthread < 0) goto fail;
+    if (sceKernelStartThread(ctx->wthread, sizeof(self), &self) < 0) {
+        sceKernelDeleteThread(ctx->wthread);
+        ctx->wthread = -1;
+        goto fail;
+    }
+    return 0;
+fail:
+    if (ctx->wsema >= 0) sceKernelDeleteSema(ctx->wsema);
+    if (ctx->wmutex_ok) sceKernelDeleteLwMutex(&ctx->wmutex);
+    free(ctx->wbuf);
+    ctx->wbuf = NULL;
+    ctx->wthread = -1;
+    ctx->wsema = -1;
+    return -1;
+}
+
+/* Дождаться слива остатка и освободить ресурсы. */
+static void ac_writer_stop(AcFileDlCtx *ctx)
+{
+    SceUInt timeout = 60u * 1000000u;
+    if (!ctx->wbuf) return;
+    ctx->wstop = 1;
+    sceKernelSignalSema(ctx->wsema, 1);
+    if (sceKernelWaitThreadEnd(ctx->wthread, &timeout) < 0) {
+        sceKernelTerminateDeleteThread(ctx->wthread);
+        ctx->werror = 1;
+    }
+    sceKernelDeleteSema(ctx->wsema);
+    sceKernelDeleteLwMutex(&ctx->wmutex);
+    free(ctx->wbuf);
+    ctx->wbuf = NULL;
+    if (ctx->use_aes) mbedtls_aes_free(&ctx->aes);
+}
+
+static int flac_file_chunk(const char *data, int size, void *user)
+{
+    AcFileDlCtx *ctx = (AcFileDlCtx *)user;
+    if (!ctx || !data || size <= 0) return -1;
+    if (ctx->slot->job_cancel || s_shutdown) {
+        return NET_HTTP_STREAM_CANCELLED;
+    }
+    if (ctx->fd < 0 || !ctx->wbuf) return -1;
+    while (size > 0) {
+        size_t freebytes, n;
+        if (ctx->werror) return -1;
+        sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
+        freebytes = AC_WBUF_SIZE - ctx->wb_used;
+        sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+        if (freebytes == 0) {
+            /* Карта не успевает: тормозим приём (редко, при длинной записи). */
+            sceKernelSignalSema(ctx->wsema, 1);
+            if (ctx->slot->job_cancel || s_shutdown) {
+                return NET_HTTP_STREAM_CANCELLED;
+            }
+            sceKernelDelayThread(3000);
+            continue;
+        }
+        n = (size_t)size;
+        if (n > freebytes) n = freebytes;
+        if (n > AC_WBUF_SIZE - ctx->wb_head) n = AC_WBUF_SIZE - ctx->wb_head;
+        if (ctx->use_aes) {
+            mbedtls_aes_crypt_ctr(&ctx->aes, n, &ctx->aes_off, ctx->aes_nonce,
+                                  ctx->aes_stream,
+                                  (const unsigned char *)data,
+                                  ctx->wbuf + ctx->wb_head);
+        } else {
+            memcpy(ctx->wbuf + ctx->wb_head, data, n);
+        }
+        ctx->wb_head = (ctx->wb_head + n) % AC_WBUF_SIZE;
+        sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
+        ctx->wb_used += n;
+        freebytes = ctx->wb_used;
+        sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+        data += n;
+        size -= (int)n;
+        if (freebytes >= AC_WRITE_MIN) sceKernelSignalSema(ctx->wsema, 1);
+    }
+    return 0;
+}
+
+static int flac_file_progress(int written_total, int content_length, void *user)
+{
+    AcFileDlCtx *ctx = (AcFileDlCtx *)user;
+    if (!ctx) return -1;
+    if (ctx->attempt_total <= 0 && content_length > 0) {
+        ctx->attempt_total = content_length;
+    }
+    /* Размер объекта стал известен — уточняем пребафер (для FLAC это
+     * 10 с трека по длительности, не больше полного файла). */
+    ctx->progressive_need = ac_prebuffer_need(ctx);
+    /* written_total — абсолютно принятые из сети байты (с range_start);
+     * плееру доступно только записанное писателем (ac_file_status_update). */
     ctx->attempt_had_progress = 1;
-    ac_log_speed(ctx->track_id, absolute,
+    ac_log_speed(ctx->track_id, (int64_t)written_total,
                  (ctx->attempt_total > 0 ? ctx->attempt_total : content_length),
                  &ctx->last_speed_us, &ctx->last_speed_bytes);
     return 0;
@@ -655,11 +811,6 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
             base_size = (int64_t)st.st_size;
         }
 
-        /* cache_music/ мог отсутствовать (удалён вне приложения): ENOENT
-         * на этом открытии ронял ВСЕ файловые кодеки (flac/aac), пока mp3
-         * в RAM-ветке работал. http_stream делает ensure для своих sink'ов,
-         * но fd здесь открывается раньше — ensure нужен и тут. */
-        fs_ensure_dir(dl_path);
         memset(&ctx, 0, sizeof(ctx));
         ctx.slot = slot;
         snprintf(ctx.track_id, sizeof(ctx.track_id), "%s", job->track.id);
@@ -681,6 +832,40 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
         /* Статус несёт финальный путь: плеер выбирает декодер по
          * расширению (.flac / .mp4 / .aac), файл играется уже во время
          * докачки — с порога PROGRESSIVE_READY. */
+        /* Расшифровка encraw: CTR с нулевым nonce, позиция = размер файла. */
+        if (variant.encrypted) {
+            unsigned char zero[16];
+            size_t skip = (size_t)(base_size % 16);
+            uint64_t blk = (uint64_t)(base_size / 16);
+            int i;
+            memset(ctx.aes_nonce, 0, sizeof(ctx.aes_nonce));
+            for (i = 0; i < 8; i++) {
+                ctx.aes_nonce[15 - i] = (unsigned char)(blk >> (8 * i));
+            }
+            mbedtls_aes_init(&ctx.aes);
+            ctx.aes_off = 0;
+            if (mbedtls_aes_setkey_enc(&ctx.aes, variant.aes_key, 128) != 0) {
+                logLine("ac: aes setkey failed slot=%d\n", slot->slot_id);
+                mbedtls_aes_free(&ctx.aes);
+                fs_close(ctx.fd);
+                slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, -1);
+                return -1;
+            }
+            ctx.use_aes = 1;
+            if (skip > 0) {  /* докачка с позиции не на границе блока */
+                memset(zero, 0, sizeof(zero));
+                mbedtls_aes_crypt_ctr(&ctx.aes, skip, &ctx.aes_off,
+                                      ctx.aes_nonce, ctx.aes_stream,
+                                      zero, zero);
+            }
+        }
+        if (ac_writer_start(&ctx) != 0) {
+            logLine("ac: writer start failed slot=%d\n", slot->slot_id);
+            if (ctx.use_aes) mbedtls_aes_free(&ctx.aes);
+            fs_close(ctx.fd);
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, -1);
+            return -1;
+        }
         slot_set_source(slot, AUDIO_CACHE_DOWNLOADING, job->track.id,
                         final_path, base_size, base_size,
                         variant.bitrate_kbps, 0,
@@ -701,8 +886,11 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
                             &(HttpSink){ .on_chunk = flac_file_chunk,
                                          .on_progress = flac_file_progress,
                                          .user = &ctx });
+        /* Дописать всё принятое (и при обрыве — для resume), затем закрыть. */
+        ac_writer_stop(&ctx);
         fs_close(ctx.fd);
         ctx.fd = -1;
+        if (rc_dl == 0 && ctx.werror) rc_dl = NET_HTTP_ERR_PROTOCOL;
 
         if (rc_dl == 0) {
             return file_job_ready(slot, job, final_path,
@@ -794,8 +982,7 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
     /* Хиты кэша по цепочке качества: hq = .flac -> .aac -> .mp3,
      * nq/lq = .aac -> .mp3. Частичный .aac хитом не считается. */
     {
-        const char *quality = ym_api_download_quality();
-        int try_flac = (quality && strcmp(quality, "hq") == 0);
+        int try_flac = ym_api_download_flac_enabled();
         SceIoStat st;
         char cand[64];
 
@@ -914,8 +1101,7 @@ static int run_download_job(AcSlot *slot, const AcJob *job)
      * nq/lq = AAC -> MP3. Каждый шаг: get-file-info + проба потока
      * (raw fLaC либо MP4), при отказе — следующий кодек. */
     {
-        const char *quality = ym_api_download_quality();
-        int try_flac = (quality && strcmp(quality, "hq") == 0);
+        int try_flac = ym_api_download_flac_enabled();
 
         /* Формат mp3 выбран явно: codecs=mp3 напрямую, без AAC-шага;
          * при отказе сервера — фолбэк на AAC ниже. */

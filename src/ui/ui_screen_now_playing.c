@@ -3,6 +3,8 @@
 #include "ui/ui_common.h"
 #include "ui/ui_glow_bg.h"
 #include "ui/ui_icon_atlas.h"
+#include "ui/ui_idle.h"
+#include <math.h>
 #include "ui/ui_layout.h"
 #include "ui/ui_screens.h"
 #include "hal/hal_gfx_config.h"
@@ -141,7 +143,8 @@ void ui_screen_now_playing_release_video(void)
 
 /* Draw the square cover video into the (cx,cy,size) box. Returns 1 if a video
  * frame was drawn (skip the static cover), else 0. */
-static int np_video_draw(const TrackEntry *track, float cx, float cy, float size)
+static int np_video_draw(const TrackEntry *track, float cx, float cy, float size,
+                         int draw_it)
 {
     AudioPlayerState audio_state;
 
@@ -207,6 +210,7 @@ static int np_video_draw(const TrackEntry *track, float cx, float cy, float size
     if (!s_np_frame) return 0;
 
     (void)size;
+    if (!draw_it) return 0;   /* режим бездействия: видео не рисуем, кадры идут */
     /* Proxy contract: visible 200x200 content is centred in 208x208. The GE
      * clips the 4px transport border and copies the result at exactly 1:1. */
     ui_draw_image_rgba_crop(s_np_frame, s_np_tex, 256, 4, 4, 200, 200, cx, cy);
@@ -485,6 +489,7 @@ void ui_screen_now_playing_handle_input(AppState *state, const InputState *input
 {
     unsigned long long now = sceKernelGetSystemTimeWide();
 
+    if (input->buttons) idle_note_activity();
     if (input->pressed & PSP_CTRL_CIRCLE) {
         ui_screens_pop_screen(state);
         return;
@@ -575,7 +580,22 @@ void ui_screen_now_playing_render(const AppState *state)
     }
     (void)ui_layout_render("now_playing", NULL, NULL, NULL);
     glow_bg_draw(0.0f, 0.0f, 480.0f, 272.0f);
-    
+
+    const float idle_k = idle_step();
+    const int idle_mode = idle_get_mode();
+    const float idle_s = idle_k * idle_k * (3.0f - 2.0f * idle_k);
+    const int cover_idle = idle_mode != IDLE_OFF && idle_k > 0.002f;
+    int ui_a = 255;
+    int cover_a = 255;
+    if (idle_mode == IDLE_DIM) {
+        ui_a = cover_a = (int)(255.0f * (1.0f - 0.62f * idle_s));
+    } else if (idle_mode == IDLE_HIDE) {
+        ui_a = cover_a = (int)(255.0f * (1.0f - idle_s));
+    } else if (idle_mode == IDLE_COVER) {
+        float ts = idle_s * 1.7f;
+        ui_a = (int)(255.0f * (1.0f - (ts > 1.0f ? 1.0f : ts)));
+    }
+
     if (state->now_playing_track.id[0] == '\0') {
         ui_draw_text(title_widget.x, title_widget.y,
                      locale_get(LOCALE_SCREEN_EMPTY), album_widget.color);
@@ -594,6 +614,12 @@ void ui_screen_now_playing_render(const AppState *state)
     const TrackEntry *track = &state->now_playing_track;
     u64 marquee_now_us = sceKernelGetSystemTimeWide();
 
+    /* Текст справа лежит на живом фоне: подложка по яркости фона + тень текста,
+     * иначе серый на светлом свечении сливается. Плашка рисуется до обложки. */
+    ui_draw_set_alpha(ui_a);
+    glow_bg_text_scrim(232.0f, 44.0f, 248.0f, 192.0f);
+    text_set_shadow(1);
+
     if (strcmp(player_snapshot.track_id, track->id) != 0) {
         int paused_position_ms;
         if (playback_controller_get_restored_pause(track->id,
@@ -610,13 +636,50 @@ void ui_screen_now_playing_render(const AppState *state)
     if (strcmp(s_marquee_track, track->id) != 0) {
         snprintf(s_marquee_track, sizeof(s_marquee_track), "%s", track->id);
         s_marquee_start_us = marquee_now_us;
+        idle_note_activity();   /* новый трек — показать информацию */
     }
     
     // Draw cover (200x200) - используем кэшированный указатель (без поиска в кеше каждый кадр)
     const NowPlayingCover *cover =
         cover_now_playing_get_for(track->album_id, track->cover_uri);
-    if (np_video_draw(track, cover_widget.x, cover_widget.y, cover_widget.w)) {
+    if (np_video_draw(track, cover_widget.x, cover_widget.y, cover_widget.w,
+                      !cover_idle)) {
         // Cover video drawn; static cover skipped this frame.
+    } else if (cover && cover->rgba_data && cover_idle) {
+        /* Бездействие: обложка рисуется текстурой — с прозрачностью и растяжением. */
+        float cw = (float)cover->w, ch = (float)cover->h;
+        float x0 = cover_widget.x, y0 = cover_widget.y;
+        float x1 = x0 + (cw < cover_widget.w ? cw : cover_widget.w);
+        float y1 = y0 + (ch < cover_widget.h ? ch : cover_widget.h);
+        float u0 = 0.0f, v0 = 0.0f, u1 = x1 - x0, v1 = y1 - y0;
+        int a = cover_a;
+        if (idle_mode == IDLE_COVER) {
+            float t = (float)(sceKernelGetSystemTimeWide() / 1000ULL) * 0.001f;
+            float zoom = 1.0f + 0.07f * (0.5f + 0.5f * sinf(t * 0.35f));
+            float uw = cw / zoom, uh = uw * (272.0f / 480.0f);
+            float ucx = cw * 0.5f + 0.04f * cw * sinf(t * 0.21f);
+            float ucy = ch * 0.5f + 0.03f * ch * sinf(t * 0.17f + 1.0f);
+            float tu0 = ucx - uw * 0.5f, tv0 = ucy - uh * 0.5f;
+            float target;
+            if (tu0 < 0.0f) tu0 = 0.0f;
+            if (tu0 + uw > cw) tu0 = cw - uw;
+            if (tv0 < 0.0f) tv0 = 0.0f;
+            if (tv0 + uh > ch) tv0 = ch - uh;
+            x0 += (0.0f - x0) * idle_s;      x1 += (480.0f - x1) * idle_s;
+            y0 += (0.0f - y0) * idle_s;      y1 += (272.0f - y1) * idle_s;
+            u1 = u1 + ((tu0 + uw) - u1) * idle_s;
+            v1 = v1 + ((tv0 + uh) - v1) * idle_s;
+            u0 = tu0 * idle_s;
+            v0 = tv0 * idle_s;
+            /* «дыхание» прозрачности поверх живого свечения — картинка и эффект смешиваются */
+            target = 0.58f + 0.14f * sinf(t * 0.9f) + 0.06f * sinf(t * 2.3f + 0.7f);
+            a = (int)(255.0f * (1.0f + (target - 1.0f) * idle_s));
+        }
+        if (a > 0) {
+            ui_draw_cover_quad(cover->rgba_data, cover->stride_bytes / 4, cover->h,
+                               u0, v0, u1, v1, x0, y0, x1, y1,
+                               0x00FFFFFFu | ((u32)(a > 255 ? 255 : a) << 24));
+        }
     } else if (cover && cover->rgba_data) {
         void *dst = hal_gpu_get_draw_buffer_cpu();
         int dst_stride = VRAM_BUFFER_WIDTH;
@@ -702,7 +765,7 @@ void ui_screen_now_playing_render(const AppState *state)
     {
         int icon_width;
         int icon_height;
-        if (ui_icon_atlas_get_size("in_bookmark", &icon_width,
+        if (ui_icon_atlas_get_size("in_heart", &icon_width,
                                    &icon_height) == 0) {
             int icon_x = (int)like_widget.x +
                          ((int)like_widget.w - icon_width) / 2;
@@ -710,15 +773,17 @@ void ui_screen_now_playing_render(const AppState *state)
                          ((int)like_widget.h - icon_height + 1) / 2;
             u32 color = track_like_is_on(track->id)
                             ? like_widget.color : UI_COLOR_INACTIVE;
-            ui_icon_atlas_draw("in_bookmark", icon_x, icon_y, color);
+            ui_icon_atlas_draw("in_heart", icon_x, icon_y, color);
         }
     }
 
+    text_set_shadow(0);
     draw_now_playing_bottom_bar(
         &bottom_status_widget, &bottom_mp3_widget,
         &bottom_bitrate_widget,
         &bottom_sample_rate_widget,
         bottom_status,
         strcmp(player_snapshot.track_id, track->id) == 0 ? &player_snapshot : NULL);
+    ui_draw_set_alpha(255);
 
 }

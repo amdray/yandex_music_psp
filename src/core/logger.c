@@ -43,6 +43,8 @@ static int s_last_sink_error = 0;
 static unsigned int s_sink_failures = 0;
 static volatile int s_realtime_mode = 0;
 static char s_log_path[LOG_PATH_MAX];
+#define LOG_CFG_PATH "config/logs.cfg"
+static volatile int s_log_enabled = 1;
 
 // Фоновый писатель (async). Запись на Memory Stick на реальной PSP с
 // почти заполненной/фрагментированной FAT32-картой занимает ~2 с на операцию;
@@ -419,6 +421,46 @@ void logger_init(const char *path)
     }
 
     log_writer_start();
+
+    /* Настройка «Логи»: читаем после открытия файла (fs_open сам пишет в лог). */
+    {
+        char cfg[16];
+        SceUID cfd = fs_open(LOG_CFG_PATH, PSP_O_RDONLY, 0777);
+        if (cfd >= 0) {
+            int n = fs_read(cfd, cfg, sizeof(cfg) - 1);
+            fs_close(cfd);
+            if (n > 0) {
+                cfg[n] = '\0';
+                if (strncmp(cfg, "logs=0", 6) == 0) {
+                    logLine("logger: disabled by settings (logs=0)\n");
+                    s_log_enabled = 0;
+                }
+            }
+        }
+    }
+}
+
+int logger_enabled(void)
+{
+    return s_log_enabled;
+}
+
+void logger_set_enabled(int enabled)
+{
+    const char *line;
+    enabled = enabled ? 1 : 0;
+    if (s_log_enabled == enabled) return;
+    if (enabled) {
+        s_log_enabled = 1;
+        logLine("logger: enabled by settings\n");
+        line = "logs=1\n";
+    } else {
+        logLine("logger: disabled by settings\n");
+        logger_flush_now();   /* дописать хвост: после этого записи прекращаются */
+        s_log_enabled = 0;
+        line = "logs=0\n";
+    }
+    (void)fs_write_deferred(LOG_CFG_PATH, line, strlen(line));
 }
 
 void logger_shutdown(void)
@@ -482,7 +524,10 @@ void logLine(const char *fmt, ...)
 {
     char line[LOG_LINE_MAX];
     va_list ap;
-    u64 usec = sceKernelGetSystemTimeWide();
+    u64 usec;
+
+    if (!s_log_enabled) return;
+    usec = sceKernelGetSystemTimeWide();
     unsigned int ms = (unsigned int)(usec / 1000ULL);
 
     // Format timestamp prefix
@@ -552,4 +597,17 @@ void logLine(const char *fmt, ...)
         // Buffer is full: flush synchronously in the caller's thread, then retry the write.
         log_flush_internal();
     }
+}
+
+void logger_checkpoint(const char *fmt, ...)
+{
+    char msg[LOG_LINE_MAX];
+    va_list ap;
+
+    if (!s_log_enabled) return;
+    va_start(ap, fmt);
+    (void)vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    logLine("checkpoint: %s\n", msg);
+    logger_flush_now();
 }

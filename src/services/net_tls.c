@@ -30,6 +30,10 @@
 #define INADDR_NONE ((unsigned long)0xFFFFFFFF)
 #endif
 
+#ifndef SO_RCVBUF
+#define SO_RCVBUF 0x1002
+#endif
+#define NET_TLS_RCVBUF_BYTES (64 * 1024)
 #ifndef SO_NONBLOCK
 #define SO_NONBLOCK 0x1009
 #endif
@@ -101,6 +105,73 @@ static void mbedtls_debug_cb(void *ctx, int level, const char *file, int line, c
 // исключительно через sceNetInetClose. mbedtls_net_free здесь запрещён — его
 // close() трактует сырой sce-номер как индекс fd-таблицы libcglue и закрывает
 // чужой дескриптор (mbedtls_net_context — это только int fd, утечек нет).
+/* Возобновление TLS-сессий (session ticket / session id): полное рукопожатие
+ * на PSP стоит ~1-1.5 с (RSA/ECDHE на 333 МГц + RTT), возобновление — один
+ * круг RTT. Кэш на несколько хостов (api, обложки, CDN); все обращения идут
+ * под s_tls_handshake_sema (рукопожатия и так сериализованы). Если сервер
+ * отверг сессию, mbedtls сам делает полное рукопожатие. */
+#define TLS_SESS_SLOTS 4
+#define TLS_SESS_MAX_AGE_US (20ULL * 60ULL * 1000000ULL)
+typedef struct {
+    char host[64];
+    mbedtls_ssl_session sess;
+    int used;
+    u64 saved_us;
+} TlsSessSlot;
+static TlsSessSlot s_sess[TLS_SESS_SLOTS];
+
+static void tls_sess_try_resume(mbedtls_ssl_context *ssl, const char *host)
+{
+    int i;
+    u64 now = sceKernelGetSystemTimeWide();
+    for (i = 0; i < TLS_SESS_SLOTS; i++) {
+        if (s_sess[i].used && strcmp(s_sess[i].host, host) == 0) {
+            if (now - s_sess[i].saved_us > TLS_SESS_MAX_AGE_US) {
+                mbedtls_ssl_session_free(&s_sess[i].sess);
+                s_sess[i].used = 0;
+                return;
+            }
+            if (mbedtls_ssl_set_session(ssl, &s_sess[i].sess) == 0) {
+                logLine("tls: resume offered host=%s\n", host);
+            }
+            return;
+        }
+    }
+}
+
+static void tls_sess_store(mbedtls_ssl_context *ssl, const char *host)
+{
+    int i, slot = -1;
+    u64 oldest = ~0ULL;
+    for (i = 0; i < TLS_SESS_SLOTS; i++) {
+        if (s_sess[i].used && strcmp(s_sess[i].host, host) == 0) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (i = 0; i < TLS_SESS_SLOTS; i++) {
+            if (!s_sess[i].used) { slot = i; break; }
+            if (s_sess[i].saved_us < oldest) { oldest = s_sess[i].saved_us; slot = i; }
+        }
+    }
+    if (slot < 0) return;
+    mbedtls_ssl_session_free(&s_sess[slot].sess);
+    mbedtls_ssl_session_init(&s_sess[slot].sess);
+    s_sess[slot].used = 0;
+    if (mbedtls_ssl_get_session(ssl, &s_sess[slot].sess) == 0) {
+        snprintf(s_sess[slot].host, sizeof(s_sess[slot].host), "%s", host);
+        s_sess[slot].saved_us = sceKernelGetSystemTimeWide();
+        s_sess[slot].used = 1;
+    }
+}
+
+static void tls_sess_clear_all(void)
+{
+    int i;
+    for (i = 0; i < TLS_SESS_SLOTS; i++) {
+        mbedtls_ssl_session_free(&s_sess[i].sess);
+        s_sess[i].used = 0;
+    }
+}
+
 static void tls_conn_cleanup(NetTlsConnection *conn)
 {
     int fd;
@@ -338,6 +409,7 @@ int net_tls_config_shutdown(void)
         logLine("tls: active owners remain; TLS runtime retained\n");
         return -1;
     }
+    tls_sess_clear_all();
     if (s_tls_conf_ready) {
         mbedtls_ssl_config_free(&s_tls_conf);
         s_tls_conf_ready = 0;
@@ -446,6 +518,23 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
         if (so_rc < 0) {
             tls_conn_cleanup(out_conn);
             return NET_TLS_ERR_CONNECT;
+        }
+    }
+    {
+        /* Окно приёма TCP: по умолчанию на PSP мало (~16 КБ), а RTT до CDN
+         * 50-100 мс => потолок window/RTT ~150 КБ/с (так и было в тесте
+         * скорости, полка 142-148 КБ/с). 64 КБ поднимает потолок >500 КБ/с,
+         * выше всё равно упирается Wi-Fi 802.11b консоли. */
+        int rcv = NET_TLS_RCVBUF_BYTES;
+        static int s_rcvbuf_logged = 0;
+        int so_rc = sceNetInetSetsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof(rcv));
+        if (!s_rcvbuf_logged) {
+            int got = 0;
+            socklen_t gl = sizeof(got);
+            int gr = sceNetInetGetsockopt(sock, SOL_SOCKET, SO_RCVBUF, &got, &gl);
+            s_rcvbuf_logged = 1;
+            logLine("tls: SO_RCVBUF set=%d rc=%d readback=%d rc=%d\n",
+                    rcv, so_rc, got, gr);
         }
     }
 
@@ -574,6 +663,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
         return -1;
     }
     mbedtls_ssl_set_bio(&out_conn->ssl, &out_conn->net, psp_net_send, psp_net_recv, NULL);
+    tls_sess_try_resume(&out_conn->ssl, hostname);
 
     {
         int hs_iter = 0;
@@ -614,7 +704,10 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
                             hs_iter, hs_elapsed_ms, hs_want_read, hs_want_write);
                     logger_flush();
                 }
-                sceKernelDelayThread(10 * 1000);
+                /* WANT_READ уже ждал в poll внутри recv — лишний сон не нужен. */
+                if (err == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    sceKernelDelayThread(2 * 1000);
+                }
                 continue;
             }
             log_mbedtls_error("tls: handshake failed", err);
@@ -624,10 +717,12 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
             return -1;
         }
 
+        tls_sess_store(&out_conn->ssl, hostname);
         // Handshake done; release semaphore so next connect can proceed.
         if (s_tls_handshake_sema >= 0) sceKernelSignalSema(s_tls_handshake_sema, 1);
-        logLine("tls: handshake ok iter=%d rd=%d wr=%d\n",
-                hs_iter, hs_want_read, hs_want_write);
+        logLine("tls: handshake ok iter=%d rd=%d wr=%d took=%llu ms\n",
+                hs_iter, hs_want_read, hs_want_write,
+                (unsigned long long)((sceKernelGetSystemTimeWide() - hs_start) / 1000));
         logger_flush();
     }
     if (!net_tls_connection_is_current(out_conn)) {
@@ -777,7 +872,7 @@ static int psp_net_send(void *ctx, const unsigned char *buf, size_t len)
             logger_flush();
             return MBEDTLS_ERR_NET_SEND_FAILED;
         }
-        sceKernelDelayThread(2 * 1000);
+        sceKernelDelayThread(1 * 1000);
         return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
     if (e == EINTR) {
@@ -837,7 +932,17 @@ static int psp_net_recv(void *ctx, unsigned char *buf, size_t len)
             logger_flush();
             return MBEDTLS_ERR_NET_RECV_FAILED;
         }
-        sceKernelDelayThread(5 * 1000);  // 5 мс: пейсинг, чтобы не жечь CPU
+        /* Ждём данные в poll (просыпаемся сразу при пакете), а не спим
+         * вслепую 1 мс на каждый пустой recv: меньше задержек и вызовов. */
+        {
+            struct SceNetInetPollfd pfd;
+            pfd.fd = conn->net.fd;
+            pfd.events = SCE_NET_INET_POLLIN;
+            pfd.revents = 0;
+            if (sceNetInetPoll(&pfd, 1, 20) < 0) {
+                sceKernelDelayThread(1 * 1000);
+            }
+        }
         return MBEDTLS_ERR_SSL_WANT_READ;
     }
     if (e == EINTR) {

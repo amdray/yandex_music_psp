@@ -72,22 +72,10 @@ void last_play_set_autostart(int enabled)
     if (s_autostart_enabled == enabled) return;
     length = snprintf(buffer, sizeof(buffer), "autoplay=%d\n", enabled);
     if (length <= 0 || length >= (int)sizeof(buffer)) return;
-    fs_ensure_dir(PLAYER_SETTINGS_PATH);
-    fd = fs_open(PLAYER_SETTINGS_PATH,
-                 PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd < 0) {
-        logLine("lastplay: autostart save open failed 0x%08X\n", fd);
-        return;
-    }
-    written = fs_write(fd, buffer, (size_t)length);
-    fs_close(fd);
-    if (written != length) {
-        logLine("lastplay: autostart save short %d/%d\n", written, length);
-        return;
-    }
+    (void)fd; (void)written;
+    fs_write_deferred(PLAYER_SETTINGS_PATH, buffer, (size_t)length);  /* в фоне */
     s_autostart_enabled = enabled;
-    logLine("lastplay: autostart=%d saved\n", s_autostart_enabled);
-    logger_flush();
+    logLine("lastplay: autostart=%d queued\n", s_autostart_enabled);
 }
 
 static int write_all(SceUID fd, const void *buf, int len)

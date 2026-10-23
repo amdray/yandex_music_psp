@@ -7,6 +7,7 @@
 
 #include "core/fs.h"
 #include "core/logger.h"
+#include "ui/ui_theme.h"
 
 #define ATLAS_SIZE 512
 #define GLYPH_CAPACITY 2048
@@ -17,10 +18,14 @@ typedef struct CbmfFace {
     CbmfPspRenderer renderer;
 } CbmfFace;
 
-static const char *const s_paths[CBMF_FONT_COUNT] = {
-    "fonts/ui.cbmf",
-    "fonts/ui16.cbmf",
+#define FONT_VARIANTS 4
+static const char *const s_paths[FONT_VARIANTS][CBMF_FONT_COUNT] = {
+    { "fonts/ui.cbmf",     "fonts/ui16.cbmf" },
+    { "fonts/ui_gri.cbmf", "fonts/ui16_gri.cbmf" },
+    { "fonts/ui_pdp.cbmf", "fonts/ui16_pdp.cbmf" },
+    { "fonts/ui_cov.cbmf", "fonts/ui16_cov.cbmf" },
 };
+static int s_variant = 0;
 static uint8_t s_textures[CBMF_FONT_COUNT][ATLAS_SIZE * ATLAS_SIZE / 2]
     __attribute__((aligned(16)));
 static uint32_t s_cluts[CBMF_FONT_COUNT][16] __attribute__((aligned(16)));
@@ -64,7 +69,7 @@ static int load_face(CbmfFontId id)
     CbmfFace *face = &s_faces[id];
     size_t size = 0;
     u64 t0 = sceKernelGetSystemTimeWide();
-    void *data = read_whole_file(s_paths[id], &size);
+    void *data = read_whole_file(s_paths[s_variant][id], &size);
     if (!data) return -1;
     logLine("text: font %d read %u bytes in %u ms\n", (int)id, (unsigned)size,
             (unsigned)((sceKernelGetSystemTimeWide() - t0) / 1000));
@@ -96,6 +101,19 @@ int cbmf_fonts_init(void)
 {
     int i;
     if (s_faces[CBMF_FONT_UI].data) return 0;
+    s_variant = ui_theme_get();
+    if (s_variant < 0 || s_variant >= FONT_VARIANTS) s_variant = 0;
+    if (s_variant != 0) {
+        /* Гарнитура темы: нет файлов — стартуем с обычной. */
+        int ok = 1;
+        for (i = 0; i < CBMF_FONT_COUNT; ++i) {
+            if (load_face((CbmfFontId)i) != 0) { ok = 0; break; }
+        }
+        if (ok) return 0;
+        cbmf_fonts_shutdown();
+        logLine("text: theme font variant %d missing, default font\n", s_variant);
+        s_variant = 0;
+    }
     for (i = 0; i < CBMF_FONT_COUNT; ++i) {
         int rc = load_face((CbmfFontId)i);
         if (rc != 0) {
@@ -126,4 +144,23 @@ const CbmfFont *cbmf_fonts_get_font(CbmfFontId id)
 {
     if (id < 0 || id >= CBMF_FONT_COUNT || !s_faces[id].data) return NULL;
     return &s_faces[id].font;
+}
+
+int cbmf_fonts_set_variant(int variant)
+{
+    int i, ok = 1;
+    if (variant < 0 || variant >= FONT_VARIANTS) variant = 0;
+    if (variant == s_variant && s_faces[CBMF_FONT_UI].data) return 0;
+    cbmf_fonts_shutdown();
+    s_variant = variant;
+    for (i = 0; i < CBMF_FONT_COUNT; ++i) {
+        if (load_face((CbmfFontId)i) != 0) { ok = 0; break; }
+    }
+    if (ok) return 0;
+    cbmf_fonts_shutdown();
+    s_variant = 0;
+    for (i = 0; i < CBMF_FONT_COUNT; ++i) {
+        (void)load_face((CbmfFontId)i);
+    }
+    return -1;
 }

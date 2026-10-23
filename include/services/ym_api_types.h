@@ -26,7 +26,8 @@ typedef struct {
     char codec[16];
     char transport[16];
     int bitrate_kbps;
-    int encrypted;
+    int encrypted;                 /* 1 = transport encraw, поток AES-128-CTR */
+    unsigned char aes_key[16];     /* ключ из downloadInfo.key (hex), nonce = 0 */
 } YmDownloadVariant;
 
 typedef enum {

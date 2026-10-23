@@ -32,9 +32,14 @@ YmStatus ym_api_download_get_aac_raw(YmApiContext *ctx,
                                      const char *track_id,
                                      YmDownloadVariant *out);
 
-/* Качество для следующих треков: "lq" / "nq" (192) / "hq" (320). */
+/* Качество для следующих треков: "lq" / "nq" (192) / "hq" (256) / "mp3" /
+ * "auto" (по скорости соединения) / "flac" (тест lossless, фолбэк hq). */
 void ym_api_download_set_quality(const char *q);
 const char *ym_api_download_quality(void);
+/* Что реально просим у сервера: lq/nq/hq (auto/flac/mp3 разворачиваются). */
+const char *ym_api_download_effective_quality(void);
+/* 1 — выбран режим «FLAC (тест)»: пробовать lossless до AAC. */
+int ym_api_download_flac_enabled(void);
 
 /* out_status (optional) receives the load-failure cause: 0 on success,
    an HTTP status on non-200, or a NET_LOAD_ERR_* code otherwise. */

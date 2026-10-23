@@ -200,7 +200,7 @@ static void aac_ra_start(YmAac *a, const char *path)
     a->ra_want = 0;
     a->ra_stop = 0;
     a->ra_thread = sceKernelCreateThread("aac_ra", aac_ra_thread_main,
-                                         0x28, 0x4000, PSP_THREAD_ATTR_USER,
+                                         0x1C, 0x4000, PSP_THREAD_ATTR_USER,
                                          NULL);
     if (a->ra_thread < 0) {
         logLine("ym_aac: read-ahead thread fail rc=%d\n", (int)a->ra_thread);

@@ -6,6 +6,7 @@
 #include "core/fs.h"
 #include "core/logger.h"
 #include "hal/hal_gpu.h"
+#include "ui/ui_draw.h"
 
 #define UI_ICON_ATLAS_MAGIC_0 'Y'
 #define UI_ICON_ATLAS_MAGIC_1 'M'
@@ -189,6 +190,7 @@ int ui_icon_atlas_draw(const char *name, int x, int y, u32 color_abgr)
     vertices = (UiIconVertex *)sceGuGetMemory(2 * sizeof(*vertices));
     vertices[0].u = entry->x;
     vertices[0].v = entry->y;
+    color_abgr = ui_draw_apply_alpha(color_abgr);
     vertices[0].color = color_abgr;
     vertices[0].x = (short)x;
     vertices[0].y = (short)y;

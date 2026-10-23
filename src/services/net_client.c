@@ -583,8 +583,6 @@ static int track_boot_worker(SceSize args __attribute__((unused)), void *argp __
         if (track_boot_is_stale(job.state, job.generation, job.playlist_kind)) {
             continue;
         }
-        logger_checkpoint("track_boot job kind=%d gen=%d",
-                          job.playlist_kind, job.generation);
 
         char url[256];
 
@@ -593,7 +591,6 @@ static int track_boot_worker(SceSize args __attribute__((unused)), void *argp __
         if (job.uuid[0]) {
             if (track_boot_load_from_cache(&job) == 0) {
                 track_boot_publish_full_ready(&job, "cache");
-                logger_checkpoint("track_boot cache-hit gen=%d", job.generation);
                 continue;
             }
             /* Miss / corrupt index: drop the partial order and refetch. */
@@ -617,7 +614,6 @@ static int track_boot_worker(SceSize args __attribute__((unused)), void *argp __
             track_boot_publish_error(job.state, job.generation, job.playlist_kind, -2);
             continue;
         }
-        logger_checkpoint("track_boot net fetch gen=%d", job.generation);
 
         int parser_rc = ym_api_playlist_tracks_parser_init(&parser.ym_parser,
                                                            track_boot_on_track_id,
@@ -1027,7 +1023,7 @@ int net_client_init(int profile_id)
 
     // Конфигурация сети с профилем Wi-Fi
     NetTlsNetworkConfig network_config = {
-        .pool_size = 128 * 1024,
+        .pool_size = 256 * 1024,  /* буферы TCP: окно приёма 64 КБ + запас */
         /* 0x1F: выше UI-потока (main 0x20) — приём Wi-Fi не голодает,
          * пока main считает тяжёлый кадр (веб-свечение). Было 42 (ниже main). */
         .callout_prio = 0x1F,
@@ -1084,7 +1080,6 @@ int net_client_poll(void)
 {
     int state;
     NetStackSnapshot snapshot;
-    static int s_poll_unavail_logged;
     if (!s_net_started) {
         return -1;
     }
@@ -1093,17 +1088,10 @@ int net_client_poll(void)
         s_net_wait_logged = 1;
     }
     if (net_stack_get_snapshot(&snapshot) < 0) {
-        /* Транзиентно: снапшот недоступен (гонка публикации/шум APCTL).
-         * Раньше это требовало выхода из процесса — ОДИН плохой
-         * apctl-колбэк убивал приложение целиком (см. жалобу
-         * «выключается при открытии плейлиста»). Просто пропускаем тик. */
-        if (!s_poll_unavail_logged) {
-            logLine("net: poll snapshot unavailable (transient)\n");
-            s_poll_unavail_logged = 1;
-        }
+        s_net_error = 1;
+        s_process_exit_required = 1;
         return -1;
     }
-    s_poll_unavail_logged = 0;
     state = snapshot.apctl_state;
     if (state != s_logged_net_state) {
         s_logged_net_state = state;

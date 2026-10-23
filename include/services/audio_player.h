@@ -56,6 +56,17 @@ int              audio_player_seek_to_ms(int target_ms);
 AudioPlayerState audio_player_get_state(void);
 bool             audio_player_get_snapshot(AudioPlayerSnapshot *out);
 bool             audio_player_get_status(AudioPlayerStatus *out);
+/* Уровни звука по трём полосам (0..65535, средняя |амплитуда|) для свечения. */
+void             audio_player_get_levels(int *low, int *mid, int *high);
+
+/* Winamp-визуализации: спектр (AUDIO_SPEC_BANDS полос, амплитуда int16 0..65535)
+ * и осциллограф (AUDIO_SCOPE_POINTS отсчётов). Анализ включён, пока UI зовёт
+ * audio_player_set_analysis(1) (каждый вызов продлевает на 500 мс). */
+#define AUDIO_SPEC_BANDS 16
+#define AUDIO_SCOPE_POINTS 64
+void             audio_player_set_analysis(int on);
+void             audio_player_get_spectrum(int *bands);
+void             audio_player_get_scope(short *points);
 
 /* WAVE-REPORT: really-audible reporting (spec section 6). The worker
  * publishes FIRST_PCM once per run after the first successful

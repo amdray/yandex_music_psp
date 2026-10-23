@@ -4,6 +4,8 @@
 #include "ui/ui_screens.h"
 #include "ui/ui_layout.h"
 #include "ui/ui_glow_bg.h"
+#include "ui/ui_idle.h"
+#include "ui/ui_theme.h"
 #include "services/locale.h"
 #include "services/eq.h"
 #include "services/ym_api.h"
@@ -12,6 +14,7 @@
 #include "services/speed_test.h"
 #include "app/app_state.h"
 #include "core/logger.h"
+#include "services/net_speed.h"
 #include "fonts/text.h"
 #include <pspctrl.h>
 #include <stdio.h>
@@ -39,6 +42,10 @@ static const MenuItem kSettingsMenu[] = {
     { LOCALE_MENU_AUDIO_QUALITY, SCREEN_COUNT,       0 },
     { LOCALE_MENU_AUTOPLAY,    SCREEN_COUNT,         0 },
     { LOCALE_MENU_GLOW_STYLE,  SCREEN_COUNT,         0 },
+    { LOCALE_MENU_THEME,       SCREEN_COUNT,         0 },
+    { LOCALE_MENU_IDLE,        SCREEN_COUNT,         0 },
+    { LOCALE_MENU_IDLE_DELAY,  SCREEN_COUNT,         0 },
+    { LOCALE_MENU_LOGS,        SCREEN_COUNT,         0 },
     { LOCALE_MENU_MEMORY,      SCREEN_MEMORY,        0 },
 };
 #define MAIN_MENU_COUNT ((int)(sizeof(kMainMenu) / sizeof(kMainMenu[0])))
@@ -69,10 +76,16 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
     int i;
 
     if (strcmp(widget->binding, "menu.items") == 0) {
-        for (i = 0; i < ctx->item_count; i++) {
+        int visible = (int)((262.0f - widget->y) / row_step);
+        int first = 0;
+        if (visible < 1) visible = 1;
+        if (ctx->item_count > visible && ctx->selected_index >= visible) {
+            first = ctx->selected_index - (visible - 1);
+        }
+        for (i = first; i < ctx->item_count && i < first + visible; i++) {
             char quality_row[80];
             const char *label = locale_get(ctx->items[i].label);
-            float y = widget->y + (float)i * row_step;
+            float y = widget->y + (float)(i - first) * row_step;
             int enabled = menu_item_enabled(&ctx->items[i], ctx->state);
             u32 color = !enabled ? UI_COLOR_INACTIVE
                                  : (i == ctx->selected_index
@@ -87,8 +100,37 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
                 if (q && strcmp(q, "hq") == 0) key = LOCALE_QUALITY_HIGH;
                 else if (q && strcmp(q, "lq") == 0) key = LOCALE_QUALITY_LOW;
                 else if (q && strcmp(q, "mp3") == 0) key = LOCALE_QUALITY_MP3;
+                else if (q && strcmp(q, "flac") == 0) key = LOCALE_QUALITY_FLAC;
+                else if (q && strcmp(q, "auto") == 0) key = LOCALE_QUALITY_AUTO;
+                if (key == LOCALE_QUALITY_AUTO) {
+                    /* Авто: показываем, что выбрано сейчас по скорости сети. */
+                    const char *e = ym_api_download_effective_quality();
+                    LocaleKey ek = LOCALE_QUALITY_NORMAL;
+                    if (e && strcmp(e, "hq") == 0) ek = LOCALE_QUALITY_HIGH;
+                    else if (e && strcmp(e, "lq") == 0) ek = LOCALE_QUALITY_LOW;
+                    snprintf(quality_row, sizeof(quality_row), "%s: %s (%s)",
+                             label, locale_get(key), locale_get(ek));
+                } else {
+                    snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                             locale_get(key));
+                }
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_LOGS) {
                 snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
-                         locale_get(key));
+                         locale_get(logger_enabled() ? LOCALE_SETTING_ON
+                                                     : LOCALE_SETTING_OFF));
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_THEME) {
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                         locale_get(ui_theme_name_key(ui_theme_get())));
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_IDLE) {
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                         locale_get(idle_mode_name_key(idle_get_mode())));
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_IDLE_DELAY) {
+                snprintf(quality_row, sizeof(quality_row), "%s: %d %s", label,
+                         idle_get_delay_s(), locale_get(LOCALE_UNIT_SEC));
                 label = quality_row;
             } else if (ctx->items[i].label == LOCALE_MENU_SPEED_TEST) {
                 char st[40];
@@ -118,8 +160,14 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
         row_step = items.step;
         color = menu_item_enabled(selected, ctx->state)
                     ? widget->color : UI_COLOR_INACTIVE;
+        int vis = (int)((262.0f - items.y) / row_step);
+        int firstrow = 0;
+        if (vis < 1) vis = 1;
+        if (ctx->item_count > vis && ctx->selected_index >= vis) {
+            firstrow = ctx->selected_index - (vis - 1);
+        }
         ui_draw_rect(items.x + widget->x,
-                     items.y + (float)ctx->selected_index * row_step +
+                     items.y + (float)(ctx->selected_index - firstrow) * row_step +
                          widget->y,
                      widget->w, widget->h, color);
     }
@@ -192,16 +240,17 @@ void ui_screen_settings_handle_input(AppState *state, const InputState *input)
         kSettingsMenu[state->settings_index].label == LOCALE_MENU_AUDIO_QUALITY &&
         (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
         !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
-        static const char *const kQualityOrder[] = { "lq", "nq", "hq", "mp3" };
+        static const char *const kQualityOrder[] = { "lq", "nq", "hq", "auto", "mp3", "flac" };
+        const int n_q = (int)(sizeof(kQualityOrder) / sizeof(kQualityOrder[0]));
         const char *cur = ym_api_download_quality();
-        int idx = 1; /* nq */
-        if (cur && strcmp(cur, "lq") == 0) idx = 0;
-        else if (cur && strcmp(cur, "hq") == 0) idx = 2;
-        else if (cur && strcmp(cur, "mp3") == 0) idx = 3;
+        int idx = 1, qi; /* nq */
+        for (qi = 0; qi < n_q; qi++) {
+            if (cur && strcmp(cur, kQualityOrder[qi]) == 0) { idx = qi; break; }
+        }
         if (input->pressed & PSP_CTRL_RIGHT) {
-            idx = (idx + 1) % 4;
+            idx = (idx + 1) % n_q;
         } else {
-            idx = (idx + 4 - 1) % 4;
+            idx = (idx + n_q - 1) % n_q;
         }
         if (strcmp(cur ? cur : "", kQualityOrder[idx]) != 0) {
             ym_api_download_set_quality(kQualityOrder[idx]);
@@ -213,6 +262,30 @@ void ui_screen_settings_handle_input(AppState *state, const InputState *input)
                (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
                !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
         last_play_set_autostart((input->pressed & PSP_CTRL_RIGHT) != 0);
+    } else if (state->settings_index >= 0 &&
+               state->settings_index < SETTINGS_MENU_COUNT &&
+               kSettingsMenu[state->settings_index].label == LOCALE_MENU_THEME &&
+               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
+               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+        ui_theme_cycle((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
+    } else if (state->settings_index >= 0 &&
+               state->settings_index < SETTINGS_MENU_COUNT &&
+               kSettingsMenu[state->settings_index].label == LOCALE_MENU_IDLE &&
+               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
+               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+        idle_cycle_mode((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
+    } else if (state->settings_index >= 0 &&
+               state->settings_index < SETTINGS_MENU_COUNT &&
+               kSettingsMenu[state->settings_index].label == LOCALE_MENU_IDLE_DELAY &&
+               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
+               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+        idle_cycle_delay((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
+    } else if (state->settings_index >= 0 &&
+               state->settings_index < SETTINGS_MENU_COUNT &&
+               kSettingsMenu[state->settings_index].label == LOCALE_MENU_LOGS &&
+               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
+               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+        logger_set_enabled((input->pressed & PSP_CTRL_RIGHT) != 0);
     } else if (state->settings_index >= 0 &&
                state->settings_index < SETTINGS_MENU_COUNT &&
                kSettingsMenu[state->settings_index].label == LOCALE_MENU_GLOW_STYLE &&

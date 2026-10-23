@@ -26,4 +26,16 @@ void ui_draw_image_rgba_nearest(const void *pixels, int tex_w, int tex_h,
                                 int draw_w, int draw_h, float x, float y);
 void ui_draw_text(float x, float y, const char *text, u32 color_abgr);
 
+/* Глобальная прозрачность интерфейса (0..255): умножает альфу прямоугольников,
+ * текста и значков. 255 — как обычно. Для режима бездействия. */
+void ui_draw_set_alpha(int alpha);
+int ui_draw_get_alpha(void);
+u32 ui_draw_apply_alpha(u32 color_abgr);
+
+/* Текстурный прямоугольник из RGBA-буфера (обложка): src в текселях,
+ * dst в пикселях экрана, color_abgr модулирует (альфа = прозрачность). */
+void ui_draw_cover_quad(const void *pixels, int stride_px, int tex_h,
+                        float u0, float v0, float u1, float v1,
+                        float x0, float y0, float x1, float y1, u32 color_abgr);
+
 #endif

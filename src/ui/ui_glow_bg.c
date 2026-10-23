@@ -1,7 +1,7 @@
 // Светящийся фон как в Яндекс Музыке (vibe-визуализация). См. ui_glow_bg.h.
 //
-// Четыре стиля (переключение в настройках, выбор в config/glow.cfg);
-// MESH — по умолчанию (mesh gradient по мотивам Paper Shaders, см. ниже):
+// Три стиля (переключение в настройках, выбор в config/glow.cfg);
+// WEB — по умолчанию:
 //  CLASSIC — 4 мягких пятна (оригинал);
 //  STRANDS — текучие нити (оригинал);
 //  WEB — порт веб-вайба Яндекса (music.yandex.ru, v4.1657):
@@ -18,6 +18,8 @@
 //  иначе ступени морфинга видны как рывки); угол спарка и UV-таблицы
 //  предрасчитаны разово.
 #include "ui/ui_glow_bg.h"
+#include "ui/ui_draw.h"
+#include "ui/ui_theme.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -30,6 +32,8 @@
 #include <pspiofilemgr.h>
 
 #include "hal/hal_gpu.h"
+#include "services/audio_player.h"
+#include "ui/ui_viz.h"
 #include "core/fs.h"
 #include "core/logger.h"
 
@@ -49,9 +53,13 @@
 #define FIELD_H 36
 #define SIN_N 1024
 
-// Сетка веб-шума (грубее — билинейка сгладит; семплируется попиксельно).
-#define NF_W 32
-#define NF_H 18
+// Сетка веб-шума (билинейка по кэшу). Измерение на хосте (PSNR к эталону
+// 240x136/128x72): кэш 32x18 — 38.7 дБ, 48x27 — 43.1, 64x36 — 44.8 дБ; именно
+// он, а не частота вершин, ограничивал точность колец. Дорогое построение шума
+// размазано равномерно на WG_NOISE_P кадров (по WG_NOISE_CELLS/P ячеек в кадр).
+#define NF_W 64
+#define NF_H 36
+#define WG_NOISE_P 16
 
 #define GLOW_STYLE_PATH "config/glow.cfg"
 
@@ -146,6 +154,8 @@ static unsigned s_frame = 0;
 static int s_playing = 1;
 static int s_liked = 0;
 static unsigned s_pulse_until = 0;
+static unsigned s_last_pulse_frame = 0;
+static float s_like_clock = -1.0f;   // секунды с момента лайка (<0 — нет)
 static int s_style = GLOW_STYLE_DEFAULT;
 
 // Палитра: до загрузки обложки — дефолтная «вайбовая», после — из обложки.
@@ -187,6 +197,74 @@ static unsigned long long s_last_us = 0;
 static int s_tex_rows = GLOW_H;
 static unsigned s_web_tick = 0;
 static int s_web_init = 0;
+
+// Макс. сетка и уровни детализации (LOD). Уровень выбирается по замеру времени
+// кадра (виртуальное время PPSSPP ≈ реальная PSP): 0 — 120x68, 1 — 88x50,
+// 2 — 60x34. Стоимость вершинного цикла ~ числу вершин.
+#define WG_MAXC 120
+#define WG_MAXR 68
+static const struct { int c, r; } kGridLv[3] = { {120, 68}, {88, 50}, {60, 34} };
+
+// Цвета вершин (общий буфер всех сеточных стилей): stride = cols + 1.
+static unsigned int s_wg_rgb[(WG_MAXR + 1) * (WG_MAXC + 1)];
+static int s_gc = 88, s_gr = 50;     // текущая сетка (по уровню LOD)
+static int s_lod = 1;                // индекс в kGridLv
+static int s_draw_c = 88, s_draw_r = 50;   // сетка, которой заполнен буфер этого кадра
+static float s_lod_ema_ms = 0.0f;    // сглаженный минимум времени обновления
+static float s_lod_win_min = 0.0f;
+static int s_lod_win_n = 0;
+static unsigned s_lod_since = 0;     // кадров с последней смены LOD
+static unsigned s_lod_wait = 900;    // сколько ждать перед попыткой подъёма
+static void web_geom_init(void);
+
+// Адаптивный LOD сеточных стилей. Метрика — МИНИМУМ времени обновления в окне
+// из 30 кадров (вытеснение потоками TLS/декодера раздувает отдельные кадры, но
+// не минимум), затем EMA. Бюджет ~9 мс на кадр (остальное — UI, звук, сеть).
+// Вниз — если EMA > бюджета; вверх — не раньше чем через s_lod_wait кадров и
+// только если оценка (пропорционально числу вершин, с запасом) укладывается;
+// если после подъёма скоро пришлось опуститься, ожидание удваивается.
+#define LOD_BUDGET_MS 9.0f
+static void grid_set_level(int lod)
+{
+    if (lod < 0) lod = 0;
+    if (lod > 2) lod = 2;
+    s_lod = lod;
+    s_gc = kGridLv[lod].c;
+    s_gr = kGridLv[lod].r;
+    web_geom_init();
+}
+
+static void grid_lod_feed(float ms)
+{
+    if (s_lod_win_n == 0 || ms < s_lod_win_min) s_lod_win_min = ms;
+    s_lod_since++;
+    if (++s_lod_win_n < 30) return;
+    s_lod_ema_ms = s_lod_ema_ms == 0.0f ? s_lod_win_min
+                 : s_lod_ema_ms + (s_lod_win_min - s_lod_ema_ms) * 0.4f;
+    s_lod_win_n = 0;
+    if (s_lod < 2 && s_lod_since > 90 && s_lod_ema_ms > LOD_BUDGET_MS) {
+        if (s_lod_since < 900) {  // подъём не удержался — ждать дольше
+            s_lod_wait = s_lod_wait < 7200u ? s_lod_wait * 2u : 7200u;
+        }
+        grid_set_level(s_lod + 1);
+        logLine("glow: lod=%d %dx%d (min frame %d.%d ms > %d)\n", s_lod, s_gc, s_gr,
+                (int)s_lod_ema_ms, (int)(s_lod_ema_ms * 10.0f) % 10,
+                (int)LOD_BUDGET_MS);
+        s_lod_since = 0;
+        s_lod_ema_ms = 0.0f;
+    } else if (s_lod > 0 && s_lod_since > s_lod_wait) {
+        float cells_now = (float)((s_gc + 1) * (s_gr + 1));
+        float cells_up = (float)((kGridLv[s_lod - 1].c + 1) * (kGridLv[s_lod - 1].r + 1));
+        if (s_lod_ema_ms * (cells_up / cells_now) * 1.15f < LOD_BUDGET_MS * 0.8f) {
+            grid_set_level(s_lod - 1);
+            logLine("glow: lod=%d %dx%d (est ok)\n", s_lod, s_gc, s_gr);
+            s_lod_since = 0;
+            s_lod_ema_ms = 0.0f;
+        } else {
+            s_lod_since = s_lod_wait / 2;  // перепроверить позже
+        }
+    }
+}
 
 typedef struct {
     unsigned short u, v;
@@ -352,7 +430,7 @@ static sfix trinoise3d_fx(sfix x, sfix y, sfix z, sfix vtime)
     }
     {
         float rzf = (float)rz / 65536.0f, zzf = (float)zz / 65536.0f;
-        float v = rzf + fsin(rzf + fsin(zzf) * 2.8f) * 2.2f;
+        float v = rzf + sinf(rzf + sinf(zzf) * 2.8f) * 2.2f;  /* именно sinf: fsin() — табличный и не годится для больших аргументов */
         float tt = v / 8.0f;
         float s;
         if (tt < 0.0f) tt = 0.0f;
@@ -371,7 +449,7 @@ static sfix raw_spark_fx(sfix afx, sfix vtime)
     shifted_index = fx_mul(shifted, 10430);  // /2pi
     seam_angle = fx_mul(shifted + 205887, 32768);  // *0.5
     {
-        float sf = fsin((float)seam_angle / 65536.0f);
+        float sf = sinf((float)seam_angle / 65536.0f);
         float tt = (sf - 0.9f) / 0.1f;
         if (tt < 0.0f) tt = 0.0f;
         if (tt > 1.0f) tt = 1.0f;
@@ -454,12 +532,21 @@ void glow_bg_set_playing(int playing)
 
 void glow_bg_set_liked(int liked)
 {
-    s_liked = liked ? 1 : 0;
+    liked = liked ? 1 : 0;
+    // Анимация лайка — только когда лайк поставили на ТОМ ЖЕ треке (как в
+    // вебе: сравнивается id трека); смена трека/подгрузка статуса лайка
+    // (pulse недавно) — без вспышки.
+    if (liked && !s_liked && s_frame > 30 &&
+        (s_frame - s_last_pulse_frame) > 120u) {
+        s_like_clock = 0.0f;
+    }
+    s_liked = liked;
 }
 
 void glow_bg_pulse(void)
 {
     s_pulse_until = s_frame + 45;  // ~0.75 сек при 60fps
+    s_last_pulse_frame = s_frame;
 }
 
 int glow_bg_get_style(void)
@@ -472,7 +559,9 @@ LocaleKey glow_bg_style_name_key(int style)
     switch (style) {
     case GLOW_STYLE_CLASSIC: return LOCALE_GLOW_STYLE_CLASSIC;
     case GLOW_STYLE_STRANDS: return LOCALE_GLOW_STYLE_STRANDS;
-    case GLOW_STYLE_MESH: return LOCALE_GLOW_STYLE_MESH;
+    case GLOW_STYLE_SPECTRUM: return LOCALE_GLOW_STYLE_SPECTRUM;
+    case GLOW_STYLE_SCOPE: return LOCALE_GLOW_STYLE_SCOPE;
+    case GLOW_STYLE_RADIAL: return LOCALE_GLOW_STYLE_RADIAL;
     default: return LOCALE_GLOW_STYLE_WEB;
     }
 }
@@ -510,20 +599,9 @@ void glow_bg_set_style(int style)
     s_style = style;
     length = snprintf(buffer, sizeof(buffer), "style=%d\n", style);
     if (length <= 0 || length >= (int)sizeof(buffer)) return;
-    fs_ensure_dir(GLOW_STYLE_PATH);
-    fd = fs_open(GLOW_STYLE_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd < 0) {
-        logLine("glow: style save open failed 0x%08X\n", fd);
-        return;
-    }
-    written = fs_write(fd, buffer, (size_t)length);
-    fs_close(fd);
-    if (written != length) {
-        logLine("glow: style save short %d/%d\n", written, length);
-        return;
-    }
-    logLine("glow: style=%d saved\n", style);
-    logger_flush();
+    (void)fd; (void)written;
+    fs_write_deferred(GLOW_STYLE_PATH, buffer, (size_t)length);  /* в фоне */
+    logLine("glow: style=%d queued\n", style);
 }
 
 static void boost_saturation(unsigned char *c, float k)
@@ -646,6 +724,11 @@ void glow_bg_set_cover(const void *rgba, int w, int h, int stride_bytes)
     avg[1] = (unsigned long)(sg / n);
     avg[2] = (unsigned long)(sb / n);
 
+    {
+        unsigned char avg_c[3];
+        avg_c[0] = (unsigned char)avg[0]; avg_c[1] = (unsigned char)avg[1]; avg_c[2] = (unsigned char)avg[2];
+        ui_theme_set_cover(acc1, acc2, avg_c);
+    }
     s_pal[0][0] = acc1[0]; s_pal[0][1] = acc1[1]; s_pal[0][2] = acc1[2];
     s_pal[1][0] = acc2[0]; s_pal[1][1] = acc2[1]; s_pal[1][2] = acc2[2];
     s_pal[2][0] = (unsigned char)avg[0];
@@ -671,8 +754,10 @@ void glow_bg_set_cover(const void *rgba, int w, int h, int stride_bytes)
     apply_palette_to_blobs();
 }
 
+#ifdef GLOW_REF_TEX
+// Эталон для сравнения на хосте: старая попиксельная классика (текстура 240x136).
 // Классика: 4 мягких пятна (оригинал, каждый кадр, полное разрешение).
-static void classic_update(void)
+static void classic_update_tex(void)
 {
     float t = (float)s_frame * 0.016f * (s_playing ? 1.0f : 0.35f);
     float bx[GLOW_BLOBS], by[GLOW_BLOBS], br[GLOW_BLOBS];
@@ -750,6 +835,105 @@ static void classic_update(void)
     }
 }
 
+#endif
+
+// Классика: 4 мягких пятна. Считается в вершинах сетки (тот же LOD, что у «Веба»),
+// цвет с учётом прозрачности сразу смешан с фоном приложения (0x1A1A1A) — GPU
+// только интерполирует (Gouraud) без blend. Пятна гладкие (радиус ≥ 38 px в
+// пространстве 240x136), поэтому сетка 60x34..120x68 не отличима от попиксельной
+// (сравнение — см. MEMORY_BANK_RU.md).
+#define GLOW_BG_GRAY 26.0f
+static float s_bg_dim = 1.0f;   // яркость фона (Winamp-стили — приглушённый)
+static void classic_update(void)
+{
+    float t = (float)s_frame * 0.016f * (s_playing ? 1.0f : 0.35f);
+    float bx[GLOW_BLOBS], by[GLOW_BLOBS], br2[GLOW_BLOBS];
+    float inv_r2[GLOW_BLOBS];
+    float bright = s_playing ? 1.0f : 0.55f;
+    float pulse = 1.0f;
+    float ar = (float)s_pal[3][0], ag = (float)s_pal[3][1], ab = (float)s_pal[3][2];
+    int gc = s_gc, gr = s_gr, stride = s_gc + 1;
+    float sx = (float)GLOW_W / (float)gc, sy = (float)GLOW_H / (float)gr;
+    unsigned long long t_begin = sceKernelGetSystemTimeWide();
+    int i, r, c;
+
+    if (s_frame < s_pulse_until) {
+        pulse = 1.0f + 0.45f * (float)(s_pulse_until - s_frame) / 45.0f;
+    }
+    bright *= pulse * s_bg_dim;
+
+    for (i = 0; i < GLOW_BLOBS; i++) {
+        float rad;
+        bx[i] = s_blobs[i].cx + sinf(t * s_blobs[i].sx + s_blobs[i].px) * 65.0f;
+        by[i] = s_blobs[i].cy + sinf(t * s_blobs[i].sy + s_blobs[i].py) * 45.0f;
+        rad = s_blobs[i].r * pulse + sinf(t * s_blobs[i].sr + s_blobs[i].pr) * 22.0f;
+        br2[i] = rad * rad;
+        inv_r2[i] = 1.0f / br2[i];
+    }
+
+    for (r = 0; r <= gr; r++) {
+        float y = (float)r * sy;
+        float ny = (y - GLOW_H * 0.5f) * (1.0f / (GLOW_H * 0.5f));
+        for (c = 0; c <= gc; c++) {
+            float x = (float)c * sx;
+            float nx = (x - GLOW_W * 0.5f) * (1.0f / (GLOW_W * 0.5f));
+            float sw = 0.0f, sr = 0.0f, sg = 0.0f, sb = 0.0f;
+            float cov, a, cr, cg, cb, vig;
+
+            for (i = 0; i < GLOW_BLOBS; i++) {
+                float dx = x - bx[i];
+                float dy = y - by[i];
+                float d2 = dx * dx + dy * dy;
+                if (d2 < br2[i]) {
+                    float tn = 1.0f - d2 * inv_r2[i];
+                    float w = tn * tn;
+                    sw += w;
+                    sr += s_blobs[i].cr * w;
+                    sg += s_blobs[i].cg * w;
+                    sb += s_blobs[i].cb * w;
+                }
+            }
+
+            sw += 0.12f;
+            sr += ar * 0.12f;
+            sg += ag * 0.12f;
+            sb += ab * 0.12f;
+
+            cov = (sw > 1.6f) ? 1.6f : sw;
+            cr = sr / sw;
+            cg = sg / sw;
+            cb = sb / sw;
+
+            if (s_liked) {
+                cr += 28.0f;
+                cg *= 0.87f;
+                cb *= 0.78f;
+            }
+
+            vig = 1.0f - 0.35f * (nx * nx + ny * ny) * 0.5f;
+            a = 0.10f + 0.90f * (cov * 0.625f);
+            if (a > 1.0f) a = 1.0f;
+            a *= vig * bright;
+            if (a < 0.0f) a = 0.0f;
+            if (cr > 255.0f) cr = 255.0f;
+            if (cg > 255.0f) cg = 255.0f;
+            if (cb > 255.0f) cb = 255.0f;
+
+            /* alpha-композиция с фоном приложения */
+            cr = cr * a + GLOW_BG_GRAY * (1.0f - a);
+            cg = cg * a + GLOW_BG_GRAY * (1.0f - a);
+            cb = cb * a + GLOW_BG_GRAY * (1.0f - a);
+            s_wg_rgb[r * stride + c] = 0xFF000000u |
+                ((unsigned int)(cb + 0.5f) << 16) |
+                ((unsigned int)(cg + 0.5f) << 8) |
+                (unsigned int)(cr + 0.5f);
+        }
+    }
+    s_draw_c = gc;
+    s_draw_r = gr;
+    grid_lod_feed((float)(sceKernelGetSystemTimeWide() - t_begin) * 0.001f);
+}
+
 // Нити: поля для изолиний (оригинал, каждый кадр, полное разрешение).
 static void strands_build_fields(float t)
 {
@@ -780,6 +964,9 @@ static void mix_white(const unsigned char *c, float k, float *out)
     out[2] = (float)c[2] + (255.0f - (float)c[2]) * k;
 }
 
+// Нити остаются на попиксельной текстуре 240x136: рисунок — тонкие изолинии
+// билинейных полей, и на сетке вершин (проверено: PSNR 26-29 дБ к текущему
+// виду, линии превращаются в мозаику) он заметно ухудшается.
 static void strands_update(void)
 {
     float t = (float)s_frame * 0.016f * (s_playing ? 1.0f : 0.35f);
@@ -963,27 +1150,25 @@ static void web_init_state(void)
  * WEB (порт веб-вайба Яндекса) на сетке вершин GPU.
  * Та же математика, что в шейдере/старом попиксельном пути (фон-градиент
  * бакета, 3 шумовых кольца со спарком, виньетка, пауза/лайк/пульс), но
- * считается в вершинах сетки 63x35 (узлы шумовой сетки 32x18 + середины
- * между ними, поэтому билинейка шума — это просто среднее), а GPU
- * интерполирует цвет (Gouraud). Вместо ~16 тыс. пикселей — ~2,2 тыс. вершин;
+ * считается в вершинах сетки 87x49 (шаг ~5.5 px; шум — билинейка по сетке
+ * 32x18), а GPU интерполирует цвет (Gouraud). Вместо ~16 тыс. пикселей —
+ * ~4,3 тыс. вершин;
  * без текстуры, без VFPU-асма и без записи/сброса кэша: на железе нет
  * проблем когерентности и порчи VFPU-контекста.
  * ------------------------------------------------------------------------ */
-#define WG_COLS 63
-#define WG_ROWS 35
-
-static unsigned int s_wg_rgb[WG_ROWS + 1][WG_COLS + 1];
-static float s_wg_ux[WG_COLS + 1], s_wg_nx2[WG_COLS + 1];
-static float s_wg_uy[WG_ROWS + 1], s_wg_ny2[WG_ROWS + 1];
-static float s_wg_blen[WG_ROWS + 1][WG_COLS + 1];
-static float s_wg_ft[WG_ROWS + 1][WG_COLS + 1];       // доля LUT спарка
-static unsigned char s_wg_i0[WG_ROWS + 1][WG_COLS + 1];
-static unsigned char s_wg_ci0[WG_COLS + 1], s_wg_rj0[WG_ROWS + 1];
-static float s_wg_ctx[WG_COLS + 1], s_wg_rty[WG_ROWS + 1];
-static float s_wg_bg[WG_COLS + 1][3];                 // фон по колонкам 0..255
-
-// Шумовые поля: тройной буфер (prev/cur/build); строится ОДНО поле за кадр,
-// слой кадра = lerp(prev, cur, (фаза+1)/3) — монотонно, без скачков.
+static float s_wg_ux[WG_MAXC + 1], s_wg_nx2[WG_MAXC + 1], s_wg_nx[WG_MAXC + 1];
+static float s_wg_uy[WG_MAXR + 1], s_wg_ny2[WG_MAXR + 1], s_wg_ny[WG_MAXR + 1];
+static float s_wg_blen[WG_MAXR + 1][WG_MAXC + 1];
+static float s_wg_ft[WG_MAXR + 1][WG_MAXC + 1];       // доля LUT спарка
+static unsigned char s_wg_i0[WG_MAXR + 1][WG_MAXC + 1];
+static unsigned char s_wg_ci0[WG_MAXC + 1], s_wg_rj0[WG_MAXR + 1];
+static float s_wg_ctx[WG_MAXC + 1], s_wg_rty[WG_MAXR + 1];
+// Сжатые (лайк: uv*(1-like*0.5)) индексы шума по кольцам.
+static unsigned char s_wg_sci0[3][WG_MAXC + 1], s_wg_srj0[3][WG_MAXR + 1];
+static float s_wg_sctx[3][WG_MAXC + 1], s_wg_srty[3][WG_MAXR + 1];
+static float s_wg_bg[WG_MAXC + 1][3];                 // фон по колонкам 0..255
+// Шумовой кэш: тройной буфер [buf][поле][NF_H][NF_W]; поле f — шум кольца f
+// (f=0 ещё и «общий»). gridL — линейная смесь prev→cur текущего кадра.
 static float s_wg_grid[3][3][NF_H][NF_W];
 static float s_wg_gridL[3][NF_H][NF_W];
 static int s_wg_prev = 0, s_wg_cur = 1, s_wg_build = 2;
@@ -1004,34 +1189,47 @@ static float wg_sat(float v)
     return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
+// Индекс/доля билинейки шумовой сетки для нормализованной координаты n∈[-1,1].
+static void wg_noise_idx(float n, int cells, int *i0, float *t)
+{
+    float f = (n * 0.5f + 0.5f) * (float)(cells - 1);
+    int i;
+    if (f < 0.0f) f = 0.0f;
+    if (f > (float)(cells - 1)) f = (float)(cells - 1);
+    i = (int)f;
+    if (i > cells - 2) i = cells - 2;
+    *i0 = i;
+    *t = f - (float)i;
+}
+
 // Статическая геометрия вершин: один раз при инициализации.
 static void web_geom_init(void)
 {
     int r, c;
-    for (c = 0; c <= WG_COLS; c++) {
-        float u = (float)c * (1.0f / WG_COLS);
-        float nx = u * 2.0f - 1.0f;
-        int i0 = c >> 1;
-        float tx = (c & 1) ? 0.5f : 0.0f;
-        if (i0 > NF_W - 2) { i0 = NF_W - 2; tx = 1.0f; }
+    for (c = 0; c <= s_gc; c++) {
+        float nx = ((float)c * (1.0f / (float)s_gc)) * 2.0f - 1.0f;
+        int i0;
+        float tx;
+        wg_noise_idx(nx, NF_W, &i0, &tx);
+        s_wg_nx[c] = nx;
         s_wg_ux[c] = nx * WEB_EX;
         s_wg_nx2[c] = nx * nx;
         s_wg_ci0[c] = (unsigned char)i0;
         s_wg_ctx[c] = tx;
     }
-    for (r = 0; r <= WG_ROWS; r++) {
-        float v = (float)r * (1.0f / WG_ROWS);
-        float ny = v * 2.0f - 1.0f;
-        int j0 = r >> 1;
-        float ty = (r & 1) ? 0.5f : 0.0f;
-        if (j0 > NF_H - 2) { j0 = NF_H - 2; ty = 1.0f; }
+    for (r = 0; r <= s_gr; r++) {
+        float ny = ((float)r * (1.0f / (float)s_gr)) * 2.0f - 1.0f;
+        int j0;
+        float ty;
+        wg_noise_idx(ny, NF_H, &j0, &ty);
+        s_wg_ny[r] = ny;
         s_wg_uy[r] = ny * WEB_EY;
         s_wg_ny2[r] = ny * ny;
         s_wg_rj0[r] = (unsigned char)j0;
         s_wg_rty[r] = ty;
     }
-    for (r = 0; r <= WG_ROWS; r++) {
-        for (c = 0; c <= WG_COLS; c++) {
+    for (r = 0; r <= s_gr; r++) {
+        for (c = 0; c <= s_gc; c++) {
             float ang = fast_atan2(s_wg_uy[r], s_wg_ux[c]) * 0.15915494f + 0.5f;
             float fi;
             int i0;
@@ -1047,23 +1245,25 @@ static void web_geom_init(void)
     }
 }
 
-// Одно поле f тройного буфера buf (та же математика, что в вебе).
-static void web_build_grid_field(int buf, int f, sfix vt)
+// Ячейки [from, to) шумового кэша буфера buf (индекс = f*NF_H*NF_W + j*NF_W + i;
+// та же математика, что в вебе). Размазывание по кадрам — см. web_update.
+#define WG_NOISE_CELLS (3 * NF_H * NF_W)
+static void web_build_noise_slice(int buf, int from, int to, sfix vt)
 {
-    float (*dst)[NF_W] = s_wg_grid[buf][f];
     sfix kx = (sfix)(WEB_EX * 1.2f * WEB_NOISE_ZOOM * 65536.0f);
     sfix ky = (sfix)(WEB_EY * 1.2f * WEB_NOISE_ZOOM * 65536.0f);
-    sfix off = f == 0 ? 0 : (f == 1 ? 102944 : 205887);
-    int j, i;
-    for (j = 0; j < NF_H; j++) {
+    int idx;
+    for (idx = from; idx < to; idx++) {
+        int f = idx / (NF_H * NF_W);
+        int rem = idx - f * (NF_H * NF_W);
+        int j = rem / NF_W, i = rem - j * NF_W;
+        sfix off = f == 0 ? 0 : (f == 1 ? 102944 : 205887);
         sfix vf = ((sfix)j << 16) / (NF_H - 1);
+        sfix uf = ((sfix)i << 16) / (NF_W - 1);
         sfix evy = fx_mul(vf + vf - 65536, ky);
-        for (i = 0; i < NF_W; i++) {
-            sfix uf = ((sfix)i << 16) / (NF_W - 1);
-            sfix eux = fx_mul(uf + uf - 65536, kx);
-            sfix rr = snoise3_fx(eux + off, evy + off, vt + off);
-            dst[j][i] = ((float)rr * (1.0f / 65536.0f) + 1.0f) * 0.5f;
-        }
+        sfix eux = fx_mul(uf + uf - 65536, kx);
+        sfix rr = snoise3_fx(eux + off, evy + off, vt + off);
+        s_wg_grid[buf][f][j][i] = ((float)rr * (1.0f / 65536.0f) + 1.0f) * 0.5f;
     }
 }
 
@@ -1086,6 +1286,91 @@ static void web_build_lut_range(int from, int to, sfix vtf)
     }
 }
 
+// ---- Реакция на лайк и на звук (как в вебе) ----------------------------
+// Лайк (web: likeAnimation): react кольца 0/1/2 = 0.7 в моменты 0 / 0.10 /
+// 0.15 с и 0 в 0.85 / 0.95 / 1.05 с; значение сглаживается как Tt(600 мс):
+// cur += (target-cur)*clamp(elapsed/0.6). Звук: уровни трёх полос
+// (низ/середина/верх) — по кольцам 0/1/2; растёт мгновенно, падает на 0.02
+// за шаг 40 мс; общий множитель audioRatio плавно 0..1 за 1 с (играет/пауза).
+#define WG_STEP 0.04f
+static float s_react[3], s_react_el[3], s_react_tgt[3];
+static float s_aud_raw[3], s_aud[3];
+static float s_aud_ratio = 0.0f, s_aud_ratio_el = 0.0f, s_aud_ratio_tgt = 0.0f;
+static float s_step_acc = 0.0f;
+
+static float wg_level_norm(int v, float db0, float range)
+{
+    float x = (float)v * (1.0f / 32768.0f);
+    float db = 20.0f * log10f(x + 1e-6f);
+    return wg_sat((db - db0) / range);
+}
+
+static void web_react_step(float dt)
+{
+    static const float kS[3] = { 0.0f, 0.10f, 0.15f };
+    static const float kE[3] = { 0.85f, 0.95f, 1.05f };
+    int i;
+    if (s_like_clock >= 0.0f) {
+        s_like_clock += dt;
+        if (s_like_clock > 1.5f) s_like_clock = -1.0f;
+    }
+    s_step_acc += dt;
+    if (s_step_acc > 0.25f) s_step_acc = 0.25f;
+    while (s_step_acc >= WG_STEP) {
+        int lo = 0, mi = 0, hi = 0;
+        float tl[3];
+        s_step_acc -= WG_STEP;
+        for (i = 0; i < 3; i++) {
+            float tgt = (s_like_clock >= kS[i] && s_like_clock < kE[i]) ? 0.7f : 0.0f;
+            float e = s_react_el[i] / 0.6f;
+            if (tgt != s_react_tgt[i]) {
+                s_react_tgt[i] = tgt;
+                s_react_el[i] = 0.0f;
+                e = 0.0f;
+            }
+            if (e > 1.0f) e = 1.0f;
+            s_react_el[i] += WG_STEP;
+            s_react[i] += (tgt - s_react[i]) * e;
+            if (s_react[i] < 0.0005f && tgt == 0.0f) s_react[i] = 0.0f;
+        }
+        if (s_playing) {
+            audio_player_get_levels(&lo, &mi, &hi);
+        }
+        tl[0] = wg_level_norm(lo, -28.0f, 24.0f);
+        tl[1] = wg_level_norm(mi, -40.0f, 26.0f);
+        tl[2] = wg_level_norm(hi, -48.0f, 30.0f);
+        {
+            float tgt = s_playing ? 1.0f : 0.0f;
+            float e = s_aud_ratio_el / 1.0f;
+            if (tgt != s_aud_ratio_tgt) {
+                s_aud_ratio_tgt = tgt;
+                s_aud_ratio_el = 0.0f;
+                e = 0.0f;
+            }
+            if (e > 1.0f) e = 1.0f;
+            s_aud_ratio_el += WG_STEP;
+            s_aud_ratio += (tgt - s_aud_ratio) * e;
+        }
+        for (i = 0; i < 3; i++) {
+            float prev = s_aud_raw[i];
+            if (tl[i] > prev) {
+                prev = tl[i];
+            } else {
+                float d = prev - tl[i];
+                prev -= d < 0.02f ? d : 0.02f;
+            }
+            s_aud_raw[i] = prev;
+            s_aud[i] = prev * s_aud_ratio;
+        }
+    }
+}
+
+static float wg_sstep(float x)  // smoothstep по уже нормированному t
+{
+    float t2 = wg_sat(x);
+    return t2 * t2 * (3.0f - 2.0f * t2);
+}
+
 // Веб-стиль: фон + кольца в вершинах сетки.
 static void web_update(float dt)
 {
@@ -1096,9 +1381,11 @@ static void web_update(float dt)
     float pulse = 1.0f;
     float offx[3], offy[3], inv_edge[3], inten[3], brad0[3], bwidH[3], bmul[3];
     float c1[3][3], c2[3][3];
-    float lr = s_liked ? 10.0f : 0.0f, lg = s_liked ? -4.0f : 0.0f,
-          lb = s_liked ? -10.0f : 0.0f;
+    float scl[3], rea[3], lk[3];
+    int lk_on[3];
     int phase, i, r, c;
+    int gc = s_gc, gr = s_gr, ostride = s_gc + 1;
+    unsigned long long t_begin = sceKernelGetSystemTimeWide();
 
     if (!s_web_init) {
         web_init_state();
@@ -1111,55 +1398,66 @@ static void web_update(float dt)
     s_vtime += dt * (s_playing ? 0.2f : 0.06f);
     if (s_vtime > 86400.0f) s_vtime -= 86400.0f;
     web_update_targets(s_playing, dt > 1.0f ? 1.0f : dt);
+    web_react_step(dt);
 
     // --- Шум и спарк: тяжёлая часть, размазана по кадрам ---
+    // Шум (кэш 64x36 x3 поля) достраивается равными долями за WG_NOISE_P кадров
+    // в буфер build; на экране — смесь prev→cur (k растёт за период). Время
+    // шума идёт медленно (vtime 0.2/с), поэтому период 16 кадров незаметен.
+    // Спарк-LUT меняется быстрее — по третям за 3 кадра, как раньше.
     phase = (int)(s_web_tick % 3);
-    if (!s_wg_ready) {
-        // Первый кадр: все буферы и LUT сразу (иначе 3 кадра тёмных колец).
-        sfix vt0 = (sfix)(s_vtime * 32768.0f);
-        int b, f;
-        for (b = 0; b < 3; b++) {
-            for (f = 0; f < 3; f++) web_build_grid_field(b, f, vt0);
-        }
-        s_wg_build_vt = vt0;
-        s_wg_lut_vt = (sfix)(s_vtime * 65536.0f);
-        web_build_lut_range(0, SPARK_N, s_wg_lut_vt);
-        memcpy(s_wg_lut, s_wg_lut_next, sizeof(s_wg_lut));
-        s_wg_ready = 1;
-    }
-    if (phase == 0) {
-        s_wg_build_vt = (sfix)(s_vtime * 32768.0f);
-        s_wg_lut_vt = (sfix)(s_vtime * 65536.0f);
-    }
-    web_build_grid_field(s_wg_build, phase, s_wg_build_vt);
     {
-        int from = phase * ((SPARK_N + 2) / 3);
-        int to = from + (SPARK_N + 2) / 3;
-        if (to > SPARK_N) to = SPARK_N;
-        web_build_lut_range(from, to, s_wg_lut_vt);
-        if (phase == 2) {
+        int np = (int)(s_web_tick % WG_NOISE_P);
+        int per = (WG_NOISE_CELLS + WG_NOISE_P - 1) / WG_NOISE_P;
+        int from = np * per, to = from + per;
+        float k = (float)(np + 1) * (1.0f / (float)WG_NOISE_P);
+        const float *pv, *cu;
+        float *dl;
+        int n;
+
+        if (!s_wg_ready) {
+            // Первый кадр: весь кэш сразу (prev=cur — один снимок), LUT целиком.
+            sfix vt0 = (sfix)(s_vtime * 32768.0f);
+            unsigned long long t0 = sceKernelGetSystemTimeWide();
+            web_build_noise_slice(s_wg_cur, 0, WG_NOISE_CELLS, vt0);
+            memcpy(s_wg_grid[s_wg_prev], s_wg_grid[s_wg_cur],
+                   sizeof(s_wg_grid[0]));
+            s_wg_build_vt = vt0;
+            s_wg_lut_vt = (sfix)(s_vtime * 65536.0f);
+            web_build_lut_range(0, SPARK_N, s_wg_lut_vt);
             memcpy(s_wg_lut, s_wg_lut_next, sizeof(s_wg_lut));
+            s_wg_ready = 1;
+            logLine("glow: web init noise %dx%d took %u ms\n", NF_W, NF_H,
+                    (unsigned)((sceKernelGetSystemTimeWide() - t0) / 1000));
         }
-    }
-    {
-        float k = (float)(phase + 1) * (1.0f / 3.0f);
-        float (*prv)[NF_H][NF_W] = s_wg_grid[s_wg_prev];
-        float (*cur)[NF_H][NF_W] = s_wg_grid[s_wg_cur];
-        int f, j;
-        for (f = 0; f < 3; f++) {
-            for (j = 0; j < NF_H; j++) {
-                for (i = 0; i < NF_W; i++) {
-                    float a = prv[f][j][i];
-                    s_wg_gridL[f][j][i] = a + (cur[f][j][i] - a) * k;
-                }
+        if (np == 0) s_wg_build_vt = (sfix)(s_vtime * 32768.0f);
+        if (to > WG_NOISE_CELLS) to = WG_NOISE_CELLS;
+        if (from < to) web_build_noise_slice(s_wg_build, from, to, s_wg_build_vt);
+
+        if (phase == 0) s_wg_lut_vt = (sfix)(s_vtime * 65536.0f);
+        {
+            int lf = phase * ((SPARK_N + 2) / 3);
+            int lt = lf + (SPARK_N + 2) / 3;
+            if (lt > SPARK_N) lt = SPARK_N;
+            web_build_lut_range(lf, lt, s_wg_lut_vt);
+            if (phase == 2) {
+                memcpy(s_wg_lut, s_wg_lut_next, sizeof(s_wg_lut));
             }
         }
-    }
-    if (phase == 2) {
-        int old_prev = s_wg_prev;
-        s_wg_prev = s_wg_cur;
-        s_wg_cur = s_wg_build;
-        s_wg_build = old_prev;
+
+        pv = &s_wg_grid[s_wg_prev][0][0][0];
+        cu = &s_wg_grid[s_wg_cur][0][0][0];
+        dl = &s_wg_gridL[0][0][0];
+        for (n = 0; n < WG_NOISE_CELLS; n++) {
+            float a = pv[n];
+            dl[n] = a + (cu[n] - a) * k;
+        }
+        if (np == WG_NOISE_P - 1) {
+            int old_prev = s_wg_prev;
+            s_wg_prev = s_wg_cur;
+            s_wg_cur = s_wg_build;
+            s_wg_build = old_prev;
+        }
     }
     s_web_tick++;
 
@@ -1168,10 +1466,18 @@ static void web_update(float dt)
         float ra = s_vtime * kRot[i][2];
         float cs = cosf(ra), sn = sinf(ra);
         float edge = 1.1f + sinf(s_vtime + 1.57f * (float)i);
+        float au = s_aud[i];
+        float strength;
+        lk[i] = s_react[i];
+        lk_on[i] = lk[i] > 0.002f;
+        scl[i] = 1.0f - 0.5f * lk[i];                 // uv*(1-like*0.5)
+        rea[i] = lk[i] > au * 0.6f ? lk[i] : au * 0.6f;
+        strength = lk[i] > au ? lk[i] : au;
         offx[i] = kRot[i][0] * cs - kRot[i][1] * sn;
         offy[i] = kRot[i][0] * sn + kRot[i][1] * cs;
         inv_edge[i] = 1.0f / edge;
-        inten[i] = 0.15f * (1.0f - 0.75f * sinf(s_vtime * 2.0f + 0.785f * (float)i));
+        inten[i] = 0.15f * (1.0f - 0.75f * sinf(s_vtime * 2.0f + 0.785f * (float)i)) +
+                   0.3f * strength;
         brad0[i] = 0.95f - 0.15f * (float)i;
         bwidH[i] = (0.8f - 0.2f * (float)i) * 0.5f;
         bmul[i] = 1.0f - (float)i * 0.3f;
@@ -1179,10 +1485,24 @@ static void web_update(float dt)
                    &c1[i][0], &c1[i][1], &c1[i][2]);
         hsl_to_rgb(s_web_col[i + 3][0], s_web_col[i + 3][1], s_web_col[i + 3][2],
                    &c2[i][0], &c2[i][1], &c2[i][2]);
+        if (lk_on[i]) {
+            for (c = 0; c <= gc; c++) {
+                int i0; float tx;
+                wg_noise_idx(s_wg_nx[c] * scl[i], NF_W, &i0, &tx);
+                s_wg_sci0[i][c] = (unsigned char)i0;
+                s_wg_sctx[i][c] = tx;
+            }
+            for (r = 0; r <= gr; r++) {
+                int j0; float ty;
+                wg_noise_idx(s_wg_ny[r] * scl[i], NF_H, &j0, &ty);
+                s_wg_srj0[i][r] = (unsigned char)j0;
+                s_wg_srty[i][r] = ty;
+            }
+        }
     }
     // Фон: градиент бакета по колонкам (угол 270°: свет справа).
-    for (c = 0; c <= WG_COLS; c++) {
-        float pos = (1.0f - (float)c * (1.0f / WG_COLS)) * 100.0f;
+    for (c = 0; c <= gc; c++) {
+        float pos = (1.0f - (float)c * (1.0f / (float)gc)) * 100.0f;
         int s = 0;
         float f;
         while (s < WEB_STOPS - 2 && kWebStopPos[s + 1] < pos) s++;
@@ -1195,11 +1515,11 @@ static void web_update(float dt)
     }
 
     // --- Вершины ---
-    for (r = 0; r <= WG_ROWS; r++) {
+    for (r = 0; r <= gr; r++) {
         int j0 = s_wg_rj0[r];
         float ty = s_wg_rty[r];
         float uvy = s_wg_uy[r];
-        for (c = 0; c <= WG_COLS; c++) {
+        for (c = 0; c <= gc; c++) {
             int i0 = s_wg_ci0[c];
             float tx = s_wg_ctx[c];
             float uvx = s_wg_ux[c];
@@ -1225,17 +1545,29 @@ static void web_update(float dt)
             cr = bgr; cg = bgg; cb = bgb;
 
             for (i = 0; i < WEB_CIRCLES; i++) {
-                float brad = brad0[i] + 0.3f * ch[0];
-                float outer = brad + bwidH[i] + bmul[i] * spark;
+                // Радиус: blob = base - step*n + 0.3*sharedNoise (shared ∈ [-1,1]);
+                // при лайке/звуке спарк раздувает внешний радиус (лучи).
+                float brad = brad0[i] + 0.3f * (2.0f * ch[0] - 1.0f);
+                float br = bmul[i] * spark;
+                float outer = brad + bwidH[i] + br * (1.0f + rea[i] * 50.0f * br);
                 float dx, dy, llen, lay, dn, alpha, om, t2, glow, tt, d;
                 float rr, gg, bb;
                 if (blen >= outer) continue;
-                dx = uvx + offx[i];
-                dy = uvy + offy[i];
+                dx = uvx * scl[i] + offx[i];
+                dy = uvy * scl[i] + offy[i];
                 llen = wg_len(dx, dy);
-                lay = ch[i];
+                if (lk_on[i]) {
+                    int sj = s_wg_srj0[i][r], si = s_wg_sci0[i][c];
+                    float sx = s_wg_sctx[i][c], sy = s_wg_srty[i][r];
+                    lay = s_wg_gridL[i][sj][si] * ((1.0f - sx) * (1.0f - sy)) +
+                          s_wg_gridL[i][sj][si + 1] * (sx * (1.0f - sy)) +
+                          s_wg_gridL[i][sj + 1][si] * ((1.0f - sx) * sy) +
+                          s_wg_gridL[i][sj + 1][si + 1] * (sx * sy);
+                } else {
+                    lay = ch[i];
+                }
                 dn = llen >= lay ? llen - lay : lay - llen;
-                alpha = 1.0f - wg_sat((llen - lay) * inv_edge[i]);
+                alpha = 1.0f - wg_sstep((llen - lay) * inv_edge[i]);
                 d = outer - 0.5f;
                 if (d < 0.05f) d = 0.05f;
                 t2 = wg_sat((blen - 0.5f) / d);
@@ -1247,6 +1579,16 @@ static void web_update(float dt)
                 rr = c1[i][0] + (c2[i][0] - c1[i][0]) * tt + glow;
                 gg = c1[i][1] + (c2[i][1] - c1[i][1]) * tt + glow;
                 bb = c1[i][2] + (c2[i][2] - c1[i][2]) * tt + glow;
+                if (rr > 255.0f) rr = 255.0f;
+                if (gg > 255.0f) gg = 255.0f;
+                if (bb > 255.0f) bb = 255.0f;
+                if (lk_on[i]) {
+                    // Белая вспышка в центре кольца при лайке (+0.6*like).
+                    float fl = 153.0f * lk[i] *
+                               (1.0f - wg_sstep((blen - 0.2f) /
+                                                (outer * 0.8f - 0.2f + 1e-4f)));
+                    rr += fl; gg += fl; bb += fl;
+                }
                 if (rr < 0.0f) rr = 0.0f; else if (rr > 255.0f) rr = 255.0f;
                 if (gg < 0.0f) gg = 0.0f; else if (gg > 255.0f) gg = 255.0f;
                 if (bb < 0.0f) bb = 0.0f; else if (bb > 255.0f) bb = 255.0f;
@@ -1255,217 +1597,43 @@ static void web_update(float dt)
                 cb += (bb - cb) * alpha;
             }
 
-            // На паузе кольца гаснут к фону; лайк — тёплый сдвиг; виньетка.
-            cr = bgr + (cr - bgr) * bright + lr;
-            cg = bgg + (cg - bgg) * bright + lg;
-            cb = bgb + (cb - bgb) * bright + lb;
+            // На паузе кольца гаснут к фону; виньетка.
+            cr = bgr + (cr - bgr) * bright;
+            cg = bgg + (cg - bgg) * bright;
+            cb = bgb + (cb - bgb) * bright;
             vig = 1.0f - 0.3f * (s_wg_nx2[c] * 0.7f + s_wg_ny2[r] * 0.5f);
             cr *= vig; cg *= vig; cb *= vig;
             if (cr < 0.0f) cr = 0.0f; else if (cr > 255.0f) cr = 255.0f;
             if (cg < 0.0f) cg = 0.0f; else if (cg > 255.0f) cg = 255.0f;
             if (cb < 0.0f) cb = 0.0f; else if (cb > 255.0f) cb = 255.0f;
-            s_wg_rgb[r][c] = 0xFF000000u | ((unsigned int)(cb + 0.5f) << 16) |
+            s_wg_rgb[r * ostride + c] = 0xFF000000u | ((unsigned int)(cb + 0.5f) << 16) |
                              ((unsigned int)(cg + 0.5f) << 8) |
                              (unsigned int)(cr + 0.5f);
         }
     }
-}
 
-/* ------------------------------------------------------------------------
- * MESH — mesh gradient по мотивам Paper Shaders (paper-design/shaders,
- * mesh-gradient.ts, Apache-2.0, (c) Lost Coast Labs): цветные пятна идут по
- * Лиссажу, поле искажается органическим «дыханием» и закручивается вихрем,
- * цвет в точке = среднее пятен с весом 1/(d^3.5 + 1e-3).
- * На PSP считается не попиксельно, а в вершинах сетки 32x18, GPU
- * интерполирует цвет по треугольникам (Gouraud). Без текстуры, без VFPU,
- * без записи в память текстуры: ~600 вершин * 8 пятен на кадр.
- * ------------------------------------------------------------------------ */
-#define MESH_COLS 32
-#define MESH_ROWS 18
-#define MESH_SPOTS 8
-#define MESH_DISTORTION 0.8f
-#define MESH_SWIRL 0.3f
+    s_draw_c = gc;
+    s_draw_r = gr;
+    grid_lod_feed((float)(sceKernelGetSystemTimeWide() - t_begin) * 0.001f);
+}
 
 typedef struct {
     unsigned int color;
     short x, y, z, pad;   /* 12 байт: выравнивание вершины GU по цвету (4) */
 } MeshVert;
-
-static unsigned int s_mesh_rgb[MESH_ROWS + 1][MESH_COLS + 1];
-static float s_mesh_spot[MESH_SPOTS][3];
-static float s_mesh_time = 0.0f;
-static float s_mesh_speed = 0.3f;
-static float s_mesh_bright = 1.0f;
-static float s_mesh_like = 0.0f;
-static int s_mesh_inited = 0;
-
-static float mesh_smooth(float x)
-{
-    if (x <= 0.0f) return 0.0f;
-    if (x >= 1.0f) return 1.0f;
-    return x * x * (3.0f - 2.0f * x);
-}
-
-static void mesh_set_target(float *dst, const unsigned char *c, float k)
-{
-    dst[0] = (float)c[0] * k;
-    dst[1] = (float)c[1] * k;
-    dst[2] = (float)c[2] * k;
-}
-
-// Цели цветов пятен из палитры обложки: два акцента, оттенки, средний цвет
-// и тёмные пятна для контраста (иначе фон превращается в сплошную кашу).
-static void mesh_targets(float t[MESH_SPOTS][3])
-{
-    unsigned char mix[3];
-    int i;
-    for (i = 0; i < 3; i++) {
-        mix[i] = (unsigned char)(((int)s_pal[0][i] + (int)s_pal[2][i]) / 2);
-    }
-    mesh_set_target(t[0], s_pal[0], 1.0f);
-    mesh_set_target(t[1], s_pal[1], 1.0f);
-    mesh_set_target(t[2], s_pal[0], 0.55f);
-    mesh_set_target(t[3], s_pal[2], 0.9f);
-    mesh_set_target(t[4], s_pal[1], 0.5f);
-    mesh_set_target(t[5], mix, 0.9f);
-    mesh_set_target(t[6], s_pal[3], 1.0f);
-    mesh_set_target(t[7], s_pal[3], 1.0f);
-}
-
-static void mesh_update(float dt)
-{
-    float tgt[MESH_SPOTS][3];
-    float px[MESH_SPOTS], py[MESH_SPOTS];
-    float speed_t = s_playing ? 0.32f : 0.10f;
-    float bright_t = s_playing ? 1.0f : 0.6f;
-    float pulse = 1.0f;
-    float k, t, bright, like;
-    int i, r, c;
-
-    if (dt > 0.1f) dt = 0.1f;
-    k = dt * 3.0f;
-    if (k > 1.0f) k = 1.0f;
-
-    mesh_targets(tgt);
-    if (!s_mesh_inited) {
-        memcpy(s_mesh_spot, tgt, sizeof(s_mesh_spot));
-        s_mesh_bright = bright_t;
-        s_mesh_like = s_liked ? 1.0f : 0.0f;
-        s_mesh_speed = speed_t;
-        s_mesh_inited = 1;
-    } else {
-        // Плавная смена цветов при новой обложке и play/pause.
-        for (i = 0; i < MESH_SPOTS; i++) {
-            s_mesh_spot[i][0] += (tgt[i][0] - s_mesh_spot[i][0]) * k;
-            s_mesh_spot[i][1] += (tgt[i][1] - s_mesh_spot[i][1]) * k;
-            s_mesh_spot[i][2] += (tgt[i][2] - s_mesh_spot[i][2]) * k;
-        }
-        s_mesh_bright += (bright_t - s_mesh_bright) * k;
-        s_mesh_like += ((s_liked ? 1.0f : 0.0f) - s_mesh_like) * k;
-        s_mesh_speed += (speed_t - s_mesh_speed) * k;
-    }
-    s_mesh_time += dt * s_mesh_speed;
-
-    if (s_frame < s_pulse_until) {
-        pulse = 1.0f + 0.45f * (float)(s_pulse_until - s_frame) / 45.0f;
-    }
-    bright = s_mesh_bright * pulse;
-    like = s_mesh_like;
-
-    // t как в шейдере: .5 * (time + firstFrameOffset).
-    t = 0.5f * (s_mesh_time + 41.5f);
-
-    // getPosition(i, t) из шейдера: Лиссажу на пятно.
-    for (i = 0; i < MESH_SPOTS; i++) {
-        float fi = (float)i;
-        float a = fi * 0.37f;
-        float q = fi * (1.0f / 3.0f);
-        float q2 = (fi + 1.0f) * 0.25f;
-        float b = 0.6f + (q - floorf(q)) * 0.9f;
-        float cc = 0.8f + (q2 - floorf(q2));
-        px[i] = 0.5f + 0.5f * fsin(t * b + a);
-        py[i] = 0.5f + 0.5f * fsin(t * cc + a * 1.5f + 1.5707963f);
-    }
-
-    for (r = 0; r <= MESH_ROWS; r++) {
-        float v0 = (float)r * (1.0f / MESH_ROWS);
-        for (c = 0; c <= MESH_COLS; c++) {
-            float u0 = (float)c * (1.0f / MESH_COLS);
-            float uvx = u0, uvy = v0;
-            float dx = u0 - 0.5f, dy = v0 - 0.5f;
-            float rad = mesh_smooth(sqrtf(dx * dx + dy * dy));
-            float center = 1.0f - rad;
-            float ang, ca, sa, rx, ry;
-            float cr = 0.0f, cg = 0.0f, cb = 0.0f, tw = 0.0f, inv, kk;
-            int ii;
-
-            // Органическое искажение (два прохода как в шейдере).
-            for (ii = 1; ii <= 2; ii++) {
-                float fi = (float)ii;
-                float sy = mesh_smooth(uvy);
-                float sx;
-                uvx += MESH_DISTORTION * center / fi *
-                       fsin(t + fi * 0.4f * sy) *
-                       fsin(0.2f * t + fi * 2.4f * sy + 1.5707963f);
-                sx = mesh_smooth(uvx);
-                uvy += MESH_DISTORTION * center / fi *
-                       fsin(t + fi * 2.0f * sx + 1.5707963f);
-            }
-
-            // Вихрь: поворот пропорционален расстоянию от центра.
-            ang = 3.0f * MESH_SWIRL * rad;
-            ca = fsin(-ang + 1.5707963f);
-            sa = fsin(-ang);
-            rx = uvx - 0.5f;
-            ry = uvy - 0.5f;
-            {
-                float nx = ca * rx - sa * ry + 0.5f;
-                float ny = sa * rx + ca * ry + 0.5f;
-                uvx = nx;
-                uvy = ny;
-            }
-
-            for (ii = 0; ii < MESH_SPOTS; ii++) {
-                float ex = uvx - px[ii], ey = uvy - py[ii];
-                float d2 = ex * ex + ey * ey;
-                float d = sqrtf(d2);
-                float w = 1.0f / (d2 * d * sqrtf(d) + 1e-3f);  // d^3.5
-                cr += s_mesh_spot[ii][0] * w;
-                cg += s_mesh_spot[ii][1] * w;
-                cb += s_mesh_spot[ii][2] * w;
-                tw += w;
-            }
-            inv = 1.0f / (tw > 1e-4f ? tw : 1e-4f);
-            // Лёгкая виньетка: края темнее, чтобы текст интерфейса читался.
-            kk = inv * bright * (0.78f + 0.22f * center);
-            {
-                float fr = cr * kk + like * 10.0f;
-                float fg = cg * kk - like * 4.0f;
-                float fb = cb * kk - like * 10.0f;
-                unsigned int ir, ig, ib;
-                if (fr < 0.0f) fr = 0.0f; else if (fr > 255.0f) fr = 255.0f;
-                if (fg < 0.0f) fg = 0.0f; else if (fg > 255.0f) fg = 255.0f;
-                if (fb < 0.0f) fb = 0.0f; else if (fb > 255.0f) fb = 255.0f;
-                ir = (unsigned int)fr;
-                ig = (unsigned int)fg;
-                ib = (unsigned int)fb;
-                s_mesh_rgb[r][c] = 0xFF000000u | (ib << 16) | (ig << 8) | ir;
-            }
-        }
-    }
-}
+typedef MeshVert VizScrimVert;
 
 // Рисует сетку цветов вершин (rows+1 строк по cols+1 цветов ABGR) полосами
-// треугольников с Gouraud-интерполяцией. Общий путь для стилей MESH и WEB.
+// треугольников с Gouraud-интерполяцией. Путь стиля WEB.
 static void grid_draw(const unsigned int *rgb, int cols, int rows,
                       float x, float y, float w, float h)
 {
-    short xs[WG_COLS + 1], ys[WG_ROWS + 1];
+    short xs[WG_MAXC + 1], ys[WG_MAXR + 1];
     MeshVert *base, *p;
     int stride = cols + 1;
     int r, c;
 
-    if (cols > WG_COLS || rows > WG_ROWS) return;
+    if (cols > WG_MAXC || rows > WG_MAXR) return;
     for (c = 0; c <= cols; c++) {
         xs[c] = (short)(x + w * (float)c / (float)cols + 0.5f);
     }
@@ -1501,6 +1669,111 @@ static void grid_draw(const unsigned int *rgb, int cols, int rows,
     hal_gpu_invalidate_tex_state();
 }
 
+/* ---- Подложка под текст -------------------------------------------------
+ * Свечение бывает светлым и серым, а текст интерфейса — белый/серый/тёмно-серый:
+ * при совпадении яркости он сливается. Меряем яркость (85-й процентиль, раз в
+ * 6 кадров) под областью текста в уже посчитанном буфере вершин (или в текстуре
+ * «Нитей») и кладём чёрную плашку с мягким краем; альфа подобрана так, чтобы
+ * фон под текстом оставался темнее ~46/255 (серый CCCCCC читается, контраст
+ * около 5:1), и плавно следует за яркостью — без мерцания. */
+static float s_scrim_a = 0.16f;
+
+static float glow_region_luma(float x0, float y0, float x1, float y1)
+{
+    unsigned hist[16];
+    unsigned n = 0, acc = 0, want;
+    int b;
+    memset(hist, 0, sizeof(hist));
+    if (s_style == GLOW_STYLE_STRANDS) {
+        int ix0 = (int)(x0 * 0.5f), ix1 = (int)(x1 * 0.5f);
+        int iy0 = (int)(y0 * 0.5f), iy1 = (int)(y1 * 0.5f);
+        int ix, iy;
+        if (!s_buf) return 0.0f;
+        if (ix1 > GLOW_W - 1) ix1 = GLOW_W - 1;
+        if (iy1 > GLOW_H - 1) iy1 = GLOW_H - 1;
+        for (iy = iy0; iy <= iy1; iy += 6) {
+            for (ix = ix0; ix <= ix1; ix += 6) {
+                const unsigned char *p = s_buf + (size_t)(iy * GLOW_PITCH + ix) * 4;
+                unsigned l = (77u * p[0] + 150u * p[1] + 29u * p[2]) >> 8;
+                hist[l >> 4]++;
+                n++;
+            }
+        }
+    } else {
+        int gc = s_draw_c, gr = s_draw_r;
+        int c0 = (int)(x0 * (float)gc / 480.0f), c1 = (int)(x1 * (float)gc / 480.0f + 0.999f);
+        int r0 = (int)(y0 * (float)gr / 272.0f), r1 = (int)(y1 * (float)gr / 272.0f + 0.999f);
+        int c, r;
+        if (c0 < 0) c0 = 0;
+        if (r0 < 0) r0 = 0;
+        if (c1 > gc) c1 = gc;
+        if (r1 > gr) r1 = gr;
+        for (r = r0; r <= r1; r += 2) {
+            for (c = c0; c <= c1; c += 2) {
+                unsigned px = s_wg_rgb[r * (gc + 1) + c];
+                unsigned l = (77u * (px & 255u) + 150u * ((px >> 8) & 255u) +
+                              29u * ((px >> 16) & 255u)) >> 8;
+                hist[l >> 4]++;
+                n++;
+            }
+        }
+    }
+    if (n == 0) return 0.0f;
+    want = (n * 85u + 99u) / 100u;
+    for (b = 0; b < 16; b++) {
+        acc += hist[b];
+        if (acc >= want) return (float)(b * 16 + 8);
+    }
+    return 255.0f;
+}
+
+void glow_bg_text_scrim(float x, float y, float w, float h)
+{
+    static unsigned cnt = 0;
+    static float luma = 0.0f;
+    const float fx = 26.0f, fy = 16.0f;
+    float xs[3], ys[4], want, a;
+    VizScrimVert *v, *p;
+    int r, c;
+
+    if (!hal_gpu_in_frame()) return;
+    hal_gpu_set_texturing(0);
+    hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
+    sceGuShadeModel(GU_SMOOTH);
+    if ((cnt++ % 6u) == 0u) luma = glow_region_luma(x, y, x + w, y + h);
+    want = luma > 50.0f ? 1.0f - 50.0f / luma : 0.0f;
+    if (want < 0.16f) want = 0.16f;       // лёгкое затемнение всегда: тени текста мало
+    if (want > 0.68f) want = 0.68f;
+    /* Winamp-стили: яркие столбики/линии рисуются поверх сетки и в замер яркости
+     * не попадают — под текстом держим плотную плашку всегда. */
+    if (s_style >= GLOW_STYLE_SPECTRUM && want < 0.62f) want = 0.62f;
+    s_scrim_a += (want - s_scrim_a) * 0.08f;
+    a = s_scrim_a * 255.0f * ((float)ui_draw_get_alpha() * (1.0f / 255.0f));
+
+    xs[0] = x; xs[1] = x + fx; xs[2] = x + w;
+    ys[0] = y; ys[1] = y + fy; ys[2] = y + h - fy; ys[3] = y + h;
+    v = (VizScrimVert *)sceGuGetMemory((unsigned)(3 * 6) * sizeof(VizScrimVert));
+    if (!v) return;
+    p = v;
+    for (r = 0; r < 3; r++) {
+        for (c = 0; c < 3; c++) {
+            int k0 = (c == 0) ? 0 : 1;
+            int ka = (r == 0) ? 0 : 1, kb = (r + 1 == 3) ? 0 : 1;
+            p->color = ((unsigned int)(a * (float)(k0 * ka) + 0.5f)) << 24;
+            p->x = (short)(xs[c] + 0.5f); p->y = (short)(ys[r] + 0.5f); p->z = 0; p->pad = 0;
+            p++;
+            p->color = ((unsigned int)(a * (float)(k0 * kb) + 0.5f)) << 24;
+            p->x = (short)(xs[c] + 0.5f); p->y = (short)(ys[r + 1] + 0.5f); p->z = 0; p->pad = 0;
+            p++;
+        }
+        sceGuDrawArray(GU_TRIANGLE_STRIP,
+                       GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
+                       6, 0, p - 6);
+    }
+    hal_gpu_set_blend(1, GU_ADD, GU_SRC_ALPHA, GU_ONE_MINUS_SRC_ALPHA);
+    hal_gpu_invalidate_tex_state();
+}
+
 // Обновление текстуры: каждый стиль — каждый кадр (плавность без рывков).
 static void glow_update(void)
 {
@@ -1517,19 +1790,22 @@ static void glow_update(void)
     if (dt > 0.25f) dt = 0.25f;
     s_last_us = now;
 
-    if (s_style == GLOW_STYLE_MESH) {
-        mesh_update(dt);
-        return;  // рисуется вершинами, текстура не нужна
-    }
     if (s_style == GLOW_STYLE_WEB) {
         web_update(dt);
         return;  // то же: сетка вершин, без текстуры
     }
     if (s_style == GLOW_STYLE_CLASSIC) {
-        classic_update();
-    } else {
-        strands_update();
+        s_bg_dim = 1.0f;
+        classic_update();   // сетка вершин, как «Веб»: текстуру не трогаем
+        return;
     }
+    if (s_style >= GLOW_STYLE_SPECTRUM) {
+        s_bg_dim = 0.42f;   // фон приглушён: визуализация должна читаться
+        classic_update();
+        viz_update(s_playing);
+        return;
+    }
+    strands_update();
 
     // Padding для LINEAR-фильтра: реплика последнего столбца/строки (240x136).
     {
@@ -1560,7 +1836,7 @@ void glow_bg_init(void)
     if (!s_sin_ready) {
         sin_tab_init();
     }
-    web_geom_init();  // статическая геометрия вершин веб-стиля: разово
+    grid_set_level(s_lod);  // статическая геометрия вершин сетки: разово
 }
 
 void glow_bg_free(void)
@@ -1581,12 +1857,15 @@ void glow_bg_draw(float x, float y, float w, float h)
     glow_update();
     s_frame++;
 
-    if (s_style == GLOW_STYLE_MESH) {
-        grid_draw(&s_mesh_rgb[0][0], MESH_COLS, MESH_ROWS, x, y, w, h);
-        return;
-    }
-    if (s_style == GLOW_STYLE_WEB) {
-        grid_draw(&s_wg_rgb[0][0], WG_COLS, WG_ROWS, x, y, w, h);
+    if (s_style == GLOW_STYLE_WEB || s_style == GLOW_STYLE_CLASSIC ||
+        s_style >= GLOW_STYLE_SPECTRUM) {
+        grid_draw(s_wg_rgb, s_draw_c, s_draw_r,
+                 x, y, w, h);
+        if (s_style >= GLOW_STYLE_SPECTRUM) {
+            viz_draw(s_style == GLOW_STYLE_SPECTRUM ? VIZ_SPECTRUM :
+                     (s_style == GLOW_STYLE_SCOPE ? VIZ_SCOPE : VIZ_RADIAL),
+                     x, y, w, h, s_pal[0][0], s_pal[0][1], s_pal[0][2]);
+        }
         return;
     }
 

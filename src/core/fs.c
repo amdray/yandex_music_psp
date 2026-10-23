@@ -562,3 +562,112 @@ void fs_evict_except(const char *dir, const char *const *keep_ids,
     }
     free(list);
 }
+
+/* --- Отложенная запись конфигов --- */
+#define FS_DEFER_SLOTS 6
+#define FS_DEFER_PATH_MAX 96
+#define FS_DEFER_DATA_MAX 256
+#define FS_DEFER_DELAY_US 1200000ULL
+
+typedef struct {
+    char path[FS_DEFER_PATH_MAX];
+    char data[FS_DEFER_DATA_MAX];
+    size_t len;
+    int dirty;
+} FsDeferSlot;
+
+static FsDeferSlot s_defer[FS_DEFER_SLOTS];
+static SceLwMutexWorkarea s_defer_mutex;
+static int s_defer_mutex_ok = 0;
+static SceUID s_defer_sema = -1;
+static SceUID s_defer_thread = -1;
+static volatile u64 s_defer_last_us = 0;
+
+static void fs_defer_write_all(void)
+{
+    int i;
+    for (i = 0; i < FS_DEFER_SLOTS; i++) {
+        char path[FS_DEFER_PATH_MAX];
+        char data[FS_DEFER_DATA_MAX];
+        size_t len = 0;
+        int have = 0;
+        sceKernelLockLwMutex(&s_defer_mutex, 1, NULL);
+        if (s_defer[i].dirty) {
+            memcpy(path, s_defer[i].path, sizeof(path));
+            memcpy(data, s_defer[i].data, s_defer[i].len);
+            len = s_defer[i].len;
+            s_defer[i].dirty = 0;
+            have = 1;
+        }
+        sceKernelUnlockLwMutex(&s_defer_mutex, 1);
+        if (have) {
+            SceUID fd = fs_open(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+            if (fd >= 0) {
+                int w = fs_write(fd, data, len);
+                fs_close(fd);
+                if (w != (int)len) logLine("fs: deferred write short '%s' %d/%d\n", path, w, (int)len);
+            } else {
+                logLine("fs: deferred open failed '%s' 0x%08X\n", path, fd);
+            }
+        }
+    }
+}
+
+static int fs_defer_main(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    for (;;) {
+        (void)sceKernelWaitSema(s_defer_sema, 1, NULL);
+        /* Склейка: ждём, пока серия нажатий закончится. */
+        for (;;) {
+            u64 now = sceKernelGetSystemTimeWide();
+            u64 last = s_defer_last_us;
+            if (now - last >= FS_DEFER_DELAY_US) break;
+            sceKernelDelayThread((SceUInt)(FS_DEFER_DELAY_US - (now - last)) + 1000);
+        }
+        fs_defer_write_all();
+    }
+    return 0;
+}
+
+int fs_write_deferred(const char *path, const void *data, size_t size)
+{
+    int i, slot = -1;
+    if (!path || !data || size == 0 || size > FS_DEFER_DATA_MAX ||
+        strlen(path) >= FS_DEFER_PATH_MAX) {
+        return -1;
+    }
+    if (!s_defer_mutex_ok) {
+        if (sceKernelCreateLwMutex(&s_defer_mutex, "fs_defer", 0, 0, NULL) < 0) {
+            return -1;
+        }
+        s_defer_mutex_ok = 1;
+        s_defer_sema = sceKernelCreateSema("fs_defer", 0, 0, 1, NULL);
+        s_defer_thread = sceKernelCreateThread("fs_defer", fs_defer_main,
+                                               0x30, 0x2000, 0, NULL);
+        if (s_defer_sema < 0 || s_defer_thread < 0 ||
+            sceKernelStartThread(s_defer_thread, 0, NULL) < 0) {
+            s_defer_thread = -1;  /* без потока — пишем в flush/выход */
+        }
+    }
+    sceKernelLockLwMutex(&s_defer_mutex, 1, NULL);
+    for (i = 0; i < FS_DEFER_SLOTS; i++) {
+        if (s_defer[i].path[0] && strcmp(s_defer[i].path, path) == 0) { slot = i; break; }
+        if (slot < 0 && !s_defer[i].path[0]) slot = i;
+    }
+    if (slot < 0) slot = 0;
+    snprintf(s_defer[slot].path, FS_DEFER_PATH_MAX, "%s", path);
+    memcpy(s_defer[slot].data, data, size);
+    s_defer[slot].len = size;
+    s_defer[slot].dirty = 1;
+    sceKernelUnlockLwMutex(&s_defer_mutex, 1);
+    s_defer_last_us = sceKernelGetSystemTimeWide();
+    if (s_defer_thread >= 0) sceKernelSignalSema(s_defer_sema, 1);
+    return 0;
+}
+
+void fs_flush_deferred(void)
+{
+    if (!s_defer_mutex_ok) return;
+    fs_defer_write_all();
+}

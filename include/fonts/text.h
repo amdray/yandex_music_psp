@@ -33,6 +33,11 @@ void text_render_window(float x, float y, const char *text, u32 color_abgr, floa
 void text_render_window_font(TextFont font, float x, float y, const char *text,
                              u32 color_abgr, float skip_px, float max_width);
 
+// Мягкая тень под текстом (смещение +1,+1, чёрная, ~75% непрозрачности): включается
+// на экранах с живым фоном, где цвет текста может совпасть с цветом свечения.
+// Действует на все text_render* до выключения (text_set_shadow(0)).
+void text_set_shadow(int on);
+
 // Measure text width in pixels
 float text_measure_width(const char *text);
 float text_measure_width_font(TextFont font, const char *text);

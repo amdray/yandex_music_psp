@@ -1,4 +1,4 @@
-﻿#include "services/net_http.h"
+#include "services/net_http.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,7 +86,7 @@ static int http_build_request(char *buf, size_t bufsz, const HttpRequest *req,
 
     if (send_client_header) {
         n = snprintf(buf + off, bufsz - off,
-                     "X-Yandex-Music-Client: YandexMusicDesktopAppWindows/5.23.2\r\n");
+                     "X-Yandex-Music-Client: YandexMusicDesktopAppWindows/5.95.0\r\n");
         if (n < 0 || (size_t)n >= bufsz - off) return -1;
         off += (size_t)n;
     }
@@ -164,7 +164,7 @@ static int http_write_all(NetTlsConnection *conn, const void *data, size_t len)
         }
         if (err == MBEDTLS_ERR_SSL_WANT_READ || err == MBEDTLS_ERR_SSL_WANT_WRITE) {
             /* Yield to other threads - prevents 100% CPU during network I/O */
-            sceKernelDelayThread(5 * 1000);
+            sceKernelDelayThread(1 * 1000);
             continue;
         }
         return -1;
@@ -229,8 +229,8 @@ static int http_open(const HttpRequest *req, const char *accept,
         }
     }
 
-    /* Р”Р»РёРЅРЅС‹Рµ Р·Р°РіРѕР»РѕРІРєРё (cookie РїР°СЃРїРѕСЂС‚Р° ~2-3 РљР‘) вЂ” РІ РєСѓС‡Рµ; РѕР±С‹С‡РЅС‹Рµ
-     * Р·Р°РїСЂРѕСЃС‹, РєР°Рє Рё СЂР°РЅСЊС€Рµ, С†РµР»РёРєРѕРј РЅР° СЃС‚РµРєРµ. */
+    /* Длинные заголовки (cookie паспорта ~2-3 КБ) — в куче; обычные
+     * запросы, как и раньше, целиком на стеке. */
     {
         size_t extra = 0;
         if (req->extra_headers) extra += strlen(req->extra_headers);
@@ -479,7 +479,8 @@ int http_stream(const HttpRequest *req, const HttpSink *sink)
             }
             if (err < 0) {
                 if (err == MBEDTLS_ERR_SSL_WANT_READ || err == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                    sceKernelDelayThread(5 * 1000);
+                    /* WANT_READ: psp_net_recv уже ждал в poll — не спим ещё раз. */
+                    if (err == MBEDTLS_ERR_SSL_WANT_WRITE) sceKernelDelayThread(1 * 1000);
                     continue;
                 }
                 logLine("http: stream hdr read failed %d\n", err);
@@ -609,7 +610,8 @@ int http_stream(const HttpRequest *req, const HttpSink *sink)
             }
             if (err < 0) {
                 if (err == MBEDTLS_ERR_SSL_WANT_READ || err == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                    sceKernelDelayThread(5 * 1000);
+                    /* WANT_READ: psp_net_recv уже ждал в poll — не спим ещё раз. */
+                    if (err == MBEDTLS_ERR_SSL_WANT_WRITE) sceKernelDelayThread(1 * 1000);
                     continue;
                 }
                 logLine("http: stream body read failed %d\n", err);
@@ -661,7 +663,8 @@ int http_stream(const HttpRequest *req, const HttpSink *sink)
             }
             if (err < 0) {
                 if (err == MBEDTLS_ERR_SSL_WANT_READ || err == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                    sceKernelDelayThread(5 * 1000);
+                    /* WANT_READ: psp_net_recv уже ждал в poll — не спим ещё раз. */
+                    if (err == MBEDTLS_ERR_SSL_WANT_WRITE) sceKernelDelayThread(1 * 1000);
                     continue;
                 }
                 logLine("http: stream body read failed %d\n", err);
@@ -755,7 +758,7 @@ static void http_jar_remove(HttpCookieJar *jar, int idx)
     jar->count--;
 }
 
-// РћРґРЅР° СЃС‚СЂРѕРєР° "Set-Cookie: name=value; Attr...". line РЅРµ NUL-С‚РµСЂРјРёРЅРёСЂРѕРІР°РЅР°.
+// Одна строка "Set-Cookie: name=value; Attr...". line не NUL-терминирована.
 static void http_jar_set_line(HttpCookieJar *jar, const char *v, const char *end)
 {
     const char *eq, *semi;
@@ -777,7 +780,7 @@ static void http_jar_set_line(HttpCookieJar *jar, const char *v, const char *end
     }
     memcpy(name, v, nlen);
     name[nlen] = '\0';
-    /* РЈРґР°Р»РµРЅРёРµ: РїСѓСЃС‚РѕРµ Р·РЅР°С‡РµРЅРёРµ, Max-Age=0 РёР»Рё Expires РІ 1970. */
+    /* Удаление: пустое значение, Max-Age=0 или Expires в 1970. */
     if (vlen == 0) expired = 1;
     {
         const char *a = semi;
@@ -807,7 +810,7 @@ static void http_jar_set_line(HttpCookieJar *jar, const char *v, const char *end
     jar->items[i].value[vlen] = '\0';
 }
 
-// Р Р°Р·РѕР±СЂР°С‚СЊ РІСЃРµ Set-Cookie РёР· Р±Р»РѕРєР° Р·Р°РіРѕР»РѕРІРєРѕРІ [hdr, hdr+len).
+// Разобрать все Set-Cookie из блока заголовков [hdr, hdr+len).
 static void http_jar_absorb(HttpCookieJar *jar, const char *hdr, int len)
 {
     const char *p = hdr, *end = hdr + len;

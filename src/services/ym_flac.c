@@ -327,7 +327,7 @@ static void ra_start(struct YmFlac *f, const char *path)
     f->ra_want = 0;
     f->ra_stop = 0;
     f->ra_thread = sceKernelCreateThread("flac_ra", ra_thread_main,
-                                         0x28, 0x4000, PSP_THREAD_ATTR_USER,
+                                         0x1C, 0x4000, PSP_THREAD_ATTR_USER,
                                          NULL);
     if (f->ra_thread < 0) {
         logLine("ym_flac: read-ahead thread fail rc=%d\n", (int)f->ra_thread);

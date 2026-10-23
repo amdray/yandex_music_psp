@@ -287,16 +287,9 @@ void eq_save(void)
     if (len <= 0 || len >= (int)sizeof(buf)) {
         return;
     }
-    fd = fs_open(EQ_CFG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd < 0) {
-        return;
-    }
-    w = fs_write(fd, buf, (size_t)len);
-    fs_close(fd);
-    if (w != len) {
-        logLine("eq: save short %d/%d\n", w, len);
-        logger_flush();
-    }
+    /* Не из UI-потока: запись на карту — секунды. Фоновый поток, склейка. */
+    (void)fd; (void)w;
+    fs_write_deferred(EQ_CFG_PATH, buf, (size_t)len);
 }
 
 void eq_init(void)

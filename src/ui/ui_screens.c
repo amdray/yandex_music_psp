@@ -42,6 +42,8 @@
 #include "ui/ui_layout.h"
 #include "ui/ui_icon_atlas.h"
 #include "ui/ui_glow_bg.h"
+#include "ui/ui_idle.h"
+#include "ui/ui_theme.h"
 
 static SplashFlow s_splash_flow;
 static ScreenId s_last_screen = SCREEN_COUNT;
@@ -326,10 +328,6 @@ static void screens_sync_lifecycle(AppState *state)
     logLine("ui: screen change %s -> %s\n",
             screen_name(s_last_screen), screen_name(current));
     logger_flush();
-    /* Синхронная метка на карту: переживает обесточивание консоли,
-       в отличие от асинхронного app.log. */
-    logger_checkpoint("screen %s -> %s",
-                      screen_name(s_last_screen), screen_name(current));
 
     prev_desc = screen_desc(s_last_screen);
     if (prev_desc && prev_desc->on_exit) {
@@ -411,6 +409,7 @@ int ui_screens_init(void)
     system_status_init();
     net_ui_status_init();
     glow_bg_init();
+    idle_init();
 
     audio_cache_init();
     playback_controller_init();
@@ -482,6 +481,22 @@ void ui_screens_handle_input(AppState *state, const InputState *input)
         s_nav_pending = SCREEN_COUNT;
     }
 
+    /* SELECT — быстрый доступ к настройкам с любого экрана; повторное нажатие
+       закрывает их. Не на заставке, входе по коду и в поиске (ввод текста). */
+    if ((input->pressed & PSP_CTRL_SELECT) &&
+        current != SCREEN_SPLASH && current != SCREEN_DEVICE_LOGIN &&
+        current != SCREEN_SEARCH) {
+        if (current == SCREEN_SETTINGS) {
+            logLine("ui: select -> close settings\n");
+            app_state_pop(state);
+        } else if (state->stack_size < APP_SCREEN_STACK_CAPACITY) {
+            logLine("ui: select -> settings from %s\n", screen_name(current));
+            app_state_push(state, SCREEN_SETTINGS);
+        }
+        apply_resource_mode(state);
+        return;
+    }
+
     if (desc && !desc->owns_back && (input->pressed & PSP_CTRL_CIRCLE)) {
         logLine("ui: circle pop screen=%s\n", screen_name(current));
         app_state_pop(state);
@@ -500,6 +515,7 @@ void ui_screens_render(const AppState *state)
     ScreenId current = app_state_get_current(state);
     const ScreenDesc *desc = screen_desc(current);
 
+    ui_theme_tick();
     ui_draw_begin_frame();
 
     if (s_fatal_resource_error) {

@@ -73,7 +73,7 @@ static void eq_band_label(int band, char *out, int out_size)
 {
     float f = eq_band_freq(band);
     if (f >= 1000.0f) {
-        /* Без %g: dtoa newlib не потокобезопасен (см. libc_guard.h). */
+        /* Без %g: dtoa newlib не потокобезопасен (см. core/libc_runtime.h). */
         int khz10 = (int)(f / 100.0f + 0.5f);
         if (khz10 % 10 == 0) {
             snprintf(out, out_size, "%d kHz", khz10 / 10);

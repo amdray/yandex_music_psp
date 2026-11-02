@@ -11783,13 +11783,17 @@ DRFLAC_API drflac_uint64 drflac_read_pcm_frames_f32(drflac* pFlac, drflac_uint64
 
 DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 pcmFrameIndex)
 {
+    drflac_uint64 originalPCMFrame;
+    drflac_bool32 restoring = DRFLAC_FALSE;
     if (pFlac == NULL) {
         return DRFLAC_FALSE;
     }
+    originalPCMFrame = pFlac->currentPCMFrame;
 
+retry_seek:
     /* Don't do anything if we're already on the seek point. */
     if (pFlac->currentPCMFrame == pcmFrameIndex) {
-        return DRFLAC_TRUE;
+        return !restoring;
     }
 
     /*
@@ -11802,10 +11806,10 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
 
     if (pcmFrameIndex == 0) {
         pFlac->currentPCMFrame = 0;
-        return drflac__seek_to_first_frame(pFlac);
+        drflac_bool32 result = drflac__seek_to_first_frame(pFlac);
+        return result && !restoring;
     } else {
         drflac_bool32 wasSuccessful = DRFLAC_FALSE;
-        drflac_uint64 originalPCMFrame = pFlac->currentPCMFrame;
 
         /* Clamp the sample to the end. */
         if (pcmFrameIndex > pFlac->totalPCMFrameCount) {
@@ -11820,7 +11824,7 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
                 if (pFlac->currentFLACFrame.pcmFramesRemaining > offset) {
                     pFlac->currentFLACFrame.pcmFramesRemaining -= offset;
                     pFlac->currentPCMFrame = pcmFrameIndex;
-                    return DRFLAC_TRUE;
+                    return !restoring;
                 }
             } else {
                 /* Backward. */
@@ -11830,7 +11834,7 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
                 if (currentFLACFramePCMFramesConsumed > offsetAbs) {
                     pFlac->currentFLACFrame.pcmFramesRemaining += offsetAbs;
                     pFlac->currentPCMFrame = pcmFrameIndex;
-                    return DRFLAC_TRUE;
+                    return !restoring;
                 }
             }
         }
@@ -11868,14 +11872,13 @@ DRFLAC_API drflac_bool32 drflac_seek_to_pcm_frame(drflac* pFlac, drflac_uint64 p
         if (wasSuccessful) {
             pFlac->currentPCMFrame = pcmFrameIndex;
         } else {
-            /* Seek failed. Try putting the decoder back to it's original state. */
-            if (drflac_seek_to_pcm_frame(pFlac, originalPCMFrame) == DRFLAC_FALSE) {
-                /* Failed to seek back to the original PCM frame. Fall back to 0. */
-                drflac_seek_to_pcm_frame(pFlac, 0);
-            }
+            /* Restore the original position once; if that fails, seek to 0. */
+            pcmFrameIndex = restoring ? 0 : originalPCMFrame;
+            restoring = DRFLAC_TRUE;
+            goto retry_seek;
         }
 
-        return wasSuccessful;
+        return wasSuccessful && !restoring;
     }
 }
 

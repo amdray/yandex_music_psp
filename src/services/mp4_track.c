@@ -1,7 +1,6 @@
-/* Разбор MP4 (ISOBMFF) аудио-трека. Один модуль на три потребителя:
- * проба потока перед закачкой, демукс flac-mp4 -> сырой fLaC, путь
- * плеера для aac-mp4 (esds ASC + сэмплы). moov целиком в RAM. */
+/* MP4 audio metadata and sample tables; moov is retained in RAM. */
 #include "services/mp4_track.h"
+#include "services/audio_reader.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -521,10 +520,14 @@ int mp4_probe_buffer(const unsigned char *buf, int len, Mp4ProbeInfo *out)
 
 /* ---- файловый доступ ---- */
 
-static int read_full(SceUID fd, void *dst, int want)
+typedef int (*Mp4ReadAt)(void *, int64_t, void *, int);
+
+static int file_read_at(void *user, int64_t offset, void *dst, int want)
 {
+    SceUID fd = *(SceUID *)user;
     unsigned char *p = (unsigned char *)dst;
     int got_total = 0;
+    if (fs_lseek(fd, offset, PSP_SEEK_SET) != offset) return -1;
     while (got_total < want) {
         int rc = fs_read(fd, p + got_total, want - got_total);
         if (rc <= 0) break;
@@ -533,7 +536,7 @@ static int read_full(SceUID fd, void *dst, int want)
     return got_total;
 }
 
-static int find_moov(SceUID fd, int64_t file_size, int64_t *out_off,
+static int find_moov(Mp4ReadAt read_at, void *user, int64_t file_size, int64_t *out_off,
                      uint64_t *out_size, size_t *out_hdr)
 {
     int64_t off = 0;
@@ -543,13 +546,12 @@ static int find_moov(SceUID fd, int64_t file_size, int64_t *out_off,
         size_t hdr = 8;
         char type[5];
 
-        if (fs_lseek(fd, off, PSP_SEEK_SET) != off) return -1;
-        if (read_full(fd, h, 8) != 8) return -1;
+        if (read_at(user, off, h, 8) != 8) return -1;
         size = rd32(h);
         memcpy(type, h + 4, 4);
         type[4] = '\0';
         if (size == 1) {
-            if (read_full(fd, h + 8, 8) != 8) return -1;
+            if (read_at(user, off + 8, h + 8, 8) != 8) return -1;
             size = rd64(h + 8);
             hdr = 16;
         } else if (size == 0) {
@@ -569,48 +571,31 @@ static int find_moov(SceUID fd, int64_t file_size, int64_t *out_off,
     return -1;
 }
 
-Mp4Track *mp4_track_open(const char *path)
+static Mp4Track *open_source(Mp4ReadAt read_at, void *user, int64_t file_size,
+                              const char *path)
 {
-    SceUID fd;
-    int64_t file_size;
     int64_t moov_off = 0;
     uint64_t moov_size = 0;
     size_t moov_hdr = 8;
     unsigned char *buf = NULL;
     Mp4Track *t = NULL;
-
-    if (!path) return NULL;
-    fd = fs_open(path, PSP_O_RDONLY, 0777);
-    if (fd < 0) {
-        logLine("mp4: open failed '%s' rc=0x%08X\n", path, fd);
-        return NULL;
-    }
-    file_size = fs_lseek(fd, 0, PSP_SEEK_END);
     if (file_size <= 16 ||
-        find_moov(fd, file_size, &moov_off, &moov_size, &moov_hdr) != 0) {
-        logLine("mp4: no moov '%s' size=%d\n", path, (int)file_size);
-        fs_close(fd);
+        find_moov(read_at, user, file_size, &moov_off, &moov_size, &moov_hdr) != 0)
         return NULL;
-    }
     if (moov_size == 0 || moov_size > MP4_MAX_MOOV) {
         logLine("mp4: bad moov size=%u\n", (unsigned)moov_size);
-        fs_close(fd);
         return NULL;
     }
 
     buf = (unsigned char *)malloc((size_t)moov_size);
     if (!buf) {
-        fs_close(fd);
         return NULL;
     }
-    if (fs_lseek(fd, moov_off, PSP_SEEK_SET) != moov_off ||
-        read_full(fd, buf, (int)moov_size) != (int)moov_size) {
+    if (read_at(user, moov_off, buf, (int)moov_size) != (int)moov_size) {
         logLine("mp4: moov read failed '%s'\n", path);
         free(buf);
-        fs_close(fd);
         return NULL;
     }
-    fs_close(fd);
 
     t = (Mp4Track *)calloc(1, sizeof(Mp4Track));
     if (!t) {
@@ -636,6 +621,35 @@ Mp4Track *mp4_track_open(const char *path)
             path, t->kind, t->sample_count, t->chunk_count, t->timescale,
             t->rate, t->ch, t->bps, t->asc_len);
     return t;
+}
+
+static int reader_read_at(void *user, int64_t offset, void *out, int count)
+{
+    return audio_reader_read_at(user, offset, out, count);
+}
+
+Mp4Track *mp4_track_open_reader(AudioReader *reader)
+{
+    const AudioSourceSnapshot *source = audio_reader_source(reader);
+    if (!source) return NULL;
+    return open_source(reader_read_at, reader, source->content_length, source->path);
+}
+
+Mp4Track *mp4_track_open(const char *path)
+{
+    SceUID fd;
+    int64_t size;
+    Mp4Track *track;
+    if (!path) return NULL;
+    fd = fs_open(path, PSP_O_RDONLY, 0777);
+    if (fd < 0) return NULL;
+    size = fs_lseek(fd, 0, PSP_SEEK_END);
+    track = open_source(file_read_at, &fd, size, path);
+    if (fs_close(fd) < 0) {
+        mp4_track_close(track);
+        return NULL;
+    }
+    return track;
 }
 
 void mp4_track_close(Mp4Track *t)

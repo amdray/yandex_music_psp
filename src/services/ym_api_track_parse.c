@@ -88,7 +88,6 @@ int ym_api_parse_track_from_object_for_album(cJSON *track_obj,
     cJSON *albums_node;
     cJSON *cover_node;
     cJSON *version_node;
-    cJSON *background_video_node;
     cJSON *genre_node;
     cJSON *year_node;
     cJSON *explicit_node;
@@ -114,6 +113,21 @@ int ym_api_parse_track_from_object_for_album(cJSON *track_obj,
 
     memset(entry, 0, sizeof(TrackEntry));
     entry->available = 1;
+
+    /* Server track metadata uses #RRGGBB; UI colors are ABGR. */
+    {
+        const cJSON *colors = cJSON_GetObjectItemCaseSensitive(track_obj, "derivedColors");
+        const cJSON *accent = cJSON_GetObjectItemCaseSensitive(colors, "accent");
+        if (cJSON_IsString(accent) && accent->valuestring) {
+            const char *text = accent->valuestring;
+            if (text[0] == '#' && strlen(text) == 7 &&
+                strspn(text + 1, "0123456789abcdefABCDEF") == 6) {
+                unsigned int rgb = (unsigned int)strtoul(text + 1, NULL, 16);
+                entry->accent_color = 0xFF000000u | ((rgb & 0xFFu) << 16) |
+                                      (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu);
+            }
+        }
+    }
 
     title_node = cJSON_GetObjectItemCaseSensitive(track_obj, "title");
     if (title_node && cJSON_IsString(title_node) && title_node->valuestring) {
@@ -229,15 +243,6 @@ int ym_api_parse_track_from_object_for_album(cJSON *track_obj,
     }
 
     version_node = cJSON_GetObjectItemCaseSensitive(track_obj, "version");
-    background_video_node = cJSON_GetObjectItemCaseSensitive(track_obj, "backgroundVideoUri");
-    if (background_video_node && cJSON_IsString(background_video_node) &&
-        background_video_node->valuestring) {
-        strncpy(entry->background_video_uri,
-                background_video_node->valuestring,
-                sizeof(entry->background_video_uri) - 1);
-        entry->background_video_uri[sizeof(entry->background_video_uri) - 1] = '\0';
-    }
-
     if (version_node && cJSON_IsString(version_node) && version_node->valuestring) {
         strncpy(entry->version, version_node->valuestring, sizeof(entry->version) - 1);
         entry->version[sizeof(entry->version) - 1] = '\0';

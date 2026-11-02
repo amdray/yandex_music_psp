@@ -47,7 +47,9 @@ void cover_manager_set_loaded_callback(CoverLoadedCallback callback, void *user_
 void cover_manager_set_browsing_active(int active);
 int cover_manager_is_browsing_active(void);
 
-void cover_manager_pause_network(void);
-void cover_manager_resume_network(void);
+/* A zero-initialized ownership flag belongs to one audio job. Transfer it
+ * with that job; releasing it twice is harmless. Do not share it between jobs. */
+void cover_manager_pause_network(int *held);
+void cover_manager_resume_network(int *held);
 
 #endif

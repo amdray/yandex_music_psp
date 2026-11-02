@@ -44,12 +44,16 @@ typedef enum SplashState {
     SPLASH_STATE_AUTH_START,
     SPLASH_STATE_AUTH_WAIT,
     SPLASH_STATE_AUTH_ERROR,
+    SPLASH_STATE_WAVE_WAIT,
     SPLASH_STATE_READY
 } SplashState;
 
 typedef struct SplashFlow {
     const char *status;
     int ready;
+    int playback_resume_requested;
+    unsigned int wave_request_id;
+    int restore_position_ms;
     SplashState state;
     char token[256];
     u64 wlan_check_at_us;

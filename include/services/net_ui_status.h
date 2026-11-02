@@ -19,7 +19,7 @@ typedef struct NetUiStatusSnapshot {
     int strength_valid;
     int hold;
     int wlan_on;
-    unsigned int download_alpha;
+    unsigned int activity_alpha;
 } NetUiStatusSnapshot;
 
 void net_ui_status_init(void);

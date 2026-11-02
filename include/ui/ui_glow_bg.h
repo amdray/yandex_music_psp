@@ -1,11 +1,12 @@
 #ifndef YM_UI_GLOW_BG_H
 #define YM_UI_GLOW_BG_H
 
+#include <stddef.h>
 #include "services/locale.h"
 
 // Светящийся фон как в Яндекс Музыке (vibe-визуализация).
-// CPU генерирует текстуру 240x136, GU растягивает до 480x272
-// с LINEAR-фильтром и alpha-блендом (мягкое свечение).
+// Встроенные плагины в src/ui/glow: сетка цветов вершин либо текстура
+// 240x136 с растяжением до 480x272.
 // Реагирует на воспроизведение (яркость/скорость), лайк (тёплый оттенок)
 // и смену трека (пульс).
 //
@@ -19,7 +20,9 @@
 #define GLOW_STYLE_SPECTRUM 3   // анализатор: столбики + колпачки
 #define GLOW_STYLE_SCOPE 4      // осциллограф
 #define GLOW_STYLE_RADIAL 5     // лучи от центра по спектру
-#define GLOW_STYLE_COUNT 6
+#define GLOW_STYLE_OFF 6
+#define GLOW_STYLE_ACCENT 7
+#define GLOW_STYLE_COUNT 8
 #define GLOW_STYLE_DEFAULT GLOW_STYLE_WEB
 
 void glow_bg_init(void);
@@ -36,13 +39,22 @@ void glow_bg_set_style(int style);
 int glow_bg_get_style(void);
 LocaleKey glow_bg_style_name_key(int style);
 
-// Подложка под текст: тёмная мягкая плашка в прямоугольнике (x,y,w,h), сила
-// которой растёт с яркостью фона под ней (чтобы серый текст не сливался со
-// свечением). Вызывать после glow_bg_draw, до отрисовки текста.
-void glow_bg_text_scrim(float x, float y, float w, float h);
+// Акцентный режим и «Классика» включают подложку при близости входных цветов
+// к тексту. В анимированных режимах её сила зависит от яркости области.
+// Границы содержимого имеют полную плотность; край затухает снаружи.
+typedef struct UiGlowTextRegion {
+    float left, top, right, bottom;
+    float feather;
+} UiGlowTextRegion;
+
+// Вызывать после glow_bg_draw, до отрисовки текста; feather должен быть > 0.
+void glow_bg_text_scrim(const UiGlowTextRegion *region,
+                       const unsigned int *text_colors, size_t color_count);
 
 // Палитра из обложки (как в Яндексе): акцент/вторичный/средний/база.
 // rgba — декодированная обложка RGBA8888; вызывать при её загрузке.
 void glow_bg_set_cover(const void *rgba, int w, int h, int stride_bytes);
+/* Server accent in ABGR; zero means the track has no server color. */
+void glow_bg_set_accent(unsigned int color);
 
 #endif

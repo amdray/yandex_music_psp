@@ -6,15 +6,15 @@
 
 #include "services/net_activity.h"
 
-#define DOWNLOAD_HOLD_US 100000ULL
-#define DOWNLOAD_FADE_US 300000ULL
+#define ACTIVITY_HOLD_US 100000ULL
+#define ACTIVITY_FADE_US 300000ULL
 
 static NetUiStatusSnapshot s_status;
 static unsigned int s_info_generation;
 static int s_info_attempted;
 static unsigned long long s_strength_next_us;
-static unsigned int s_seen_body_epoch;
-static unsigned long long s_download_last_active_us;
+static unsigned int s_seen_transfer_epoch;
+static unsigned long long s_network_last_active_us;
 
 void net_ui_status_init(void)
 {
@@ -23,14 +23,14 @@ void net_ui_status_init(void)
     s_info_generation = 0;
     s_info_attempted = 0;
     s_strength_next_us = 0;
-    s_seen_body_epoch = 0;
-    s_download_last_active_us = 0;
+    s_seen_transfer_epoch = 0;
+    s_network_last_active_us = 0;
 }
 
 void net_ui_status_update(int hold, int wlan_on)
 {
     NetStackSnapshot link;
-    NetActivitySnapshot activity;
+    unsigned int activity_epoch;
     unsigned long long now = sceKernelGetSystemTimeWide();
 
     s_status.hold = hold ? 1 : 0;
@@ -75,27 +75,26 @@ void net_ui_status_update(int hold, int wlan_on)
                 ? NET_UI_STUCK : NET_UI_RECOVERING;
     }
 
-    net_activity_get_snapshot(&activity);
-    if (activity.active_response_count != 0U ||
-        activity.body_activity_epoch != s_seen_body_epoch) {
-        s_seen_body_epoch = activity.body_activity_epoch;
-        s_download_last_active_us = now;
-        s_status.download_alpha = 255U;
-    } else if (s_download_last_active_us != 0) {
-        unsigned long long elapsed = now - s_download_last_active_us;
-        if (elapsed <= DOWNLOAD_HOLD_US) {
-            s_status.download_alpha = 255U;
-        } else if (elapsed < DOWNLOAD_HOLD_US + DOWNLOAD_FADE_US) {
+    activity_epoch = net_activity_get_epoch();
+    if (activity_epoch != s_seen_transfer_epoch) {
+        s_seen_transfer_epoch = activity_epoch;
+        s_network_last_active_us = now;
+        s_status.activity_alpha = 255U;
+    } else if (s_network_last_active_us != 0) {
+        unsigned long long elapsed = now - s_network_last_active_us;
+        if (elapsed <= ACTIVITY_HOLD_US) {
+            s_status.activity_alpha = 255U;
+        } else if (elapsed < ACTIVITY_HOLD_US + ACTIVITY_FADE_US) {
             unsigned long long remaining =
-                DOWNLOAD_HOLD_US + DOWNLOAD_FADE_US - elapsed;
-            s_status.download_alpha =
-                (unsigned int)((remaining * 255ULL) / DOWNLOAD_FADE_US);
+                ACTIVITY_HOLD_US + ACTIVITY_FADE_US - elapsed;
+            s_status.activity_alpha =
+                (unsigned int)((remaining * 255ULL) / ACTIVITY_FADE_US);
         } else {
-            s_download_last_active_us = 0;
-            s_status.download_alpha = 0U;
+            s_network_last_active_us = 0;
+            s_status.activity_alpha = 0U;
         }
     } else {
-        s_status.download_alpha = 0U;
+        s_status.activity_alpha = 0U;
     }
 }
 

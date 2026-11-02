@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <jpeglib.h>
+#include <jerror.h>
 #include <png.h>
 
 #include "core/fs.h"
@@ -59,7 +60,7 @@ static int jpeg_decode_context_cleanup(JpegDecodeContext *ctx)
 {
     int result;
 
-    if (!ctx) return -1;
+    if (!ctx) return IMAGE_ERR_ARGUMENT;
     result = ctx->result;
     if (ctx->create_started) {
         jpeg_destroy_decompress(&ctx->cinfo);
@@ -74,18 +75,19 @@ static int jpeg_decode_context_cleanup(JpegDecodeContext *ctx)
 static int read_file_to_buffer_from_fd(SceUID fd, u8 **out_buf, size_t *out_size)
 {
     if (fd < 0 || !out_buf || !out_size) {
-        return -1;
+        return IMAGE_ERR_ARGUMENT;
     }
 
     // Get current position (after header read)
     SceOff current_pos = fs_lseek(fd, 0, PSP_SEEK_CUR);
     SceOff file_size = fs_lseek(fd, 0, PSP_SEEK_END);
-    fs_lseek(fd, current_pos, PSP_SEEK_SET);
+    if (current_pos < 0 || file_size < current_pos ||
+        fs_lseek(fd, current_pos, PSP_SEEK_SET) < 0) return IMAGE_ERR_IO;
     
     size_t remaining_size = (size_t)(file_size - current_pos);
     if (remaining_size == 0 || remaining_size > 10 * 1024 * 1024) {
         logLine("image: invalid file size %zu\n", remaining_size);
-        return -1;
+        return IMAGE_ERR_UNSUPPORTED;
     }
 
     u8 *buffer = (u8 *)malloc(remaining_size);
@@ -93,14 +95,14 @@ static int read_file_to_buffer_from_fd(SceUID fd, u8 **out_buf, size_t *out_size
         int maxFree = sceKernelMaxFreeMemSize();
         logLine("image: alloc failed %zu bytes (max_free=%d)\n", 
                 remaining_size, maxFree);
-        return -1;
+        return IMAGE_ERR_NO_MEMORY;
     }
 
     int read_size = fs_read(fd, buffer, remaining_size);
     if (read_size != (int)remaining_size) {
         logLine("image: read failed %d != %zu\n", read_size, remaining_size);
         free(buffer);
-        return -1;
+        return IMAGE_ERR_IO;
     }
 
     *out_buf = buffer;
@@ -120,28 +122,34 @@ static int load_jpeg_rgba(SceUID fd, const char *path, void **out_data, int *out
     size_t row_stride;
 
     if (fd < 0) {
-        return -1;
+        return IMAGE_ERR_ARGUMENT;
     }
 
     ctx = (JpegDecodeContext *)calloc(1, sizeof(*ctx));
     if (!ctx) {
         logLine("image: jpeg context alloc failed\n");
-        return -1;
+        return IMAGE_ERR_NO_MEMORY;
     }
-    ctx->result = -1;
+    ctx->result = IMAGE_ERR_DECODE;
 
     // Reset to beginning (header was already read)
-    fs_lseek(fd, 0, PSP_SEEK_SET);
-
-    if (read_file_to_buffer_from_fd(fd, &ctx->jpeg_buf, &ctx->jpeg_size) != 0) {
+    if (fs_lseek(fd, 0, PSP_SEEK_SET) < 0) {
+        ctx->result = IMAGE_ERR_IO;
         goto cleanup;
     }
+
+    ctx->result = read_file_to_buffer_from_fd(fd, &ctx->jpeg_buf, &ctx->jpeg_size);
+    if (ctx->result != IMAGE_OK) {
+        goto cleanup;
+    }
+    ctx->result = IMAGE_ERR_DECODE;
 
     ctx->cinfo.err = jpeg_std_error(&ctx->error.pub);
     ctx->error.pub.error_exit = jpeg_error_exit;
 
     if (setjmp(ctx->error.setjmp_buffer)) {
-        ctx->result = -1;
+        ctx->result = ctx->error.pub.msg_code == JERR_OUT_OF_MEMORY
+                          ? IMAGE_ERR_NO_MEMORY : IMAGE_ERR_DECODE;
         if (ctx->jpeg_size >= 8) {
             if (ctx->jpeg_buf[0] == 0x89 && ctx->jpeg_buf[1] == 0x50 &&
                 ctx->jpeg_buf[2] == 0x4E && ctx->jpeg_buf[3] == 0x47) {
@@ -180,6 +188,7 @@ static int load_jpeg_rgba(SceUID fd, const char *path, void **out_data, int *out
     width = ctx->cinfo.output_width;
     height = ctx->cinfo.output_height;
     if (width <= 0 || height <= 0 || width > 2048 || height > 2048) {
+        ctx->result = IMAGE_ERR_UNSUPPORTED;
         logLine("image: jpeg invalid size %dx%d\n", width, height);
         goto cleanup;
     }
@@ -198,6 +207,7 @@ static int load_jpeg_rgba(SceUID fd, const char *path, void **out_data, int *out
     }
     ctx->rgba_buf = (u8 *)memalign(16, rgba_size);
     if (!ctx->rgba_buf) {
+        ctx->result = IMAGE_ERR_NO_MEMORY;
         int maxFree = sceKernelMaxFreeMemSize();
         logLine("image: jpeg rgba alloc failed %dx%d (%zu bytes, max_free=%d)\n", 
                 aligned_w, aligned_h, rgba_size, maxFree);
@@ -214,6 +224,7 @@ static int load_jpeg_rgba(SceUID fd, const char *path, void **out_data, int *out
     }
     ctx->row_buffer = (u8 *)malloc(row_stride);
     if (!ctx->row_buffer) {
+        ctx->result = IMAGE_ERR_NO_MEMORY;
         logLine("image: row buffer alloc failed\n");
         goto cleanup;
     }
@@ -262,13 +273,34 @@ cleanup:
     return jpeg_decode_context_cleanup(ctx);
 }
 
+typedef struct {
+    SceUID fd;
+    volatile int *result;
+} PngReadContext;
+
+static png_voidp image_png_malloc(png_structp png_ptr, png_alloc_size_t size)
+{
+    void *memory = malloc(size);
+    if (!memory) {
+        volatile int *result = png_get_mem_ptr(png_ptr);
+        if (result) *result = IMAGE_ERR_NO_MEMORY;
+    }
+    return memory;
+}
+
+static void image_png_free(png_structp png_ptr, png_voidp memory)
+{
+    (void)png_ptr;
+    free(memory);
+}
+
 static void png_read_fn(png_structp png_ptr, png_bytep data, png_size_t length)
 {
-    void *io_ptr = png_get_io_ptr(png_ptr);
-    SceUID *fd_ptr = (SceUID *)io_ptr;
-    if (*fd_ptr >= 0) {
-        int read_size = fs_read(*fd_ptr, data, (size_t)length);
+    PngReadContext *context = png_get_io_ptr(png_ptr);
+    if (context->fd >= 0) {
+        int read_size = fs_read(context->fd, data, (size_t)length);
         if (read_size != (int)length) {
+            *context->result = IMAGE_ERR_IO;
             png_error(png_ptr, "Read error");
         }
     }
@@ -278,45 +310,49 @@ static int load_png_rgba(SceUID fd, const char *path, void **out_data, int *out_
 {
     (void)path;  // Unused, kept for consistency with load_jpeg_rgba signature
     if (fd < 0) {
-        return -1;
+        return IMAGE_ERR_ARGUMENT;
     }
 
     // Reset to beginning (header was already read)
-    fs_lseek(fd, 0, PSP_SEEK_SET);
+    if (fs_lseek(fd, 0, PSP_SEEK_SET) < 0) return IMAGE_ERR_IO;
 
     // Read PNG signature (8 bytes) - already read in detect, but verify
     u8 sig[8];
     int read_size = fs_read(fd, sig, 8);
-    if (read_size != 8 || !png_check_sig(sig, 8)) {
+    if (read_size != 8) return IMAGE_ERR_IO;
+    if (!png_check_sig(sig, 8)) {
         logLine("image: png invalid signature\n");
-        return -1;
+        return IMAGE_ERR_INVALID_DATA;
     }
 
-    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    volatile int result = IMAGE_ERR_DECODE;
+    PngReadContext context = {fd, &result};
+    png_structp png_ptr = png_create_read_struct_2(PNG_LIBPNG_VER_STRING,
+        NULL, NULL, NULL, (void *)&result, image_png_malloc, image_png_free);
     if (!png_ptr) {
         logLine("image: png create read struct failed\n");
-        return -1;
+        return IMAGE_ERR_NO_MEMORY;
     }
 
     png_infop info_ptr = png_create_info_struct(png_ptr);
     if (!info_ptr) {
         logLine("image: png create info struct failed\n");
         png_destroy_read_struct(&png_ptr, NULL, NULL);
-        return -1;
+        return IMAGE_ERR_NO_MEMORY;
     }
 
-    volatile u8 *rgba_buf_v = NULL;
-    volatile png_bytep *row_pointers_v = NULL;
+    u8 * volatile rgba_buf_v = NULL;
+    png_bytep * volatile row_pointers_v = NULL;
 
     if (setjmp(png_jmpbuf(png_ptr))) {
         logLine("image: png decode error\n");
         free((void *)row_pointers_v);
         free((void *)rgba_buf_v);
         png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-        return -1;
+        return result;
     }
 
-    png_set_read_fn(png_ptr, &fd, png_read_fn);
+    png_set_read_fn(png_ptr, &context, png_read_fn);
     png_set_sig_bytes(png_ptr, 8);
     png_read_info(png_ptr, info_ptr);
 
@@ -325,7 +361,7 @@ static int load_png_rgba(SceUID fd, const char *path, void **out_data, int *out_
     if (width <= 0 || height <= 0 || width > 2048 || height > 2048) {
         logLine("image: png invalid size %dx%d\n", width, height);
         png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-        return -1;
+        return IMAGE_ERR_UNSUPPORTED;
     }
 
     png_byte color_type = png_get_color_type(png_ptr, info_ptr);
@@ -366,7 +402,7 @@ static int load_png_rgba(SceUID fd, const char *path, void **out_data, int *out_
         logLine("image: png rgba alloc failed %dx%d (%zu bytes, max_free=%d)\n", 
                 aligned_w, aligned_h, needed, maxFree);
         png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-        return -1;
+        return IMAGE_ERR_NO_MEMORY;
     }
     rgba_buf_v = rgba_buf;
     memset(rgba_buf, 0, aligned_row_bytes * aligned_h);
@@ -376,14 +412,14 @@ static int load_png_rgba(SceUID fd, const char *path, void **out_data, int *out_
         logLine("image: png row pointer count overflow\n");
         free(rgba_buf);
         png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-        return -1;
+        return IMAGE_ERR_UNSUPPORTED;
     }
     png_bytep *row_pointers = (png_bytep *)malloc(rows_bytes);
     if (!row_pointers) {
         logLine("image: png row pointers alloc failed\n");
         free(rgba_buf);
         png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
-        return -1;
+        return IMAGE_ERR_NO_MEMORY;
     }
     row_pointers_v = row_pointers;
 
@@ -434,28 +470,36 @@ static int detect_image_format_from_header(const u8 *header, size_t header_size)
 
 int image_load_rgba8888(const char *path, void **out_data, int *out_w, int *out_h, int *out_stride_bytes)
 {
+    if (out_data) *out_data = NULL;
+    if (out_w) *out_w = 0;
+    if (out_h) *out_h = 0;
+    if (out_stride_bytes) *out_stride_bytes = 0;
     if (!path || !out_data || !out_w || !out_h) {
-        return -1;
+        return IMAGE_ERR_ARGUMENT;
     }
 
     SceUID fd = fs_open(path, PSP_O_RDONLY, 0);
     if (fd < 0) {
         logLine("image: open failed '%s'\n", path);
-        return -1;
+        return IMAGE_ERR_IO;
     }
 
     // Read header for format detection
     u8 header[8];
-    int read_size = fs_read(fd, header, sizeof(header));
-    if (read_size < 8) {
-        logLine("image: read header failed '%s'\n", path);
-        fs_close(fd);
-        return -1;
+    size_t header_size = 0;
+    while (header_size < sizeof(header)) {
+        int read_size = fs_read(fd, header + header_size, sizeof(header) - header_size);
+        if (read_size <= 0) {
+            logLine("image: read header failed '%s'\n", path);
+            fs_close(fd);
+            return read_size < 0 ? IMAGE_ERR_IO : IMAGE_ERR_INVALID_DATA;
+        }
+        header_size += (size_t)read_size;
     }
 
     // Detect format by file signature (more reliable than extension)
     int format = detect_image_format_from_header(header, sizeof(header));
-    int result = -1;
+    int result = IMAGE_ERR_UNSUPPORTED;
 
     if (format == 1) {
         result = load_png_rgba(fd, path, out_data, out_w, out_h, out_stride_bytes);

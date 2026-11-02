@@ -60,7 +60,8 @@ void net_client_track_store_unlock(void);
 void net_client_track_window_focus(struct AppState *state, const char *token, int focus);
 /* То же, но гидратирует только span строк (быстрый первый экран гейта;
  * полный obtained окном доберёт обычный update). */
-void net_client_track_window_focus_span(struct AppState *state, const char *token,
+/* 1 already ready, 0 pending, -1 failed; does not change membership status. */
+int net_client_track_window_focus_span(struct AppState *state, const char *token,
                                         int focus, int span);
 
 /* 1 when rows [pos, pos+span) are hydrated (span clamped to the list end).

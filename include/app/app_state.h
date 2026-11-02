@@ -9,6 +9,7 @@
 #include "app/track.h"
 #include "app/artist.h"
 #include "services/list_index.h"
+#include "services/ym_api.h"
 
 typedef enum ScreenId {
     SCREEN_SPLASH = 0,
@@ -24,10 +25,12 @@ typedef enum ScreenId {
     SCREEN_NET_INFO,
     SCREEN_DEVICE_LOGIN,
     SCREEN_EQ,
-    SCREEN_WAVE,
     SCREEN_SEARCH,
     SCREEN_HELP,
     SCREEN_MEMORY,
+    SCREEN_SETTINGS_PLAYBACK,
+    SCREEN_SETTINGS_DISPLAY,
+    SCREEN_SETTINGS_DIAGNOSTICS,
     SCREEN_COUNT
 } ScreenId;
 
@@ -55,20 +58,17 @@ typedef enum AppResourceMode {
    no entering a screen whose visible content is not loaded yet). */
 #define TRACK_LIST_VISIBLE_ROWS 5
 
-/* Hydrated rows kept in RAM around the focus position. Everything outside
-   the window lives as an id only; rows re-hydrate from the metadata store
-   (or one POST /tracks) when the window slides over them. */
-#define TRACK_WINDOW_CAPACITY 48
+/* One network batch of presentation rows around focus; shared metadata has
+   its own retention policy independent of this presentation window. */
+#define TRACK_WINDOW_CAPACITY YM_API_HYDRATE_MAX
 
-/* Cursor anchor of a previously visited playlist: navigation identity is the
-   track id, never the ordinal — an external edit shifts positions, so on
-   re-entry the id is re-located (pos is just the scan hint / removal
-   fallback). One slot per playlist uuid, LRU-less rolling table. */
+/* Per-playlist cursor: requested release and occurrence within the composition. */
 #define TRACK_ANCHOR_CAPACITY 32
 
 typedef struct TrackAnchor {
     char uuid[48];
-    char track_id[40];
+    TrackRef ref;
+    int occurrence;
     int pos;
 } TrackAnchor;
 
@@ -88,20 +88,20 @@ typedef struct TrackBootstrapState {
     int error_code;
 } TrackBootstrapState;
 
-/* The open list: the full id order (cheap, grows unbounded) plus a hydrated
-   window of full TrackEntry rows around the focus. Guarded by the track-store
-   mutex; the window is filled by the hydrator sink on its worker thread. */
-typedef struct TrackRuntimeStorage {
-    ListIndexId *ids;   /* id order of the open list */
-    int ids_capacity;
-    int count;          /* ids populated so far */
-    int ids_complete;   /* 1 when count is the final list length */
+/* Complete membership is independent of viewport metadata. */
+typedef struct TrackListContext {
+    TrackRef *refs;
+    int capacity;
+    int count;
+    int complete;
+    int revision;
+} TrackListContext;
 
-    TrackEntry window[TRACK_WINDOW_CAPACITY];
-    unsigned char window_valid[TRACK_WINDOW_CAPACITY];
-    int window_start;   /* list position of window[0] */
-} TrackRuntimeStorage;
-
+typedef struct TrackListWindow {
+    TrackEntry rows[TRACK_WINDOW_CAPACITY];
+    unsigned char valid[TRACK_WINDOW_CAPACITY];
+    int start;
+} TrackListWindow;
 typedef struct PlaylistLoadState {
     int generation;
     PlaylistLoadStatus status;
@@ -117,6 +117,9 @@ typedef struct AppState {
     AppResourceMode resource_mode;
     int menu_index;
     int settings_index;
+    int playback_settings_index;
+    int display_settings_index;
+    int diagnostics_settings_index;
     u32 splash_start_ms;
     u64 ui_now_us;
 
@@ -142,7 +145,8 @@ typedef struct AppState {
     // Track UI / bootstrap / runtime storage split
     TrackUiState track_ui;
     TrackBootstrapState track_boot;
-    TrackRuntimeStorage track_store;
+    TrackListContext track_context;
+    TrackListWindow track_window;
     
     // Now Playing
     TrackEntry now_playing_track;  // Full track info for now playing screen
@@ -181,7 +185,7 @@ void app_state_reset_track_bootstrap(AppState *state, int playlist_kind,
                                      int playlist_selected_index,
                                      const char *playlist_uuid,
                                      const char *playlist_title);
-void app_state_anchor_save(AppState *state, const char *uuid, const char *track_id, int pos);
+void app_state_anchor_save(AppState *state, const char *uuid, int pos);
 const TrackAnchor *app_state_anchor_find(const AppState *state, const char *uuid);
 void app_state_cancel_track_bootstrap(AppState *state);
 void app_state_reset(AppState *state, ScreenId screen);

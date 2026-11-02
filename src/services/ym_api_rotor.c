@@ -4,47 +4,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include <cjson/cJSON.h>
-#include "services/libc_guard.h"
+#include "core/json.h"
+#include <sys/select.h>
+#include <curl/curl.h>
 
 #include "core/logger.h"
+#include "core/time_format.h"
 #include "services/api_parser.h"
-#include "services/list_index.h"
+
 #include "services/net_http.h"
 #include "services/ym_api_track_parse.h"
 
 #define ROTOR_HOST "https://api.music.yandex.net"
-
-int ym_api_rotor_timestamp_utc(char *out, size_t out_size)
-{
-    time_t now;
-    struct tm *parts;
-    int written;
-
-    if (!out || out_size < YM_ROTOR_TIMESTAMP_SIZE) {
-        return -1;
-    }
-    now = time(NULL);
-    if (now <= 0) {
-        snprintf(out, out_size, "1970-01-01T00:00:00.000Z");
-        return 1;
-    }
-    parts = gmtime(&now);
-    if (!parts) {
-        snprintf(out, out_size, "1970-01-01T00:00:00.000Z");
-        return 1;
-    }
-    written = snprintf(out, out_size,
-                       "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
-                       parts->tm_year + 1900, parts->tm_mon + 1, parts->tm_mday,
-                       parts->tm_hour, parts->tm_min, parts->tm_sec);
-    if (written <= 0 || (size_t)written >= out_size) {
-        return -1;
-    }
-    return 0;
-}
 
 int ym_api_rotor_composite_id(const char *track_id, int album_id,
                               char *out, size_t out_size)
@@ -61,38 +34,6 @@ int ym_api_rotor_composite_id(const char *track_id, int album_id,
         }
         return -1;
     }
-    return 0;
-}
-
-static int rotor_url_encode_component(const char *in, char *out, size_t out_size)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    size_t used = 0;
-
-    if (!in || !out || out_size == 0) {
-        return -1;
-    }
-    while (*in) {
-        unsigned char c = (unsigned char)*in++;
-        int plain = ((c >= 'A' && c <= 'Z') ||
-                     (c >= 'a' && c <= 'z') ||
-                     (c >= '0' && c <= '9') ||
-                     c == '-' || c == '_' || c == '.' || c == '~');
-        if (plain) {
-            if (used + 1 >= out_size) {
-                return -1;
-            }
-            out[used++] = (char)c;
-        } else {
-            if (used + 3 >= out_size) {
-                return -1;
-            }
-            out[used++] = '%';
-            out[used++] = hex[(c >> 4) & 0x0F];
-            out[used++] = hex[c & 0x0F];
-        }
-    }
-    out[used] = '\0';
     return 0;
 }
 
@@ -276,6 +217,74 @@ static int rotor_parse_sequence(cJSON *result_obj, const char *batch_id,
     return 0;
 }
 
+static int rotor_parse_session_response(NetHttpResponse *resp, int include_context,
+                                         YmRotorSessionInfo *out_session,
+                                         YmRotorSequenceItem *out_items,
+                                         int max_items, int *out_count)
+{
+    YmRotorSessionInfo session = {0};
+    int count = 0;
+    if (resp->status_code != 200 || !resp->body || resp->body_size <= 0) {
+        int verdict = rotor_status_verdict(resp->status_code);
+        logLine("ym_rotor: session response status=%d\n", resp->status_code);
+        net_http_response_free(resp);
+        return verdict;
+    }
+    cJSON *root = ym_json_parse_len(resp->body, (size_t)resp->body_size, NULL);
+    net_http_response_free(resp);
+    if (!root) return YM_ROTOR_ERR;
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
+    if (!cJSON_IsObject(result) ||
+        rotor_copy_id_node(cJSON_GetObjectItemCaseSensitive(result, "radioSessionId"),
+                           session.radio_session_id, sizeof(session.radio_session_id),
+                           "radioSessionId") != 0 ||
+        rotor_copy_id_node(cJSON_GetObjectItemCaseSensitive(result, "batchId"),
+                           session.batch_id, sizeof(session.batch_id), "batchId") != 0)
+        goto fail;
+    session.terminated = rotor_bool_node(cJSON_GetObjectItemCaseSensitive(result, "terminated"));
+    session.interactive = rotor_bool_node(cJSON_GetObjectItemCaseSensitive(result, "interactive"));
+    if (include_context) {
+        cJSON *wave = cJSON_GetObjectItemCaseSensitive(result, "wave");
+        cJSON *seeds = cJSON_GetObjectItemCaseSensitive(wave, "seeds");
+        int n = cJSON_GetArraySize(seeds);
+        if (!cJSON_IsArray(seeds) || n <= 0 || n > YM_ROTOR_SEEDS_MAX) goto fail;
+        for (int i = 0; i < n; ++i) {
+            if (rotor_copy_id_node(cJSON_GetArrayItem(seeds, i),
+                                   session.context.seeds[i], YM_ROTOR_SEED_SIZE,
+                                   "wave.seeds") != 0) goto fail;
+        }
+        session.context.seed_count = n;
+        session.context.include_wave_model = 1;
+    }
+    if (rotor_parse_sequence(result, session.batch_id, out_items, max_items, &count) != 0 ||
+        session.terminated || count <= 0) goto fail;
+    *out_session = session;
+    if (out_count) *out_count = count;
+    cJSON_Delete(root);
+    return YM_ROTOR_OK;
+fail:
+    cJSON_Delete(root);
+    return YM_ROTOR_ERR;
+}
+
+static int rotor_append_queue(char *payload, size_t size, int used,
+                               const char *const *queue, int queue_count)
+{
+    char escaped[128];
+    int total = queue && queue_count > 0 ? queue_count : 0;
+    if (total > YM_ROTOR_QUEUE_MAX) total = YM_ROTOR_QUEUE_MAX;
+    for (int i = 0; i < total; ++i) {
+        if (!queue[i] || !queue[i][0]) continue;
+        rotor_json_escape(queue[i], escaped, sizeof(escaped));
+        int added = snprintf(payload + used, size - (size_t)used,
+                             "%s\"%s\"", i > 0 ? "," : "", escaped);
+        if (added < 0 || (size_t)added >= size - (size_t)used) return -1;
+        used += added;
+    }
+    int added = snprintf(payload + used, size - (size_t)used, "]}");
+    return added < 0 || (size_t)added >= size - (size_t)used ? -1 : used + added;
+}
+
 int ym_api_rotor_session_new(YmApiContext *ctx,
                              const char *const *seeds, int seed_count,
                              int include_wave_model,
@@ -287,10 +296,6 @@ int ym_api_rotor_session_new(YmApiContext *ctx,
     char payload[1024];
     char escaped[YM_ROTOR_SEED_SIZE * 2 + 16];
     NetHttpResponse resp;
-    cJSON *root = NULL;
-    cJSON *result_obj = NULL;
-    YmRotorSessionInfo session;
-    int parsed_count = 0;
     int payload_len;
     int seed_index;
     int seed_total;
@@ -302,8 +307,6 @@ int ym_api_rotor_session_new(YmApiContext *ctx,
         !out_items || max_items <= 0) {
         return -1;
     }
-    memset(&session, 0, sizeof(session));
-
     payload_len = snprintf(payload, sizeof(payload),
                            "{\"includeTracksInResponse\":true,"
                            "\"includeWaveModel\":%s,"
@@ -346,58 +349,44 @@ int ym_api_rotor_session_new(YmApiContext *ctx,
             return rotor_transport_verdict(post_rc);
         }
     }
-    if (resp.status_code != 200 || !resp.body || resp.body_size <= 0) {
-        int verdict = rotor_status_verdict(resp.status_code);
-        logLine("ym_rotor: session/new bad status=%d\n", resp.status_code);
-        net_http_response_free(&resp);
-        return verdict;
-    }
+    return rotor_parse_session_response(&resp, 0, out_session, out_items,
+                                         max_items, out_count);
+}
 
-    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
-    net_http_response_free(&resp);
-    if (!root) {
-        logLine("ym_rotor: session/new parse failed\n");
-        return -1;
-    }
-    result_obj = cJSON_GetObjectItemCaseSensitive(root, "result");
-    if (!cJSON_IsObject(result_obj)) {
-        logLine("ym_rotor: session/new no result object\n");
-        cJSON_Delete(root);
-        return -1;
-    }
-    if (rotor_copy_id_node(cJSON_GetObjectItemCaseSensitive(result_obj, "radioSessionId"),
-                           session.radio_session_id,
-                           sizeof(session.radio_session_id),
-                           "radioSessionId") != 0 ||
-        rotor_copy_id_node(cJSON_GetObjectItemCaseSensitive(result_obj, "batchId"),
-                           session.batch_id, sizeof(session.batch_id),
-                           "batchId") != 0) {
-        cJSON_Delete(root);
-        return -1;
-    }
-    session.terminated = rotor_bool_node(
-        cJSON_GetObjectItemCaseSensitive(result_obj, "terminated"));
-    session.interactive = rotor_bool_node(
-        cJSON_GetObjectItemCaseSensitive(result_obj, "interactive"));
-    if (rotor_parse_sequence(result_obj, session.batch_id,
-                             out_items, max_items, &parsed_count) != 0) {
-        cJSON_Delete(root);
-        return -1;
-    }
-    cJSON_Delete(root);
-
-    if (session.terminated || parsed_count <= 0) {
-        logLine("ym_rotor: session/new unusable terminated=%d tracks=%d\n",
-                session.terminated, parsed_count);
-        return -1;
-    }
-    *out_session = session;
-    if (out_count) {
-        *out_count = parsed_count;
-    }
-    logLine("ym_rotor: session/new ok tracks=%d\n", parsed_count);
-    logger_flush();
-    return 0;
+int ym_api_rotor_session_clone(YmApiContext *ctx, const char *radio_session_id,
+                               const char *const *queue, int queue_count,
+                               const char *track_to_start_from,
+                               YmRotorSessionInfo *out_session,
+                               YmRotorSequenceItem *out_items, int max_items,
+                               int *out_count)
+{
+    char url[160], payload[8192], escaped[128];
+    NetHttpResponse resp;
+    if (out_count) *out_count = 0;
+    if (rotor_check_context(ctx) != 0 || !radio_session_id || !radio_session_id[0] ||
+        strlen(radio_session_id) >= YM_ROTOR_SESSION_ID_SIZE ||
+        !queue || queue_count <= 0 || queue_count > YM_ROTOR_QUEUE_MAX ||
+        !track_to_start_from || !track_to_start_from[0] ||
+        !out_session || !out_items || max_items <= 0) return YM_ROTOR_ERR;
+    snprintf(url, sizeof(url), ROTOR_HOST "/rotor/session/%s/clone", radio_session_id);
+    rotor_json_escape(track_to_start_from, escaped, sizeof(escaped));
+    int used = snprintf(payload, sizeof(payload),
+                        "{\"includeTracksInResponse\":true,\"includeWaveModel\":true,"
+                        "\"interactive\":false,\"trackToStartFrom\":\"%s\","
+                        "\"sessions\":[],\"queue\":[", escaped);
+    if (used < 0 || (size_t)used >= sizeof(payload) ||
+        rotor_append_queue(payload, sizeof(payload), used, queue, queue_count) < 0)
+        return YM_ROTOR_ERR;
+    logLine("ym_rotor: session/clone start queue=%d\n", queue_count);
+    int rc = rotor_post_json(ctx, url, payload, &resp);
+    if (rc != 0) return rotor_transport_verdict(rc);
+    rc = rotor_parse_session_response(&resp, 1, out_session, out_items, max_items, out_count);
+    if (rc == 0 && strcmp(out_items[0].track.id, track_to_start_from) != 0)
+        rc = YM_ROTOR_ERR;
+    logLine("ym_rotor: session/clone result=%d tracks=%d\n", rc,
+            rc == 0 && out_count ? *out_count : 0);
+    if (rc != 0 && out_count) *out_count = 0;
+    return rc;
 }
 
 int ym_api_rotor_session_tracks(YmApiContext *ctx,
@@ -409,14 +398,12 @@ int ym_api_rotor_session_tracks(YmApiContext *ctx,
 {
     char url[160];
     char payload[8192];
-    char escaped[128];
     NetHttpResponse resp;
     cJSON *root = NULL;
     cJSON *result_obj = NULL;
     YmRotorSessionInfo session;
     int parsed_count = 0;
     int payload_len;
-    int queue_index;
     int queue_total;
 
     if (out_count) {
@@ -447,30 +434,8 @@ int ym_api_rotor_session_tracks(YmApiContext *ctx,
     if (queue_total > YM_ROTOR_QUEUE_MAX) {
         queue_total = YM_ROTOR_QUEUE_MAX;
     }
-    for (queue_index = 0; queue_index < queue_total; ++queue_index) {
-        int add_len;
-
-        if (!queue[queue_index] || !queue[queue_index][0]) {
-            continue;
-        }
-        rotor_json_escape(queue[queue_index], escaped, sizeof(escaped));
-        add_len = snprintf(payload + payload_len,
-                           sizeof(payload) - (size_t)payload_len,
-                           "%s\"%s\"",
-                           (queue_index > 0) ? "," : "", escaped);
-        if (add_len < 0 || (size_t)(payload_len + add_len) >= sizeof(payload)) {
-            return -1;
-        }
-        payload_len += add_len;
-    }
-    {
-        int tail_len = snprintf(payload + payload_len,
-                                sizeof(payload) - (size_t)payload_len, "]}");
-        if (tail_len < 0 || (size_t)(payload_len + tail_len) >= sizeof(payload)) {
-            return -1;
-        }
-        payload_len += tail_len;
-    }
+    if (rotor_append_queue(payload, sizeof(payload), payload_len, queue, queue_total) < 0)
+        return -1;
 
     logLine("ym_rotor: session/tracks start queue=%d\n", queue_total);
     {
@@ -486,7 +451,7 @@ int ym_api_rotor_session_tracks(YmApiContext *ctx,
         return verdict;
     }
 
-    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size, NULL);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: session/tracks parse failed\n");
@@ -583,7 +548,7 @@ static int rotor_post_feedback(const YmApiContext *ctx,
         net_http_response_free(&resp);
         return verdict;
     }
-    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size, NULL);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: feedback parse failed\n");
@@ -598,16 +563,6 @@ static int rotor_post_feedback(const YmApiContext *ctx,
     return ok;
 }
 
-static int rotor_feedback_timestamp(char *out, size_t out_size)
-{
-    int ts_rc = ym_api_rotor_timestamp_utc(out, out_size);
-
-    if (ts_rc > 0) {
-        logLine("ym_rotor: clock unavailable, epoch timestamp used\n");
-    }
-    return (ts_rc < 0) ? -1 : 0;
-}
-
 int ym_api_rotor_feedback_radio_started(YmApiContext *ctx,
                                         const char *radio_session_id)
 {
@@ -615,7 +570,7 @@ int ym_api_rotor_feedback_radio_started(YmApiContext *ctx,
     char event_body[256];
     int event_len;
 
-    if (rotor_feedback_timestamp(timestamp, sizeof(timestamp)) != 0) {
+    if (ym_time_format(timestamp, sizeof(timestamp), YM_TIME_UTC) != 0) {
         return -1;
     }
     event_len = snprintf(event_body, sizeof(event_body),
@@ -628,16 +583,25 @@ int ym_api_rotor_feedback_radio_started(YmApiContext *ctx,
     return rotor_post_feedback(ctx, radio_session_id, NULL, event_body);
 }
 
+static int rotor_format_seconds(char *out, size_t size, int milliseconds)
+{
+    int written;
+    if (milliseconds < 0) return -1;
+    written = snprintf(out, size, "%d.%03d",
+                       milliseconds / 1000, milliseconds % 1000);
+    return written < 0 || (size_t)written >= size ? -1 : 0;
+}
+
 static int rotor_track_event(const YmApiContext *ctx,
                              const char *radio_session_id,
                              const char *batch_id,
                              const char *track_id, int album_id,
                              const char *event_type,
-                             double total_played_s, int has_total,
-                             double track_len_s)
+                             int total_played_ms, int has_total,
+                             int track_len_ms)
 {
     char timestamp[YM_ROTOR_TIMESTAMP_SIZE];
-    char composite[LIST_INDEX_ID_SIZE + 16];
+    char composite[TRACK_ID_SIZE + 16];
     char event_body[512];
     char total_s[32], len_s[32];
     int event_len;
@@ -645,16 +609,15 @@ static int rotor_track_event(const YmApiContext *ctx,
     if (!batch_id || !batch_id[0] || !track_id || !track_id[0]) {
         return -1;
     }
-    if (rotor_feedback_timestamp(timestamp, sizeof(timestamp)) != 0) {
+    if (ym_time_format(timestamp, sizeof(timestamp), YM_TIME_UTC) != 0) {
         return -1;
     }
     if (ym_api_rotor_composite_id(track_id, album_id,
                                   composite, sizeof(composite)) != 0) {
         return -1;
     }
-    /* Без %.3f: dtoa newlib не потокобезопасен (см. libc_guard.h). */
-    ym_fmt_fixed(total_s, sizeof(total_s), total_played_s, 3);
-    ym_fmt_fixed(len_s, sizeof(len_s), track_len_s, 3);
+    if (rotor_format_seconds(total_s, sizeof(total_s), total_played_ms) != 0 ||
+        rotor_format_seconds(len_s, sizeof(len_s), track_len_ms) != 0) return -1;
     if (has_total) {
         event_len = snprintf(event_body, sizeof(event_body),
                              "\"timestamp\":\"%s\",\"type\":\"%s\","
@@ -680,53 +643,53 @@ int ym_api_rotor_feedback_track_started(YmApiContext *ctx,
                                         const char *radio_session_id,
                                         const char *batch_id,
                                         const char *track_id, int album_id,
-                                        double track_len_s)
+                                        int track_len_ms)
 {
     return rotor_track_event(ctx, radio_session_id, batch_id, track_id,
-                             album_id, "trackStarted", 0.0, 0, track_len_s);
+                             album_id, "trackStarted", 0, 0, track_len_ms);
 }
 
 int ym_api_rotor_feedback_track_finished(YmApiContext *ctx,
                                          const char *radio_session_id,
                                          const char *batch_id,
                                          const char *track_id, int album_id,
-                                         double total_played_s,
-                                         double track_len_s)
+                                         int total_played_ms,
+                                         int track_len_ms)
 {
     return rotor_track_event(ctx, radio_session_id, batch_id, track_id,
                              album_id, "trackFinished",
-                             total_played_s, 1, track_len_s);
+                             total_played_ms, 1, track_len_ms);
 }
 
 int ym_api_rotor_feedback_skip(YmApiContext *ctx,
                                const char *radio_session_id,
                                const char *batch_id,
                                const char *track_id, int album_id,
-                               double total_played_s,
-                               double track_len_s)
+                               int total_played_ms,
+                               int track_len_ms)
 {
     return rotor_track_event(ctx, radio_session_id, batch_id, track_id,
-                             album_id, "skip", total_played_s, 1, track_len_s);
+                             album_id, "skip", total_played_ms, 1, track_len_ms);
 }
 
 int ym_api_rotor_feedback_like(YmApiContext *ctx,
                                const char *radio_session_id,
                                const char *batch_id,
                                const char *track_id, int album_id,
-                               double track_len_s)
+                               int track_len_ms)
 {
     return rotor_track_event(ctx, radio_session_id, batch_id, track_id,
-                             album_id, "like", 0.0, 0, track_len_s);
+                             album_id, "like", 0, 0, track_len_ms);
 }
 
 int ym_api_rotor_feedback_unlike(YmApiContext *ctx,
                                  const char *radio_session_id,
                                  const char *batch_id,
                                  const char *track_id, int album_id,
-                                 double track_len_s)
+                                 int track_len_ms)
 {
     return rotor_track_event(ctx, radio_session_id, batch_id, track_id,
-                             album_id, "unlike", 0.0, 0, track_len_s);
+                             album_id, "unlike", 0, 0, track_len_ms);
 }
 
 int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
@@ -734,15 +697,13 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
                             const char *play_id, int from_cache,
                             const char *timestamp_utc,
                             const char *client_now_utc,
-                            double track_len_s)
+                            int track_len_ms, int total_played_ms, int position_ms)
 {
     static const char url[] = ROTOR_HOST "/play-audio";
     char body[1024];
-    char track_enc[128];
-    char play_enc[128];
-    char ts_enc[128];
-    char now_enc[128];
+    char *track_enc, *play_enc, *ts_enc, *now_enc;
     char len_s[32];
+    char played_s[32], position_s[32];
     NetHttpResponse resp;
     cJSON *root = NULL;
     cJSON *result_node = NULL;
@@ -754,22 +715,33 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
         !client_now_utc) {
         return -1;
     }
-    if (rotor_url_encode_component(track_id, track_enc, sizeof(track_enc)) != 0 ||
-        rotor_url_encode_component(play_id, play_enc, sizeof(play_enc)) != 0 ||
-        rotor_url_encode_component(timestamp_utc, ts_enc, sizeof(ts_enc)) != 0 ||
-        rotor_url_encode_component(client_now_utc, now_enc, sizeof(now_enc)) != 0) {
+    if (rotor_format_seconds(len_s, sizeof(len_s), track_len_ms) != 0) return -1;
+    if (rotor_format_seconds(played_s, sizeof(played_s), total_played_ms) != 0 ||
+        rotor_format_seconds(position_s, sizeof(position_s), position_ms) != 0) return -1;
+    track_enc = curl_easy_escape(NULL, track_id, 0);
+    play_enc = curl_easy_escape(NULL, play_id, 0);
+    ts_enc = curl_easy_escape(NULL, timestamp_utc, 0);
+    now_enc = curl_easy_escape(NULL, client_now_utc, 0);
+    if (!track_enc || !play_enc || !ts_enc || !now_enc) {
+        curl_free(track_enc);
+        curl_free(play_enc);
+        curl_free(ts_enc);
+        curl_free(now_enc);
         return -1;
     }
-    ym_fmt_fixed(len_s, sizeof(len_s), track_len_s, 3);  /* без %.3f */
     body_len = snprintf(body, sizeof(body),
                         "track-id=%s&from-cache=%s&from=yandex-music-psp"
                         "&play-id=%s&uid=%d&timestamp=%s"
                         "&track-length-seconds=%s"
-                        "&total-played-seconds=0&end-position-seconds=0"
+                        "&total-played-seconds=%s&end-position-seconds=%s"
                         "&album-id=%d&client-now=%s",
                         track_enc, from_cache ? "true" : "false",
-                        play_enc, uid, ts_enc, len_s,
+                        play_enc, uid, ts_enc, len_s, played_s, position_s,
                         album_id, now_enc);
+    curl_free(track_enc);
+    curl_free(play_enc);
+    curl_free(ts_enc);
+    curl_free(now_enc);
     if (body_len < 0 || (size_t)body_len >= sizeof(body)) {
         return -1;
     }
@@ -794,10 +766,11 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
     if (resp.status_code != 200 || !resp.body || resp.body_size <= 0) {
         int verdict = rotor_status_verdict(resp.status_code);
         logLine("ym_rotor: play-audio bad status=%d\n", resp.status_code);
+        if (resp.status_code == 400) verdict = YM_ROTOR_ERR_BAD_REPORT;
         net_http_response_free(&resp);
         return verdict;
     }
-    root = ym_json_parse_len(resp.body, (size_t)resp.body_size);
+    root = ym_json_parse_len(resp.body, (size_t)resp.body_size, NULL);
     net_http_response_free(&resp);
     if (!root) {
         logLine("ym_rotor: play-audio parse failed\n");
@@ -814,73 +787,6 @@ int ym_api_rotor_play_audio(YmApiContext *ctx, int uid,
     }
     cJSON_Delete(root);
     return ok;
-}
-
-static int rotor_library_post(YmApiContext *ctx, int uid,
-                              const char *collection, const char *operation,
-                              const char *track_id)
-{
-    char url[256];
-    char body[128];
-    char track_enc[128];
-    NetHttpResponse resp;
-    int body_len;
-    int req_rc;
-    int rc = -1;
-
-    if (rotor_check_context(ctx) != 0 || uid <= 0 || !track_id ||
-        !track_id[0]) {
-        return -1;
-    }
-    if (rotor_url_encode_component(track_id, track_enc, sizeof(track_enc)) != 0) {
-        return -1;
-    }
-    snprintf(url, sizeof(url), ROTOR_HOST "/users/%d/%s/tracks/%s",
-             uid, collection, operation);
-    url[sizeof(url) - 1] = '\0';
-    body_len = snprintf(body, sizeof(body), "track-ids=%s", track_enc);
-    if (body_len < 0 || (size_t)body_len >= sizeof(body)) {
-        return -1;
-    }
-
-    memset(&resp, 0, sizeof(resp));
-    req_rc = http_request(&(HttpRequest){
-        .method = HTTP_POST,
-        .url = url,
-        .token = ctx->oauth_token,
-        .content_type = "application/x-www-form-urlencoded",
-        .payload = body,
-        .payload_size = body_len,
-        .initial_buffer = HTTP_TLS_BUFFER_SMALL,
-    }, &resp);
-    if (req_rc != 0) {
-        int verdict = rotor_transport_verdict(req_rc);
-        logLine("ym_rotor: library %s/%s transport failed rc=%d\n",
-                collection, operation, req_rc);
-        net_http_response_free(&resp);
-        return verdict;
-    }
-    logLine("ym_rotor: library %s/%s status=%d\n",
-            collection, operation, resp.status_code);
-    logger_flush();
-    rc = (resp.status_code == 200) ? 0 : rotor_status_verdict(resp.status_code);
-    net_http_response_free(&resp);
-    return rc;
-}
-
-int ym_api_track_unlike(YmApiContext *ctx, int uid, const char *track_id)
-{
-    return rotor_library_post(ctx, uid, "likes", "remove", track_id);
-}
-
-int ym_api_track_dislike(YmApiContext *ctx, int uid, const char *track_id)
-{
-    return rotor_library_post(ctx, uid, "dislikes", "add-multiple", track_id);
-}
-
-int ym_api_track_undislike(YmApiContext *ctx, int uid, const char *track_id)
-{
-    return rotor_library_post(ctx, uid, "dislikes", "remove", track_id);
 }
 
 int ym_api_rotor_resolve_uid(YmApiContext *ctx, int *out_uid)
@@ -1005,7 +911,7 @@ int ym_api_rotor_album_wave_cards(YmApiContext *ctx, int album_id,
         net_http_response_free(&resp);
         return v;
     }
-    root = ym_json_parse(resp.body);
+    root = ym_json_parse(resp.body, NULL);
     net_http_response_free(&resp);
     if (!root) {
         return YM_ROTOR_ERR;

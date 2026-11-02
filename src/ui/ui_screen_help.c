@@ -20,7 +20,7 @@ static const HelpRow s_help_rows[] = {
     { NULL,     "b_cross",     NULL,           LOCALE_HELP_SELECT },
     { NULL,     "b_circle",    NULL,           LOCALE_HELP_BACK },
     { "START",  NULL,          NULL,           LOCALE_HELP_PLAY_PAUSE },
-    { NULL,     "b_square",    NULL,           LOCALE_HELP_STOP },
+    { NULL,     "b_square",    NULL,           LOCALE_HELP_SHUFFLE },
     { NULL,     "b_triangle",  NULL,           LOCALE_HELP_LIKE },
     { NULL,     "in_left_key", "in_right_key", LOCALE_HELP_SEEK },
     { NULL,     "in_music",    NULL,           LOCALE_HELP_NOTE },
@@ -44,7 +44,7 @@ static void help_layout_slot(const UiLayoutWidget *widget, void *user_data)
     float step = widget->step;
     unsigned i;
     (void)user_data;
-    if (strcmp(widget->binding, "help.buttons") == 0) {
+    if (widget == &ui_layout_rows_help__buttons) {
         for (i = 0; i < sizeof(s_help_rows) / sizeof(s_help_rows[0]); i++) {
             const HelpRow *row = &s_help_rows[i];
             float y = widget->y + (float)i * step;
@@ -81,7 +81,7 @@ static void help_layout_slot(const UiLayoutWidget *widget, void *user_data)
                 }
             }
         }
-    } else if (strcmp(widget->binding, "help.descriptions") == 0) {
+    } else if (widget == &ui_layout_rows_help__descriptions) {
         for (i = 0; i < sizeof(s_help_rows) / sizeof(s_help_rows[0]); i++) {
             ui_draw_text(widget->x, widget->y + (float)i * step,
                          locale_get(s_help_rows[i].description), widget->color);
@@ -92,6 +92,6 @@ static void help_layout_slot(const UiLayoutWidget *widget, void *user_data)
 void ui_screen_help_render(const AppState *state)
 {
     (void)state;
-    (void)ui_layout_render("help", NULL, help_layout_slot, NULL);
+    (void)ui_layout_render(&ui_layout_screen_help, help_layout_slot, NULL);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_HELP));
 }

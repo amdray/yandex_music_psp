@@ -15,19 +15,23 @@
 // Источник протокола: AlexxIT/YandexStation core/yandex_session.py
 // (get_qr / login_qr / login_cookies / get_music_token).
 //
-// Состояние флоу (cookies, csrf, track) — статическое, один вход за раз.
+// Контекст одной попытки принадлежит вызывающему worker-потоку.
 // Все вызовы блокирующие (TLS), звать из рабочего потока.
 
 #define YA_QR_LINK_MAX 384
 
+typedef struct YaQrAuth YaQrAuth;
+YaQrAuth *ya_qr_create(void);
+void ya_qr_destroy(YaQrAuth *ctx);
+
 // Шаги 1-3. 0 = ок, link заполнен. <0 = ошибка (err — коротко для экрана).
-int ya_qr_begin(char *link, int link_sz, char *err, int err_sz);
+int ya_qr_begin(YaQrAuth *ctx, char *link, int link_sz, char *err, int err_sz);
 
 // Шаги 4-7. 1 = токен Музыки в token; 0 = ещё не подтвердили (опросить
 // позже); -2 = QR протух/отклонён (начать заново); иные <0 = ошибка сети/API.
-int ya_qr_poll(char *token, int token_sz, char *err, int err_sz);
+int ya_qr_poll(YaQrAuth *ctx, char *token, int token_sz, char *err, int err_sz);
 
 // Стереть cookies/csrf/track (после входа или отмены).
-void ya_qr_reset(void);
+void ya_qr_reset(YaQrAuth *ctx);
 
 #endif

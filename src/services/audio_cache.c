@@ -1,3 +1,4 @@
+#include "core/io_profile.h"
 #include "services/audio_cache.h"
 
 #include <pspthreadman.h>
@@ -13,11 +14,10 @@
 #include "services/net_tls.h"
 #include "services/net_stack.h"
 #include "services/net_http.h"
-#include "services/track_download.h"
+#include "services/audio_storage.h"
 #include "services/cover_manager.h"
 #include "services/ym_api.h"
-#include "services/net_speed.h"
-#include "services/audio_stream_buf.h"
+#include "services/download_settings.h"
 #include "services/mp4_track.h"
 #include <mbedtls/aes.h>
 
@@ -29,7 +29,6 @@
 #define AUDIO_CACHE_FLAC_PREBUFFER_MS    10000
 #define AUDIO_CACHE_FLAC_PREBUFFER_FALLBACK (1280 * 1024)
 #define AUDIO_CACHE_SLOT_COUNT 2
-#define AUDIO_CACHE_RESUME_VERIFY_BYTES (4 * 1024)
 #define AUDIO_CACHE_RETRY_MIN_US (250 * 1000)
 #define AUDIO_CACHE_RETRY_MAX_US (4 * 1000 * 1000)
 
@@ -49,16 +48,24 @@ static const char *audio_cache_state_name(AudioCacheState state)
 // задания: новое post перекрывает ещё не взятое старое (latest wins).
 typedef struct {
     TrackEntry track;
-    char       path[64];
     char       token[256];
-    int        pause_network;
+    int        network_pause_held;
+    DownloadSettings settings;
 } AcJob;
+
+typedef enum {
+    AC_COMMIT_NONE,
+    AC_COMMIT_PENDING,
+    AC_COMMIT_IN_PROGRESS,
+    AC_COMMIT_FAILED
+} AcCommitState;
 
 typedef struct AcSlot AcSlot;
 struct AcSlot {
     int              slot_id;
     AudioCacheStatus status;
-    AudioStreamBuf   stream_buf;
+    DownloadSettings request_settings;
+    char             request_track_id[TRACK_ID_SIZE];
     // Постоянный воркер: создаётся в init, удаляется только в shutdown.
     // Потоки НИКОГДА не удаляются на живом задании — отмена всегда
     // кооперативная через job_cancel (проброшен и в TLS-слой).
@@ -67,8 +74,56 @@ struct AcSlot {
     AcJob            pending_job;
     int              job_pending;       // под s_status_mutex
     volatile int     job_cancel;        // 1 = текущее задание отменено
+    int              retire_requested;  /* protected by s_status_mutex */
+    int              wake_pending;      /* at most one unconsumed wake */
+    AcCommitState    commit_state;      /* protected by s_status_mutex */
+    AcSlot          *wait_for;
     AcSlot          *self_arg;
 };
+
+#define AUDIO_CACHE_SETTINGS_PATH "config/audio_cache.cfg"
+static const char kRetainOff[] = "retain=0\n";
+static const char kRetainOn[] = "retain=1\n";
+static unsigned int s_retain_downloads;
+
+/* Loaded on the UI thread before workers start. Missing settings preserve
+ * the existing temporary-cache policy. The buffer also detects extra bytes. */
+static void load_cache_setting(void)
+{
+    char buffer[sizeof(kRetainOff)];
+    SceUID fd = fs_open(AUDIO_CACHE_SETTINGS_PATH, PSP_O_RDONLY, 0777);
+    int count;
+    s_retain_downloads = 0;
+    if (fd < 0) return;
+    count = fs_read(fd, buffer, sizeof(buffer));
+    fs_close(fd);
+    if (count == sizeof(kRetainOn) - 1 &&
+        memcmp(buffer, kRetainOn, sizeof(kRetainOn) - 1) == 0) {
+        s_retain_downloads = 1;
+    } else if (count != sizeof(kRetainOff) - 1 ||
+               memcmp(buffer, kRetainOff, sizeof(kRetainOff) - 1) != 0) {
+        logLine("ac: invalid retention setting\n");
+    }
+}
+
+int audio_cache_retain_downloads(void)
+{
+    return __sync_fetch_and_add(&s_retain_downloads, 0U) != 0;
+}
+
+void audio_cache_set_retain_downloads(int enabled)
+{
+    unsigned int value = enabled != 0;
+    if (audio_cache_retain_downloads() == (int)value) return;
+    if (fs_write_deferred(AUDIO_CACHE_SETTINGS_PATH,
+                          value ? kRetainOn : kRetainOff,
+                          sizeof(kRetainOff) - 1) < 0) {
+        logLine("ac: retention setting could not be queued\n");
+        return;
+    }
+    (void)__sync_lock_test_and_set(&s_retain_downloads, value);
+    logLine("ac: retain_downloads=%u queued\n", value);
+}
 
 static volatile int s_active_slot = 0;
 static char s_hint_next[40];   /* id следующего трека очереди (под hint) */
@@ -76,16 +131,54 @@ static volatile int s_shutdown = 0;
 static AcSlot s_slots[AUDIO_CACHE_SLOT_COUNT];
 static SceLwMutexWorkarea s_status_mutex;
 static int s_mutex_initialized = 0;
+static AcSlot *s_source_watch_slot;
+static AudioCacheSourceNotify s_source_notify;
+static void *s_source_notify_user;
 
-typedef struct {
-    AcSlot *slot;
-    char    track_id[40];
-    int64_t content_length;
-    int64_t resume_write_pos;
-    int64_t verify_pos;
-    u64     speed_us;       /* периодический лог скорости закачки */
-    int64_t speed_bytes;
-} AcRamStreamCtx;
+static void notify_source_locked(AcSlot *slot)
+{
+    if (slot == s_source_watch_slot && s_source_notify) {
+        AudioCacheStatus status = slot->status;
+        if (slot->retire_requested) status.state = AUDIO_CACHE_CANCELLED;
+        s_source_notify(&status, s_source_notify_user);
+    }
+}
+
+int audio_cache_watch_source(const char *track_id, AudioCacheSourceNotify notify,
+                             void *user)
+{
+    int i, rc = -1;
+    if (!s_mutex_initialized || !track_id || !notify) return -1;
+    sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (!s_source_notify) {
+        for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
+            AcSlot *slot = &s_slots[i];
+            if (slot->status.source_ref_count > 0 &&
+                strcmp(slot->status.track_id, track_id) == 0) {
+                s_source_watch_slot = slot;
+                s_source_notify = notify;
+                s_source_notify_user = user;
+                notify_source_locked(slot);
+                rc = 0;
+                break;
+            }
+        }
+    }
+    sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    return rc;
+}
+
+void audio_cache_unwatch_source(void *user)
+{
+    if (!s_mutex_initialized) return;
+    sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (s_source_notify_user == user) {
+        s_source_watch_slot = NULL;
+        s_source_notify = NULL;
+        s_source_notify_user = NULL;
+    }
+    sceKernelUnlockLwMutex(&s_status_mutex, 1);
+}
 
 static AcSlot *active_slot(void)
 {
@@ -95,14 +188,6 @@ static AcSlot *active_slot(void)
 static AcSlot *prefetch_slot(void)
 {
     return &s_slots[s_active_slot ? 0 : 1];
-}
-
-static void slot_clear_status(AcSlot *slot)
-{
-    if (!slot) return;
-    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    memset(&slot->status, 0, sizeof(slot->status));
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
 }
 
 static void slot_set_status(AcSlot *slot, AudioCacheState state,
@@ -126,6 +211,7 @@ static void slot_set_status(AcSlot *slot, AudioCacheState state,
         slot->status.path[0] = '\0';
     }
 
+    notify_source_locked(slot);
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
 
     if (prev_state != state || error_code != 0) {
@@ -138,7 +224,8 @@ static void slot_set_status(AcSlot *slot, AudioCacheState state,
 static void slot_set_source(AcSlot *slot, AudioCacheState state,
                             const char *track_id, const char *path,
                             int64_t downloaded_bytes, int64_t content_length, int bitrate_kbps,
-                            int complete, int progressive, int error_code)
+                            int complete, int progressive, int error_code,
+                            AudioQuality quality, int from_disk_cache)
 {
     AudioCacheState prev_state;
 
@@ -151,6 +238,8 @@ static void slot_set_source(AcSlot *slot, AudioCacheState state,
     slot->status.downloaded_bytes = downloaded_bytes;
     slot->status.content_length = content_length;
     slot->status.bitrate_kbps = bitrate_kbps;
+    slot->status.quality = quality;
+    slot->status.from_disk_cache = from_disk_cache;
     slot->status.complete = complete;
     slot->status.progressive = progressive;
 
@@ -163,6 +252,7 @@ static void slot_set_source(AcSlot *slot, AudioCacheState state,
         slot->status.path[0] = '\0';
     }
 
+    notify_source_locked(slot);
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
 
     if (prev_state != state || downloaded_bytes == 0) {
@@ -171,112 +261,6 @@ static void slot_set_source(AcSlot *slot, AudioCacheState state,
                 path ? path : "", (int)downloaded_bytes, (int)content_length,
                 complete, progressive);
     }
-}
-
-static int ac_ram_chunk_cb(const char *data, int size, void *user_data)
-{
-    AcRamStreamCtx *ctx = (AcRamStreamCtx *)user_data;
-    int consumed = 0;
-    int rc;
-    if (!ctx || !ctx->slot) return -1;
-    if (ctx->slot->job_cancel || s_shutdown) {
-        return NET_HTTP_STREAM_CANCELLED;
-    }
-    if (ctx->verify_pos < ctx->resume_write_pos) {
-        int64_t verify_left = ctx->resume_write_pos - ctx->verify_pos;
-        int verify_now = verify_left < size ? (int)verify_left : size;
-        if (asb_compare_at(&ctx->slot->stream_buf, ctx->verify_pos,
-                           (const uint8_t *)data, verify_now) != 0) {
-            logLine("ac: resume representation mismatch slot=%d track='%s' at=%d len=%d\n",
-                    ctx->slot->slot_id, ctx->track_id,
-                    (int)ctx->verify_pos, verify_now);
-            return -1;
-        }
-        ctx->verify_pos += verify_now;
-        consumed = verify_now;
-    }
-    if (consumed == size) return 0;
-
-    rc = asb_append(&ctx->slot->stream_buf,
-                    (const uint8_t *)data + consumed, size - consumed);
-    if (rc != 0 && (ctx->slot->job_cancel || s_shutdown)) {
-        return NET_HTTP_STREAM_CANCELLED;
-    }
-    return rc;
-}
-
-static void ac_log_speed(const char *track_id, int64_t absolute,
-                         int64_t total, u64 *last_us, int64_t *last_bytes);
-
-static int ac_ram_progress_cb(int written_total, int content_length, void *user_data)
-{
-    AcRamStreamCtx *ctx = (AcRamStreamCtx *)user_data;
-    AcSlot *slot = ctx ? ctx->slot : NULL;
-    int progressive;
-
-    if (!slot || !ctx->track_id[0]) return -1;
-    if (slot->job_cancel || s_shutdown) {
-        return NET_HTTP_STREAM_CANCELLED;
-    }
-
-    /* First request allocates the full object. A resumed request must match
-     * the coherent buffer snapshot captured immediately before it. */
-    if (ctx->resume_write_pos == 0 && written_total == 0) {
-        if (content_length <= 0) {
-            logLine("ac: no Content-Length for track '%s', refusing\n", ctx->track_id);
-            return -1;
-        }
-        ctx->content_length = (int64_t)content_length;
-        if (asb_alloc(&slot->stream_buf, ctx->content_length) != 0) {
-            logLine("ac: asb_alloc failed slot=%d track='%s' size=%d\n",
-                    slot->slot_id, ctx->track_id, content_length);
-            return -1;
-        }
-        logLine("ac: slot=%d buf allocated %d bytes for '%s'\n",
-                slot->slot_id, content_length, ctx->track_id);
-    } else if (written_total == ctx->verify_pos &&
-               ctx->verify_pos <= ctx->resume_write_pos) {
-        AudioStreamBufSnapshot snapshot;
-        memset(&snapshot, 0, sizeof(snapshot));
-        if (asb_get_snapshot(&slot->stream_buf, &snapshot) != 0 ||
-            snapshot.write_pos != ctx->resume_write_pos ||
-            snapshot.capacity != ctx->content_length ||
-            snapshot.content_length != ctx->content_length ||
-            content_length != ctx->content_length) {
-            logLine("ac: resume snapshot mismatch slot=%d track='%s' request=%d write=%d expected=%d got_total=%d\n",
-                    slot->slot_id, ctx->track_id, written_total,
-                    (int)snapshot.write_pos, (int)ctx->content_length,
-                    content_length);
-            return -1;
-        }
-    }
-
-    {
-        AudioStreamBufSnapshot snapshot;
-        if (asb_get_snapshot(&slot->stream_buf, &snapshot) != 0) return -1;
-        written_total = (int)snapshot.write_pos;
-    }
-    progressive = (written_total >= AUDIO_CACHE_PROGRESSIVE_THRESHOLD);
-
-    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    if (strcmp(slot->status.track_id, ctx->track_id) == 0) {
-        slot->status.downloaded_bytes = (int64_t)written_total;
-        slot->status.content_length   = (int64_t)content_length;
-        if ((int64_t)written_total > ctx->resume_write_pos) {
-            slot->status.error_code = 0;
-        }
-        if (progressive && slot->status.state == AUDIO_CACHE_DOWNLOADING) {
-            slot->status.state = AUDIO_CACHE_PROGRESSIVE_READY;
-            slot->status.progressive = 1;
-            logLine("ac: slot=%d progressive ready '%s' bytes=%d/%d\n",
-                    slot->slot_id, ctx->track_id, written_total, content_length);
-        }
-    }
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-    ac_log_speed(ctx->track_id, (int64_t)written_total,
-                 (int64_t)content_length,
-                 &ctx->speed_us, &ctx->speed_bytes);
-    return 0;
 }
 
 static void log_worker_priority(SceUID tid)
@@ -373,18 +357,18 @@ typedef struct {
 } AcProbeResult;
 
 /* Скачивает префикс url в RAM и определяет формат/кодек. 0 = распознано. */
-static int ac_probe_stream(AcSlot *slot, const char *url, const char *token,
+static YmStatus ac_probe_stream(AcSlot *slot, const char *url, const char *token,
                            AcProbeResult *out)
 {
     AcProbeCtx *p;
     int rc;
 
-    if (!slot || !url || !token || !out) return -1;
+    if (!slot || !url || !token || !out) return YM_ERR_PARSE;
     memset(out, 0, sizeof(*out));
     /* Проба живёт только внутри вызова: два слота качают одновременно,
      * общий статический буфер давал гонку. */
     p = (AcProbeCtx *)calloc(1, sizeof(AcProbeCtx));
-    if (!p) return -1;
+    if (!p) return YM_ERR_NO_MEMORY;
     p->slot = slot;
 
     rc = http_stream(&(HttpRequest){
@@ -399,23 +383,27 @@ static int ac_probe_stream(AcSlot *slot, const char *url, const char *token,
                                      .user = p });
     if (rc != 0 && rc != NET_HTTP_STREAM_CANCELLED) {
         free(p);
-        return rc;
+        return net_http_error_is_network(rc) ? YM_ERR_NETWORK : YM_ERR_HTTP;
+    }
+    if (slot->job_cancel || s_shutdown) {
+        free(p);
+        return YM_ERR_CANCELLED;
     }
     if (p->len >= 4 && memcmp(p->buf, "fLaC", 4) == 0) {
         out->is_raw_flac = flac_probe_streaminfo(p->buf, p->len,
                                                  &out->mp4.rate,
                                                  &out->mp4.ch, &out->mp4.bps);
         free(p);
-        return out->is_raw_flac ? 0 : -1;
+        return out->is_raw_flac ? YM_OK : YM_ERR_UNSUPPORTED;
     }
     if (mp4_probe_buffer(p->buf, p->len, &out->mp4) == 0 &&
         out->mp4.kind != MP4_PROBE_NONE) {
         out->is_mp4 = 1;
         free(p);
-        return 0;
+        return YM_OK;
     }
     free(p);
-    return -1;
+    return YM_ERR_UNSUPPORTED;
 }
 
 typedef struct {
@@ -497,17 +485,14 @@ static void ac_log_speed(const char *track_id, int64_t absolute,
         *last_bytes = absolute;
         return;
     }
-    /* Окно 2 с: скармливаем оценщику скорости (режим качества «Авто»).
-     * Лог — не чаще раза в 5 с, как и раньше. */
+    /* Окно оценки — 2 с, запись в лог — не чаще раза в 5 с. */
     if (now - *last_us >= 2000000ULL) {
         int64_t delta = absolute - *last_bytes;
         if (delta >= 0) {
-            net_speed_note(delta, now - *last_us);
             if (now - s_log_us >= 5000000ULL) {
-                logLine("ac: dl speed track='%s' %d/%d %d KB/s (ema %d)\n",
+                logLine("ac: dl speed track='%s' %d/%d %d KB/s\n",
                         track_id, (int)absolute, (int)total,
-                        (int)(delta * 1000000LL / (int64_t)(now - *last_us) / 1024),
-                        net_speed_kbps());
+                        (int)(delta * 1000000LL / (int64_t)(now - *last_us) / 1024));
                 s_log_us = now;
             }
         }
@@ -534,6 +519,7 @@ static void ac_file_status_update(AcFileDlCtx *ctx, int64_t absolute)
                     ctx->slot->slot_id, ctx->track_id, (int)absolute);
         }
     }
+    notify_source_locked(ctx->slot);
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
 }
 
@@ -541,15 +527,22 @@ static void ac_file_status_update(AcFileDlCtx *ctx, int64_t absolute)
 static int ac_writer_main(SceSize args, void *argp)
 {
     AcFileDlCtx *ctx = *(AcFileDlCtx **)argp;
+    IoProfileLane profile;
+    io_profile_begin(&profile, IP_WRITER0 + ctx->slot->slot_id);
     (void)args;
     for (;;) {
         SceUInt timeout = 200000;
         size_t n, tail;
+        io_profile_phase(&profile, IP_WAIT);
         (void)sceKernelWaitSema(ctx->wsema, 1, &timeout);
+        io_profile_phase(&profile, IP_OTHER);
         for (;;) {
             int rc;
             sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
             n = ctx->wb_used;
+            uint64_t profile_now = sceKernelGetSystemTimeWide();
+            io_profile_event(IP_WRITE_BUFFER, ctx->slot->slot_id, (int)n,
+                             profile_now, profile_now);
             tail = ctx->wb_tail;
             sceKernelUnlockLwMutex(&ctx->wmutex, 1);
             if (n > AC_WRITE_CHUNK) n = AC_WRITE_CHUNK;
@@ -560,7 +553,9 @@ static int ac_writer_main(SceSize args, void *argp)
                 timeout == 0) {
                 break;
             }
+            io_profile_phase(&profile, IP_IO);
             rc = fs_write(ctx->fd, ctx->wbuf + tail, (SceSize)n);
+            io_profile_phase(&profile, IP_OTHER);
             if (rc != (int)n) {
                 logLine("ac: file write short slot=%d rc=%d\n",
                         ctx->slot->slot_id, rc);
@@ -568,6 +563,7 @@ static int ac_writer_main(SceSize args, void *argp)
                 sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
                 ctx->wb_used = 0;
                 sceKernelUnlockLwMutex(&ctx->wmutex, 1);
+                io_profile_end(&profile);
                 return sceKernelExitDeleteThread(0);
             }
             sceKernelLockLwMutex(&ctx->wmutex, 1, NULL);
@@ -583,6 +579,7 @@ static int ac_writer_main(SceSize args, void *argp)
         sceKernelUnlockLwMutex(&ctx->wmutex, 1);
         if (ctx->wstop && n == 0) break;
     }
+    io_profile_end(&profile);
     return sceKernelExitDeleteThread(0);
 }
 
@@ -635,7 +632,7 @@ static void ac_writer_stop(AcFileDlCtx *ctx)
     if (ctx->use_aes) mbedtls_aes_free(&ctx->aes);
 }
 
-static int flac_file_chunk(const char *data, int size, void *user)
+static int ac_file_chunk(const char *data, int size, void *user)
 {
     AcFileDlCtx *ctx = (AcFileDlCtx *)user;
     if (!ctx || !data || size <= 0) return -1;
@@ -681,7 +678,7 @@ static int flac_file_chunk(const char *data, int size, void *user)
     return 0;
 }
 
-static int flac_file_progress(int written_total, int content_length, void *user)
+static int ac_file_progress(int written_total, int content_length, void *user)
 {
     AcFileDlCtx *ctx = (AcFileDlCtx *)user;
     if (!ctx) return -1;
@@ -722,13 +719,14 @@ static int ac_mp4_file_complete(const char *path, const char *family)
     return ok;
 }
 
-/* Финализация файлового задания: READY + чистка старого кэша. */
+/* READY describes complete audio data; cache commit waits for all readers. */
 static int file_job_ready(AcSlot *slot, const AcJob *job,
-                          const char *final_path, int bitrate_kbps)
+                          const char *download_path, const char *final_path,
+                          int bitrate_kbps, AudioQuality quality)
 {
     SceIoStat st;
     memset(&st, 0, sizeof(st));
-    if (fs_getstat(final_path, &st) != 0 || st.st_size <= 0) {
+    if (fs_getstat(download_path, &st) != 0 || st.st_size <= 0) {
         logLine("ac: final missing after job slot=%d '%s'\n",
                 slot->slot_id, final_path);
         logger_flush();
@@ -736,33 +734,51 @@ static int file_job_ready(AcSlot *slot, const AcJob *job,
                         NET_HTTP_ERR_PROTOCOL);
         return -1;
     }
-    slot_set_source(slot, AUDIO_CACHE_READY, job->track.id, final_path,
+    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    slot->commit_state = strcmp(download_path, final_path) != 0
+        ? AC_COMMIT_PENDING : AC_COMMIT_NONE;
+    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    slot_set_source(slot, AUDIO_CACHE_READY, job->track.id, download_path,
                     (int64_t)st.st_size, (int64_t)st.st_size, bitrate_kbps,
-                    1, 1, 0);
+                    1, 1, 0, quality, 0);
     logLine("ac: state -> READY (file) slot=%d track='%s' path='%s' size=%d\n",
-            slot->slot_id, job->track.id, final_path, (int)st.st_size);
+            slot->slot_id, job->track.id, download_path, (int)st.st_size);
     logger_flush();
     /* Чистка cache_music выполняется в worker_main после задания
      * (ac_trim_music: только текущий + предзагруженный трек). */
     return 0;
 }
 
-/* Файловая докачка (flac: raw fLaC либо flac-mp4 как есть; aac: mp4 как
- * есть) с Range-resume. Возвращает 0 (READY/CANCELLED — как RAM путь:
- * отмена не ошибка) или <0. Частичный файл сохраняется для resume и уже
- * с AUDIO_CACHE_PROGRESSIVE_THRESHOLD играется плеером напрямую. */
-static int run_file_job(AcSlot *slot, const AcJob *job,
-                        const YmApiContext *api_ctx, const char *family,
-                        const char *final_path)
+static YmStatus ac_fetch_variant(YmApiContext *ctx, const char *track_id,
+                                 DownloadCodec codec, const char *quality,
+                                 YmDownloadVariant *variant)
 {
-    unsigned int retry_delay_us = AUDIO_CACHE_RETRY_MIN_US;
-    YmDownloadVariant variant;
-    YmStatus ym_status;
-    char dl_path[64];
-    int restarted = 0;
+    switch (codec) {
+    case DOWNLOAD_CODEC_MP3:
+        return ym_api_download_get_mp3_raw(ctx, track_id, quality, variant);
+    case DOWNLOAD_CODEC_AAC:
+        return ym_api_download_get_aac_raw(ctx, track_id, quality, variant);
+    case DOWNLOAD_CODEC_FLAC:
+        return ym_api_download_get_flac_raw(ctx, track_id, variant);
+    default:
+        return YM_ERR_UNSUPPORTED;
+    }
+}
 
-    memset(&variant, 0, sizeof(variant));
-    snprintf(dl_path, sizeof(dl_path), "%s", final_path);
+/* Файловая загрузка с Range-resume и фиксированными параметрами запроса. */
+static int run_file_job(AcSlot *slot, const AcJob *job,
+                        const YmApiContext *api_ctx, DownloadCodec codec,
+                        const char *quality, YmDownloadVariant *variant,
+                        const char *initial_path)
+{
+    const char *family = download_codec_name(codec);
+    unsigned int retry_delay_us = AUDIO_CACHE_RETRY_MIN_US;
+    YmStatus ym_status;
+    char final_path[AUDIO_STORAGE_PATH_CAPACITY];
+    char dl_path[AUDIO_STORAGE_PATH_CAPACITY];
+    int restarted = 0;
+    int refresh_variant = 0;
+    snprintf(final_path, sizeof(final_path), "%s", initial_path);
 
     for (;;) {
         AcFileDlCtx ctx;
@@ -776,13 +792,15 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
             return 0;
         }
 
-        ym_status = strcmp(family, "flac") == 0
-                        ? ym_api_download_get_flac_raw((YmApiContext *)api_ctx,
-                                                       job->track.id,
-                                                       &variant)
-                        : ym_api_download_get_aac_raw((YmApiContext *)api_ctx,
-                                                      job->track.id,
-                                                      &variant);
+        ym_status = refresh_variant
+            ? ac_fetch_variant((YmApiContext *)api_ctx, job->track.id, codec,
+                                quality, variant) : YM_OK;
+        refresh_variant = 1;
+        if (ym_status == YM_ERR_CANCELLED || slot->job_cancel || s_shutdown) {
+            slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
+                            NET_HTTP_STREAM_CANCELLED);
+            return 0;
+        }
         if (ym_status != YM_OK) {
             if (ym_status == YM_ERR_NETWORK) {
                 if (ac_wait_for_retry(slot, job->track.id,
@@ -806,6 +824,11 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
             return -1;
         }
 
+        if (snprintf(dl_path, sizeof(dl_path), "%s.part", final_path) >= (int)sizeof(dl_path)) {
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, NET_HTTP_ERR_INVALID);
+            return -1;
+        }
+
         memset(&st, 0, sizeof(st));
         if (fs_getstat(dl_path, &st) == 0 && st.st_size > 0) {
             base_size = (int64_t)st.st_size;
@@ -816,7 +839,7 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
         snprintf(ctx.track_id, sizeof(ctx.track_id), "%s", job->track.id);
         ctx.base_size = base_size;
         ctx.is_flac = strcmp(family, "flac") == 0;
-        ctx.bitrate_kbps = variant.bitrate_kbps;
+        ctx.bitrate_kbps = variant->bitrate_kbps;
         ctx.duration_ms = job->track.duration_ms;
         ctx.progressive_need = ac_prebuffer_need(&ctx);
         ctx.fd = fs_open(dl_path, PSP_O_WRONLY | (base_size > 0 ? PSP_O_APPEND : (PSP_O_CREAT | PSP_O_TRUNC)), 0777);
@@ -833,7 +856,7 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
          * расширению (.flac / .mp4 / .aac), файл играется уже во время
          * докачки — с порога PROGRESSIVE_READY. */
         /* Расшифровка encraw: CTR с нулевым nonce, позиция = размер файла. */
-        if (variant.encrypted) {
+        if (variant->encrypted) {
             unsigned char zero[16];
             size_t skip = (size_t)(base_size % 16);
             uint64_t blk = (uint64_t)(base_size / 16);
@@ -844,7 +867,7 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
             }
             mbedtls_aes_init(&ctx.aes);
             ctx.aes_off = 0;
-            if (mbedtls_aes_setkey_enc(&ctx.aes, variant.aes_key, 128) != 0) {
+            if (mbedtls_aes_setkey_enc(&ctx.aes, variant->aes_key, 128) != 0) {
                 logLine("ac: aes setkey failed slot=%d\n", slot->slot_id);
                 mbedtls_aes_free(&ctx.aes);
                 fs_close(ctx.fd);
@@ -867,34 +890,37 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
             return -1;
         }
         slot_set_source(slot, AUDIO_CACHE_DOWNLOADING, job->track.id,
-                        final_path, base_size, base_size,
-                        variant.bitrate_kbps, 0,
+                        dl_path, base_size, base_size,
+                        variant->bitrate_kbps, 0,
                         base_size >= ctx.progressive_need,
-                        0);
+                        0, variant->quality, 0);
         logLine("ac: %s file start slot=%d track='%s' resume=%d\n",
                 family, slot->slot_id, job->track.id, (int)base_size);
         logger_flush();
 
         rc_dl = http_stream(&(HttpRequest){
-                                .method = HTTP_GET, .url = variant.url,
+                                .method = HTTP_GET, .url = variant->url,
                                 .token = api_ctx->oauth_token,
                                 .identity_encoding = 1,
                                 .range_enabled = base_size > 0,
                                 .range_start = (int)base_size,
                                 .range_total = 0
                             },
-                            &(HttpSink){ .on_chunk = flac_file_chunk,
-                                         .on_progress = flac_file_progress,
+                            &(HttpSink){ .on_chunk = ac_file_chunk,
+                                         .on_progress = ac_file_progress,
                                          .user = &ctx });
         /* Дописать всё принятое (и при обрыве — для resume), затем закрыть. */
         ac_writer_stop(&ctx);
-        fs_close(ctx.fd);
+        {
+            int close_rc = fs_close(ctx.fd);
+            if (rc_dl == 0 && close_rc < 0) rc_dl = close_rc;
+        }
         ctx.fd = -1;
         if (rc_dl == 0 && ctx.werror) rc_dl = NET_HTTP_ERR_PROTOCOL;
 
         if (rc_dl == 0) {
-            return file_job_ready(slot, job, final_path,
-                                  variant.bitrate_kbps);
+            return file_job_ready(slot, job, dl_path, final_path,
+                                  variant->bitrate_kbps, variant->quality);
         }
         if (rc_dl == NET_HTTP_STREAM_CANCELLED ||
             slot->job_cancel || s_shutdown) {
@@ -937,535 +963,195 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
     }
 }
 
-/* Какой кодек выбрала цепочка переговоров/кэша. */
-typedef enum {
-    DL_NONE = 0,
-    DL_FLAC,
-    DL_AAC,
-    DL_MP3
-} AcDlKind;
+static const DownloadCodec kCodecPlans[DOWNLOAD_CODEC_COUNT][DOWNLOAD_CODEC_COUNT] = {
+    { DOWNLOAD_CODEC_MP3, DOWNLOAD_CODEC_AAC, DOWNLOAD_CODEC_COUNT },
+    { DOWNLOAD_CODEC_AAC, DOWNLOAD_CODEC_MP3, DOWNLOAD_CODEC_COUNT },
+    { DOWNLOAD_CODEC_FLAC, DOWNLOAD_CODEC_AAC, DOWNLOAD_CODEC_MP3 }
+};
 
-static int run_download_job(AcSlot *slot, const AcJob *job)
+static const char *const kCacheExtensions[] = { "mp3", "aac", "flac", "mp4" };
+
+static int ac_try_cached_variant(AcSlot *slot, const AcJob *job,
+                                 AudioQuality quality, char *path, size_t capacity)
 {
-    YmApiContext api_ctx;
-    YmDownloadVariant variant;
-    YmDownloadVariant original_variant;
-    YmStatus ym_status;
-    int net_paused = job->pause_network;
-    char dl_path[64];
-    AcDlKind dl_kind = DL_NONE;
-    int want_mp3;
-
-    {
-        const char *q = ym_api_download_quality();
-        want_mp3 = (q && strcmp(q, "mp3") == 0);
+    size_t representation;
+    for (representation = 0; representation < sizeof(kCacheExtensions) / sizeof(kCacheExtensions[0]); representation++) {
+        SceIoStat st;
+        const char *extension = kCacheExtensions[representation];
+        if (audio_storage_build_path(job->track.id, extension, quality, path, capacity) != 0) {
+            return -1;
+        }
+        memset(&st, 0, sizeof(st));
+        if (fs_getstat(path, &st) != 0) continue;
+        if (strcmp(extension, "aac") == 0 && !ac_mp4_file_complete(path, "aac")) continue;
+        if (strcmp(extension, "mp4") == 0 && !ac_mp4_file_complete(path, "flac")) continue;
+        if (slot->job_cancel || s_shutdown) return 0;
+        logLine("ac: cache hit quality=%s slot=%d '%s'\n",
+                audio_quality_name(quality), slot->slot_id, path);
+        slot_set_source(slot, AUDIO_CACHE_READY, job->track.id, path,
+                        (int64_t)st.st_size, (int64_t)st.st_size, 0, 1, 1, 0, quality, 1);
+        return 1;
     }
+    return 0;
+}
 
-    logLine("ac: worker started slot=%d track_id='%s' want_mp3=%d\n",
-            slot->slot_id, job->track.id, want_mp3);
-    logger_flush();
+static int ac_remove_outdated_cache(AcSlot *slot, const AcJob *job, AudioQuality required)
+{
+    int quality;
+    size_t representation;
+    for (quality = AUDIO_QUALITY_UNKNOWN; quality < (int)required; quality++) {
+        for (representation = 0; representation < sizeof(kCacheExtensions) / sizeof(kCacheExtensions[0]); representation++) {
+            char path[AUDIO_STORAGE_PATH_CAPACITY];
+            char partial[AUDIO_STORAGE_PATH_CAPACITY];
+            SceIoStat st;
+            int rc;
+            if (slot->job_cancel || s_shutdown) return 0;
+            if (audio_storage_build_path(job->track.id, kCacheExtensions[representation],
+                                        (AudioQuality)quality, path, sizeof(path)) != 0 ||
+                snprintf(partial, sizeof(partial), "%s.part", path) >= (int)sizeof(partial)) {
+                return NET_HTTP_ERR_INVALID;
+            }
+            if (fs_getstat(path, &st) == 0) {
+                rc = fs_remove(path);
+                if (rc < 0) return rc;
+                logLine("ac: removed outdated cache '%s'\n", path);
+            }
+            if (fs_getstat(partial, &st) == 0) {
+                rc = fs_remove(partial);
+                if (rc < 0) return rc;
+                logLine("ac: removed outdated partial '%s'\n", partial);
+            }
+        }
+    }
+    return 0;
+}
 
-    slot_clear_status(slot);
-    asb_reset(&slot->stream_buf);
+static int ac_try_cached(AcSlot *slot, const AcJob *job, AudioQuality required,
+                          char *path, size_t capacity)
+{
+    int quality;
+    for (quality = required; quality < AUDIO_QUALITY_COUNT; quality++) {
+        int cached = ac_try_cached_variant(slot, job, (AudioQuality)quality, path, capacity);
+        if (cached < 0) {
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, YM_ERR_PARSE);
+        }
+        if (cached != 0 || slot->job_cancel || s_shutdown) return cached;
+    }
+    return 0;
+}
 
+static YmStatus ac_prepare_variant(AcSlot *slot, const AcJob *job,
+                                   YmApiContext *ctx, DownloadCodec codec,
+                                   const YmDownloadVariant *variant,
+                                   char *path, size_t capacity)
+{
+    YmStatus status;
+    const char *extension = download_codec_name(codec);
+    if (codec != DOWNLOAD_CODEC_MP3) {
+        AcProbeResult probe;
+        status = ac_probe_stream(slot, variant->url, ctx->oauth_token, &probe);
+        if (slot->job_cancel || s_shutdown) return YM_ERR_CANCELLED;
+        if (status != YM_OK) return status;
+        if (codec == DOWNLOAD_CODEC_AAC) {
+            if (!probe.is_mp4 || probe.mp4.kind != MP4_PROBE_AAC) {
+                return YM_ERR_UNSUPPORTED;
+            }
+        } else {
+            int kind_ok = probe.is_raw_flac ||
+                          (probe.is_mp4 && probe.mp4.kind == MP4_PROBE_FLAC);
+            if (!kind_ok || probe.mp4.rate != 44100 || probe.mp4.ch != 2 ||
+                probe.mp4.bps < 16 || probe.mp4.bps > 32) {
+                return YM_ERR_UNSUPPORTED;
+            }
+            extension = probe.is_mp4 ? "mp4" : "flac";
+        }
+    }
+    return audio_storage_build_path(job->track.id, extension, variant->quality, path, capacity) == 0
+        ? YM_OK : YM_ERR_PARSE;
+}
+
+static int run_download_job(AcSlot *slot, AcJob *job)
+{
+    DownloadSettings settings = job->settings;
+    const DownloadCodec *plan = kCodecPlans[settings.codec];
+    const char *quality = download_quality_name(settings.quality);
+    YmApiContext api_ctx;
+    int candidate;
+    AudioQuality required = download_settings_required_quality(settings);
+    int cached;
+    int remove_rc;
+    char path[AUDIO_STORAGE_PATH_CAPACITY];
+
+    logLine("ac: worker started slot=%d track_id='%s' codec=%s quality=%s\n",
+            slot->slot_id, job->track.id,
+            download_codec_name(settings.codec), quality);
+    if (slot->job_cancel || s_shutdown) goto cancelled;
     if (job->token[0] == '\0') {
-        logLine("ac: token missing slot=%d\n", slot->slot_id);
-        logger_flush();
-        if (net_paused) cover_manager_resume_network();
         slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, -1);
         return -1;
     }
-
     api_ctx.oauth_token = job->token;
     api_ctx.timeout_ms = 0;
 
-    /* Хиты кэша по цепочке качества: hq = .flac -> .aac -> .mp3,
-     * nq/lq = .aac -> .mp3. Частичный .aac хитом не считается. */
-    {
-        int try_flac = ym_api_download_flac_enabled();
-        SceIoStat st;
-        char cand[64];
+    cached = ac_try_cached(slot, job, required, path, sizeof(path));
+    if (slot->job_cancel || s_shutdown) goto cancelled;
+    if (cached != 0) return cached > 0 ? 0 : -1;
 
-        /* Выбран формат mp3: .mp3 — первый кандидат кэша. */
-        if (want_mp3 &&
-            track_download_build_path_for_codec(job->track.id, "mp3",
-                                                cand, sizeof(cand)) == 0) {
-            memset(&st, 0, sizeof(st));
-            logLine("ac: check cache slot=%d '%s'\n", slot->slot_id, cand);
-            logger_flush();
-            if (fs_getstat(cand, &st) == 0) {
-                logLine("ac: cache hit (mp3) slot=%d '%s'\n",
-                        slot->slot_id, cand);
-                logger_flush();
-                if (net_paused) cover_manager_resume_network();
-                strncpy(dl_path, cand, sizeof(dl_path) - 1);
-                dl_path[sizeof(dl_path) - 1] = '\0';
-                dl_kind = DL_MP3;
-                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
-                                dl_path, (int64_t)st.st_size,
-                                (int64_t)st.st_size, 0, 1, 1, 0);
-                return 0;
-            }
-        }
-
-        if (try_flac &&
-            track_download_build_path_for_codec(job->track.id, "flac",
-                                                cand, sizeof(cand)) == 0) {
-            memset(&st, 0, sizeof(st));
-            logLine("ac: check cache slot=%d '%s'\n", slot->slot_id, cand);
-            logger_flush();
-            if (fs_getstat(cand, &st) == 0) {
-                logLine("ac: cache hit (flac) slot=%d '%s'\n", slot->slot_id, cand);
-                logger_flush();
-                if (net_paused) cover_manager_resume_network();
-                strncpy(dl_path, cand, sizeof(dl_path) - 1);
-                dl_path[sizeof(dl_path) - 1] = '\0';
-                dl_kind = DL_FLAC;
-                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
-                                dl_path, (int64_t)st.st_size,
-                                (int64_t)st.st_size, 0, 1, 1, 0);
-                return 0;
-            }
-        }
-
-        /* Новый формат кэша flac: сырой mp4-контейнер X.mp4 (игрывается
-         * напрямую). Частичный — не хит, но докачается с места обрыва. */
-        if (try_flac &&
-            track_download_build_path_for_codec(job->track.id, "mp4",
-                                                cand, sizeof(cand)) == 0) {
-            memset(&st, 0, sizeof(st));
-            logLine("ac: check cache slot=%d '%s'\n", slot->slot_id, cand);
-            logger_flush();
-            if (fs_getstat(cand, &st) == 0 &&
-                ac_mp4_file_complete(cand, "flac")) {
-                logLine("ac: cache hit (flac mp4) slot=%d '%s'\n",
-                        slot->slot_id, cand);
-                logger_flush();
-                if (net_paused) cover_manager_resume_network();
-                strncpy(dl_path, cand, sizeof(dl_path) - 1);
-                dl_path[sizeof(dl_path) - 1] = '\0';
-                dl_kind = DL_FLAC;
-                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
-                                dl_path, (int64_t)st.st_size,
-                                (int64_t)st.st_size, 0, 1, 1, 0);
-                return 0;
-            }
-        }
-
-        if (track_download_build_path_for_codec(job->track.id, "aac",
-                                                cand, sizeof(cand)) == 0) {
-            memset(&st, 0, sizeof(st));
-            logLine("ac: check cache slot=%d '%s'\n", slot->slot_id, cand);
-            logger_flush();
-            if (fs_getstat(cand, &st) == 0 &&
-                ac_mp4_file_complete(cand, "aac")) {
-                logLine("ac: cache hit (aac) slot=%d '%s'\n", slot->slot_id, cand);
-                logger_flush();
-                if (net_paused) cover_manager_resume_network();
-                strncpy(dl_path, cand, sizeof(dl_path) - 1);
-                dl_path[sizeof(dl_path) - 1] = '\0';
-                dl_kind = DL_AAC;
-                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
-                                dl_path, (int64_t)st.st_size,
-                                (int64_t)st.st_size, 0, 1, 1, 0);
-                return 0;
-            }
-        }
-
-        /* .mp3 — фолбэк-кандидат (при выбранном mp3 уже проверен выше). */
-        if (!want_mp3) {
-            memset(&st, 0, sizeof(st));
-            logLine("ac: check cache slot=%d '%s'\n", slot->slot_id, job->path);
-            logger_flush();
-            if (fs_getstat(job->path, &st) == 0) {
-                logLine("ac: cache hit slot=%d '%s'\n", slot->slot_id, job->path);
-                logger_flush();
-                if (net_paused) cover_manager_resume_network();
-                strncpy(dl_path, job->path, sizeof(dl_path) - 1);
-                dl_path[sizeof(dl_path) - 1] = '\0';
-                dl_kind = DL_MP3;
-                slot_set_source(slot, AUDIO_CACHE_READY, job->track.id,
-                                dl_path, (int64_t)st.st_size,
-                                (int64_t)st.st_size, 0, 1, 1, 0);
-                return 0;
-            }
-        }
-    }
-
-    logLine("ac: fetch url slot=%d track_id='%s' tls_ready=%d net_ready=%d\n",
-            slot->slot_id, job->track.id,
-            net_tls_config_is_ready(), net_stack_is_ready());
-    logger_flush();
-
-    /* Переговоры по цепочке качества: hq = FLAC -> AAC -> MP3,
-     * nq/lq = AAC -> MP3. Каждый шаг: get-file-info + проба потока
-     * (raw fLaC либо MP4), при отказе — следующий кодек. */
-    {
-        int try_flac = ym_api_download_flac_enabled();
-
-        /* Формат mp3 выбран явно: codecs=mp3 напрямую, без AAC-шага;
-         * при отказе сервера — фолбэк на AAC ниже. */
-        if (want_mp3) {
-            if (track_download_build_path_for_codec(job->track.id, "mp3",
-                                                    dl_path,
-                                                    sizeof(dl_path)) == 0) {
-                ym_status = ym_api_download_get_mp3_raw(&api_ctx,
-                                                         job->track.id,
-                                                         &variant);
-                if (ym_status == YM_OK) {
-                    dl_kind = DL_MP3;
-                    logLine("ac: mp3 committed slot=%d track='%s' bitrate=%d\n",
-                            slot->slot_id, job->track.id,
-                            variant.bitrate_kbps);
-                    logger_flush();
-                } else {
-                    logLine("ac: mp3 unavailable slot=%d track='%s' status=%d fallback\n",
-                            slot->slot_id, job->track.id, ym_status);
-                    logger_flush();
-                }
-            }
-        }
-
-        if (try_flac) {
-            YmDownloadVariant flac_variant;
-            memset(&flac_variant, 0, sizeof(flac_variant));
-            ym_status = ym_api_download_get_flac_raw(&api_ctx, job->track.id,
-                                                     &flac_variant);
-            if (ym_status == YM_OK) {
-                AcProbeResult pr;
-                int probe_rc = ac_probe_stream(slot, flac_variant.url,
-                                               api_ctx.oauth_token, &pr);
-                int kind_ok = pr.is_raw_flac ||
-                              (pr.is_mp4 && pr.mp4.kind == MP4_PROBE_FLAC);
-                if (probe_rc == 0 && kind_ok && pr.mp4.rate == 44100 &&
-                    pr.mp4.ch == 2 && pr.mp4.bps >= 16 && pr.mp4.bps <= 32) {
-                    if (track_download_build_path_for_codec(job->track.id,
-                                                           pr.is_mp4 ? "mp4"
-                                                                     : "flac",
-                                                           dl_path,
-                                                           sizeof(dl_path)) == 0) {
-                        variant = flac_variant;
-                        dl_kind = DL_FLAC;
-                        logLine("ac: flac committed slot=%d track='%s' fmt=%d/%d/%d mp4=%d bitrate=%d\n",
-                                slot->slot_id, job->track.id,
-                                pr.mp4.rate, pr.mp4.ch, pr.mp4.bps,
-                                pr.is_mp4, flac_variant.bitrate_kbps);
-                        logger_flush();
-                    }
-                } else {
-                    logLine("ac: flac rejected slot=%d track='%s' probe_rc=%d kind=%d fmt=%d/%d/%d\n",
-                            slot->slot_id, job->track.id, probe_rc,
-                            (int)pr.mp4.kind, pr.mp4.rate, pr.mp4.ch,
-                            pr.mp4.bps);
-                    logger_flush();
-                }
-            } else {
-                logLine("ac: flac unavailable slot=%d track='%s' status=%d\n",
-                        slot->slot_id, job->track.id, ym_status);
-                logger_flush();
-            }
-        }
-
-        if (dl_kind == DL_NONE) {
-            YmDownloadVariant aac_variant;
-            memset(&aac_variant, 0, sizeof(aac_variant));
-            ym_status = ym_api_download_get_aac_raw(&api_ctx, job->track.id,
-                                                    &aac_variant);
-            if (ym_status == YM_OK) {
-                AcProbeResult pr;
-                int probe_rc = ac_probe_stream(slot, aac_variant.url,
-                                               api_ctx.oauth_token, &pr);
-                if (probe_rc == 0 && pr.is_mp4 &&
-                    pr.mp4.kind == MP4_PROBE_AAC) {
-                    if (track_download_build_path_for_codec(job->track.id,
-                                                           "aac", dl_path,
-                                                           sizeof(dl_path)) == 0) {
-                        variant = aac_variant;
-                        dl_kind = DL_AAC;
-                        logLine("ac: aac committed slot=%d track='%s' bitrate=%d\n",
-                                slot->slot_id, job->track.id,
-                                aac_variant.bitrate_kbps);
-                        logger_flush();
-                    }
-                } else {
-                    logLine("ac: aac rejected slot=%d track='%s' probe_rc=%d kind=%d\n",
-                            slot->slot_id, job->track.id, probe_rc,
-                            (int)pr.mp4.kind);
-                    logger_flush();
-                }
-            } else {
-                logLine("ac: aac unavailable slot=%d track='%s' status=%d\n",
-                        slot->slot_id, job->track.id, ym_status);
-                logger_flush();
-            }
-        }
-    }
-
-    if (dl_kind == DL_NONE && !want_mp3) {
-        /* MP3-фолбэк: codecs=mp3, lq/nq -> 192, hq -> 320. */
-        if (track_download_build_path_for_codec(job->track.id, "mp3",
-                                                dl_path, sizeof(dl_path)) != 0) {
-            if (net_paused) cover_manager_resume_network();
-            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, -4);
+    for (candidate = 0; candidate < DOWNLOAD_CODEC_COUNT &&
+         plan[candidate] != DOWNLOAD_CODEC_COUNT; candidate++) {
+        DownloadCodec codec = plan[candidate];
+        YmDownloadVariant variant;
+        YmStatus status;
+        if (slot->job_cancel || s_shutdown) goto cancelled;
+        logLine("ac: fetch codec=%s slot=%d track='%s' quality=%s\n",
+                download_codec_name(codec), slot->slot_id, job->track.id,
+                codec == DOWNLOAD_CODEC_FLAC ? "lossless" : quality);
+        memset(&variant, 0, sizeof(variant));
+        status = ac_fetch_variant(&api_ctx, job->track.id, codec, quality, &variant);
+        if (status == YM_ERR_CANCELLED || slot->job_cancel || s_shutdown) goto cancelled;
+        if (status == YM_ERR_UNSUPPORTED) continue;
+        if (status != YM_OK) {
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, status);
             return -1;
         }
-        ym_status = ym_api_download_get_mp3_raw(&api_ctx, job->track.id, &variant);
-    if (ym_status != YM_OK) {
-        if (net_paused) cover_manager_resume_network();
-        if (slot->job_cancel || s_shutdown) {
-            logLine("ac: fetch url cancelled slot=%d track_id='%s'\n",
-                    slot->slot_id, job->track.id);
-            logger_flush();
-            slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
-                            NET_HTTP_STREAM_CANCELLED);
-            return 0;
-        }
-        logLine("ac: fetch url FAILED slot=%d track_id='%s' status=%d\n",
-                slot->slot_id, job->track.id, ym_status);
-        logger_flush();
-        slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, (int)ym_status);
-        return -1;
-    }
-        dl_kind = DL_MP3;
-    }
-    if (dl_kind == DL_NONE) {
-        /* Ни один кодек не согласован (mp3 выбранным форматом + AAC
-         * отказали) — ошибка, дальше с пустым variant не уходим. */
-        if (net_paused) cover_manager_resume_network();
-        logLine("ac: no codec available slot=%d track_id='%s'\n",
-                slot->slot_id, job->track.id);
-        logger_flush();
-        slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL,
-                        YM_ERR_UNSUPPORTED);
-        return -1;
-    }
-    original_variant = variant;
-
-    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    if (strcmp(slot->status.track_id, job->track.id) == 0) {
-        slot->status.bitrate_kbps = variant.bitrate_kbps;
-    }
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-
-    if (net_paused) cover_manager_resume_network();
-
-    if (slot->job_cancel || s_shutdown) {
-        asb_set_cancelled(&slot->stream_buf);
-        slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
-                        NET_HTTP_STREAM_CANCELLED);
-        return 0;
-    }
-
-    if (dl_kind == DL_FLAC) {
-        return run_file_job(slot, job, &api_ctx, "flac", dl_path);
-    }
-    if (dl_kind == DL_AAC) {
-        return run_file_job(slot, job, &api_ctx, "aac", dl_path);
-    }
-
-    slot_set_source(slot, AUDIO_CACHE_DOWNLOADING, job->track.id,
-                    dl_path, 0, 0, 0, 0, 0, 0);
-
-    logLine("ac: ram stream start slot=%d track_id='%s'\n",
-            slot->slot_id, job->track.id);
-    logger_flush();
-
-    {
-        AcRamStreamCtx ctx;
-        int rc_dl;
-        unsigned int retry_delay_us = AUDIO_CACHE_RETRY_MIN_US;
-
-        for (;;) {
-            AudioStreamBufSnapshot before;
-            int request_start;
-
-            if (asb_get_snapshot(&slot->stream_buf, &before) != 0) {
-                rc_dl = NET_HTTP_ERR_PROTOCOL;
-                break;
-            }
-            if (before.content_length > 0 &&
-                before.write_pos == before.content_length) {
-                rc_dl = 0;
-                break;
-            }
-
-            memset(&ctx, 0, sizeof(ctx));
-            ctx.slot = slot;
-            snprintf(ctx.track_id, sizeof(ctx.track_id), "%s", job->track.id);
-            ctx.content_length = before.content_length;
-            ctx.resume_write_pos = before.write_pos;
-            request_start = before.write_pos > AUDIO_CACHE_RESUME_VERIFY_BYTES
-                                ? (int)before.write_pos - AUDIO_CACHE_RESUME_VERIFY_BYTES
-                                : 0;
-            ctx.verify_pos = request_start;
-
-            rc_dl = track_download_mp3_to_ram_from(
-                variant.url, request_start,
-                before.content_length > 0 ? (int)before.content_length : 0,
-                ac_ram_chunk_cb, ac_ram_progress_cb, &ctx);
-            if (rc_dl == 0) {
-                AudioStreamBufSnapshot after;
-                memset(&after, 0, sizeof(after));
-                if (asb_get_snapshot(&slot->stream_buf, &after) == 0 &&
-                    after.content_length > 0 &&
-                    after.write_pos == after.content_length) {
-                    break;
-                }
-                logLine("ac: stream success with incomplete buffer slot=%d track='%s' bytes=%d/%d\n",
-                        slot->slot_id, job->track.id,
-                        (int)after.write_pos, (int)after.content_length);
-                rc_dl = NET_HTTP_ERR_PROTOCOL;
-                break;
-            }
-            if (rc_dl == NET_HTTP_STREAM_CANCELLED ||
-                slot->job_cancel || s_shutdown) {
-                logLine("ac: ram stream cancelled slot=%d track_id='%s' rc=%d\n",
-                        slot->slot_id, job->track.id, rc_dl);
-                logger_flush();
-                asb_set_cancelled(&slot->stream_buf);
-                slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id,
-                                NULL, NET_HTTP_STREAM_CANCELLED);
-                return 0;
-            }
-            if (!net_http_error_is_network(rc_dl)) break;
-
-            if (asb_get_snapshot(&slot->stream_buf, &before) != 0) {
-                rc_dl = NET_HTTP_ERR_PROTOCOL;
-                break;
-            }
-            slot_set_source(slot,
-                            before.write_pos >= AUDIO_CACHE_PROGRESSIVE_THRESHOLD
-                                ? AUDIO_CACHE_PROGRESSIVE_READY
-                                : AUDIO_CACHE_DOWNLOADING,
-                            job->track.id, job->path, before.write_pos,
-                            before.content_length, original_variant.bitrate_kbps,
-                            0,
-                            before.write_pos >= AUDIO_CACHE_PROGRESSIVE_THRESHOLD,
-                            rc_dl);
-            logLine("ac: ram stream interrupted slot=%d track_id='%s' rc=%d bytes=%d/%d retry_us=%u\n",
-                    slot->slot_id, job->track.id, rc_dl,
-                    (int)before.write_pos, (int)before.content_length,
-                    retry_delay_us);
-            logger_flush();
-
-            if (ac_wait_for_retry(slot, job->track.id,
-                                  sceKernelGetSystemTimeWide() + retry_delay_us) != 0) {
-                asb_set_cancelled(&slot->stream_buf);
-                slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id,
-                                NULL, NET_HTTP_STREAM_CANCELLED);
-                return 0;
-            }
-
-            ym_status = ym_api_download_get_mp3_raw(&api_ctx, job->track.id,
-                                                     &variant);
-            if (ym_status != YM_OK) {
-                if (ym_status == YM_ERR_NETWORK) {
-                    if (retry_delay_us < AUDIO_CACHE_RETRY_MAX_US / 2)
-                        retry_delay_us *= 2;
-                    else
-                        retry_delay_us = AUDIO_CACHE_RETRY_MAX_US;
-                    continue;
-                }
-                rc_dl = (int)ym_status;
-                break;
-            }
-            if (variant.bitrate_kbps != original_variant.bitrate_kbps ||
-                variant.encrypted != original_variant.encrypted ||
-                strcmp(variant.codec, original_variant.codec) != 0 ||
-                strcmp(variant.transport, original_variant.transport) != 0) {
-                logLine("ac: resumed variant mismatch slot=%d track='%s' bitrate=%d/%d codec='%s'/'%s' transport='%s'/'%s'\n",
-                        slot->slot_id, job->track.id,
-                        original_variant.bitrate_kbps, variant.bitrate_kbps,
-                        original_variant.codec, variant.codec,
-                        original_variant.transport, variant.transport);
-                rc_dl = NET_HTTP_ERR_PROTOCOL;
-                break;
-            }
-            if (retry_delay_us < AUDIO_CACHE_RETRY_MAX_US / 2)
-                retry_delay_us *= 2;
-            else
-                retry_delay_us = AUDIO_CACHE_RETRY_MAX_US;
-        }
-
-        if (rc_dl != 0) {
-            logLine("ac: ram stream failed terminal slot=%d track_id='%s' rc=%d\n",
-                    slot->slot_id, job->track.id, rc_dl);
-            logger_flush();
-            asb_set_error(&slot->stream_buf);
-            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, rc_dl);
+        logLine("ac: resolved slot=%d track='%s' requested=%s quality=%s codec=%s\n",
+                slot->slot_id, job->track.id,
+                codec == DOWNLOAD_CODEC_FLAC ? "lossless" : quality,
+                audio_quality_name(variant.quality), download_codec_name(codec));
+        cached = ac_try_cached(slot, job, variant.quality, path, sizeof(path));
+        if (slot->job_cancel || s_shutdown) goto cancelled;
+        if (cached != 0) return cached > 0 ? 0 : -1;
+        status = ac_prepare_variant(slot, job, &api_ctx, codec,
+                                    &variant, path, sizeof(path));
+        if (status == YM_ERR_CANCELLED || slot->job_cancel || s_shutdown) goto cancelled;
+        if (status == YM_ERR_UNSUPPORTED) continue;
+        if (status != YM_OK) {
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, status);
             return -1;
         }
-    }
-
-    /* The network object is complete now. Publish that before the slower
-     * Memory Stick copy so playback never buffers at EOF waiting for I/O. */
-    asb_set_complete(&slot->stream_buf);
-    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    if (strcmp(slot->status.track_id, job->track.id) == 0) {
-        slot->status.complete = 1;
-        slot->status.progressive = 1;
-        slot->status.state = AUDIO_CACHE_READY;
-        slot->status.error_code = 0;
-    }
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-
-    /* Write completed RAM buffer to disk for future cache hits. */
-    {
-        AudioStreamBufSnapshot snapshot;
-        int64_t write_size = 0;
-        if (asb_get_snapshot(&slot->stream_buf, &snapshot) == 0) {
-            write_size = snapshot.write_pos;
+        remove_rc = ac_remove_outdated_cache(slot, job, variant.quality);
+        if (slot->job_cancel || s_shutdown) goto cancelled;
+        if (remove_rc < 0) {
+            slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, remove_rc);
+            return -1;
         }
-        if (write_size > 0 && slot->stream_buf.buf && job->path[0]) {
-            u64 t0 = sceKernelGetSystemTimeWide();
-            fs_ensure_dir(job->path);
-            SceUID wfd = fs_open(job->path,
-                                 PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-            if (wfd < 0) {
-                logLine("ac: cache write open failed slot=%d '%s' rc=0x%08X\n",
-                        slot->slot_id, job->path, wfd);
-            } else {
-                const char *p = (const char *)slot->stream_buf.buf;
-                int remaining = (int)write_size;
-                int write_ok = 1;
-                /* 64 KB blocks so cancellation is honoured mid-write:
-                 * a full-track write to the Memory Stick takes seconds on
-                 * hardware and must not delay the next queued job. */
-                while (remaining > 0) {
-                    int block = remaining > 65536 ? 65536 : remaining;
-                    int rc;
-                    if (slot->job_cancel || s_shutdown) {
-                        logLine("ac: cache write cancelled slot=%d\n", slot->slot_id);
-                        write_ok = 0;
-                        break;
-                    }
-                    rc = fs_write(wfd, p, (SceSize)block);
-                    if (rc <= 0) {
-                        logLine("ac: cache write error slot=%d rc=%d\n",
-                                slot->slot_id, rc);
-                        write_ok = 0;
-                        break;
-                    }
-                    p += rc;
-                    remaining -= rc;
-                }
-                fs_close(wfd);
-                if (write_ok) {
-                    u64 t1 = sceKernelGetSystemTimeWide();
-                    logLine("ac: cache written slot=%d '%s' size=%d took=%u ms\n",
-                            slot->slot_id, job->path, (int)write_size,
-                            (unsigned)((t1 - t0) / 1000));
-                    /* Чистка cache_music — в worker_main (ac_trim_music);
-                     * обложки чистит сам cover-подсистема после загрузки. */
-                } else {
-                    fs_remove(job->path);
-                }
-            }
+        if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+        if (strcmp(slot->status.track_id, job->track.id) == 0) {
+            slot->status.bitrate_kbps = variant.bitrate_kbps;
         }
+        if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
+        cover_manager_resume_network(&job->network_pause_held);
+        if (slot->job_cancel || s_shutdown) goto cancelled;
+        return run_file_job(slot, job, &api_ctx, codec, quality, &variant, path);
     }
-
-    logLine("ac: state -> READY (ram) slot=%d track_id='%s'\n",
+    logLine("ac: no codec available slot=%d track_id='%s'\n",
             slot->slot_id, job->track.id);
+    slot_set_status(slot, AUDIO_CACHE_ERROR, job->track.id, NULL, YM_ERR_UNSUPPORTED);
+    return -1;
+
+cancelled:
+    slot_set_status(slot, AUDIO_CACHE_CANCELLED, job->track.id, NULL,
+                    NET_HTTP_STREAM_CANCELLED);
     return 0;
 }
 
@@ -1490,6 +1176,8 @@ static void ac_trim_music(const char *extra_id)
     int slot_idx[2];
     int n = 0;
     int i;
+
+    if (audio_cache_retain_downloads()) return;
 
     memset(ids, 0, sizeof(ids));
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
@@ -1523,67 +1211,163 @@ static void ac_trim_music(const char *extra_id)
     fs_evict_except("cache_music", keep, n);
 }
 
-static int worker_main(SceSize args, void *argp)
+/* Caller holds s_status_mutex. State is authoritative; the semaphore only
+ * requests another inspection of that state. */
+static int wake_slot_locked(AcSlot *slot)
 {
-    AcSlot *slot;
-
-    if (args != sizeof(slot) || !argp) return -1;
-    slot = *(AcSlot **)argp;
-    if (!slot) return -1;
-
-    log_worker_priority(sceKernelGetThreadId());
-
-    for (;;) {
-        AcJob job;
-        int have_job = 0;
-
-        sceKernelWaitSema(slot->job_sema, 1, NULL);
-
-        if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-        if (s_shutdown) {
-            if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-            break;
-        }
-        if (slot->job_pending) {
-            job = slot->pending_job;
-            slot->job_pending = 0;
-            slot->job_cancel = 0;
-            have_job = 1;
-        }
-        if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-
-        if (!have_job) continue;
-
-        /* Чистка cache_music — ПЕРЕД заданием: id забранного job
-         * уже известен (extra_id), статус слотов ещё не обновлён. */
-        ac_trim_music(job.track.id);
-        net_tls_cancel_bind(&slot->job_cancel);
-        run_download_job(slot, &job);
-        net_tls_cancel_unbind();
+    int rc;
+    if (slot->wake_pending) return 0;
+    if (slot->worker_thread < 0 || slot->job_sema < 0) return -1;
+    rc = sceKernelSignalSema(slot->job_sema, 1);
+    if (rc < 0) {
+        logLine("ac: wake failed slot=%d rc=%d\n", slot->slot_id, rc);
+        return -1;
     }
-
-    sceKernelExitThread(0);
+    slot->wake_pending = 1;
     return 0;
 }
 
-/* Отменяет текущее задание слота и стирает ещё не взятое из ящика.
- * Поток не трогаем: воркер постоянный, отмена только кооперативная. */
-static void cancel_job(AcSlot *slot)
+static int cancel_job_locked(AcSlot *slot)
 {
-    if (!slot) return;
-    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (slot->job_pending) cover_manager_resume_network(&slot->pending_job.network_pause_held);
     slot->job_pending = 0;
+    slot->wait_for = NULL;
     slot->job_cancel = 1;
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-    asb_set_cancelled(&slot->stream_buf);
+    slot->retire_requested = 1;
+    notify_source_locked(slot);
+    return wake_slot_locked(slot);
+}
+
+/* Only the slot worker commits; no new source may enter during rename. */
+static void commit_completed_file(AcSlot *slot)
+{
+    char download_path[sizeof(slot->status.path)];
+    char final_path[sizeof(slot->status.path)];
+    char track_id[sizeof(slot->status.track_id)];
+    int rc;
+
+    sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (slot->commit_state != AC_COMMIT_PENDING ||
+        slot->status.source_ref_count != 0) {
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+        return;
+    }
+    slot->commit_state = AC_COMMIT_IN_PROGRESS;
+    memcpy(download_path, slot->status.path, sizeof(download_path));
+    memcpy(track_id, slot->status.track_id, sizeof(track_id));
+    sceKernelUnlockLwMutex(&s_status_mutex, 1);
+
+    rc = audio_storage_complete_path(download_path, final_path, sizeof(final_path));
+    if (rc == 0) {
+        logLine("ac: cache commit begin slot=%d track='%s' refs=0 from='%s' to='%s'\n",
+                slot->slot_id, track_id, download_path, final_path);
+        rc = fs_rename(download_path, final_path);
+        if (rc < 0) {
+            SceIoStat previous;
+            if (fs_getstat(final_path, &previous) == 0 &&
+                fs_remove(final_path) == 0) {
+                rc = fs_rename(download_path, final_path);
+            }
+        }
+    }
+
+    sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (rc >= 0) {
+        snprintf(slot->status.path, sizeof(slot->status.path), "%s", final_path);
+        slot->commit_state = AC_COMMIT_NONE;
+    } else {
+        slot->commit_state = AC_COMMIT_FAILED;
+    }
+    sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    if (rc >= 0) {
+        logLine("ac: cache committed slot=%d track='%s' path='%s'\n",
+                slot->slot_id, track_id, final_path);
+    } else {
+        logLine("ac: cache commit failed slot=%d track='%s' rc=0x%08X; source retained '%s'\n",
+                slot->slot_id, track_id, (unsigned int)rc, download_path);
+    }
+}
+
+/* Only the slot worker calls this, after run_download_job has returned.
+ * Existing source holders block replacement until their files are released. */
+static int retire_slot_locked(AcSlot *slot)
+{
+    int i;
+    if (!slot->retire_requested) return 1;
+    if (slot->status.source_ref_count != 0) return 0;
+    logLine("ac: cancel complete slot=%d track_id='%s'\n",
+            slot->slot_id, slot->status.track_id);
+    memset(&slot->status, 0, sizeof(slot->status));
+    slot->request_track_id[0] = '\0';
+    slot->commit_state = AC_COMMIT_NONE;
+    slot->retire_requested = 0;
+    for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
+        AcSlot *waiting = &s_slots[i];
+        if (waiting->wait_for == slot && wake_slot_locked(waiting) < 0) {
+            logLine("ac: cancellation waiter unavailable slot=%d\n", i);
+        }
+    }
+    return 1;
+}
+
+static int worker_main(SceSize args, void *argp)
+{
+    AcSlot *slot;
+    if (args != sizeof(slot) || !argp) return -1;
+    slot = *(AcSlot **)argp;
+    if (!slot) return -1;
+    log_worker_priority(sceKernelGetThreadId());
+
+    for (;;) {
+        int wait_rc = sceKernelWaitSema(slot->job_sema, 1, NULL);
+        if (wait_rc < 0) {
+            logLine("ac: worker wait failed slot=%d rc=%d\n", slot->slot_id, wait_rc);
+            return wait_rc;
+        }
+        sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+        slot->wake_pending = 0;
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+        for (;;) {
+            AcJob job;
+            commit_completed_file(slot);
+            sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+            if (!retire_slot_locked(slot)) {
+                sceKernelUnlockLwMutex(&s_status_mutex, 1);
+                break;
+            }
+            if (s_shutdown) {
+                sceKernelUnlockLwMutex(&s_status_mutex, 1);
+                return 0;
+            }
+            if (!slot->job_pending ||
+                (slot->wait_for && slot->wait_for->retire_requested)) {
+                sceKernelUnlockLwMutex(&s_status_mutex, 1);
+                break;
+            }
+            job = slot->pending_job;
+            slot->request_settings = job.settings;
+            memcpy(slot->request_track_id, job.track.id, sizeof(slot->request_track_id));
+            slot->pending_job.network_pause_held = 0;
+            slot->job_pending = 0;
+            slot->wait_for = NULL;
+            slot->job_cancel = 0;
+            sceKernelUnlockLwMutex(&s_status_mutex, 1);
+            ac_trim_music(job.track.id);
+            net_tls_cancel_bind(&slot->job_cancel);
+            run_download_job(slot, &job);
+            net_tls_cancel_unbind();
+            cover_manager_resume_network(&job.network_pause_held);
+        }
+    }
 }
 
 static int post_job(AcSlot *slot, const TrackEntry *track, const char *token,
-                    int pause_network)
+                    int pause_network, AcSlot *wait_for)
 {
     AcJob job;
+    int wake_rc;
 
-    if (!slot || !track || track->id[0] == '\0' || !token || token[0] == '\0') {
+    if (!s_mutex_initialized || !slot || !track || track->id[0] == '\0' || !token || token[0] == '\0') {
         return -1;
     }
     if (slot->worker_thread < 0 || slot->job_sema < 0) {
@@ -1593,28 +1377,33 @@ static int post_job(AcSlot *slot, const TrackEntry *track, const char *token,
     }
 
     memset(&job, 0, sizeof(job));
-    if (track_download_build_path(track->id, job.path, sizeof(job.path)) != 0) {
-        logLine("ac: build_path failed for id='%s'\n", track->id);
-        slot_set_status(slot, AUDIO_CACHE_ERROR, track->id, NULL, -3);
-        return -1;
-    }
     memcpy(&job.track, track, sizeof(TrackEntry));
+    job.settings = download_settings_get();
     snprintf(job.token, sizeof(job.token), "%s", token);
-    job.pause_network = pause_network;
 
     if (pause_network) {
-        cover_manager_pause_network();
+        cover_manager_pause_network(&job.network_pause_held);
     }
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (slot->job_pending) cover_manager_resume_network(&slot->pending_job.network_pause_held);
     slot->pending_job = job;
+    job.network_pause_held = 0;
     slot->job_pending = 1;
-    slot->job_cancel = 1;  /* завершить текущее задание, если оно есть */
+    slot->job_cancel = 1;
+    slot->retire_requested = 1;
+    slot->wait_for = wait_for;
+    wake_rc = wake_slot_locked(slot);
+    if (wake_rc < 0) {
+        slot->job_pending = 0;
+        cover_manager_resume_network(&slot->pending_job.network_pause_held);
+    }
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-    sceKernelSignalSema(slot->job_sema, 1);
+    if (wake_rc < 0) {
+        return -1;
+    }
 
-    logLine("ac: job posted slot=%d track_id='%s' path='%s'\n",
-            slot->slot_id, track->id, job.path);
+    logLine("ac: job posted slot=%d track_id='%s'\n", slot->slot_id, track->id);
     return 0;
 }
 
@@ -1622,14 +1411,21 @@ void audio_cache_init(void)
 {
     int i;
 
+    load_cache_setting();
+
     memset(s_slots, 0, sizeof(s_slots));
     s_active_slot = 0;
     s_shutdown = 0;
+    for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
+        s_slots[i].worker_thread = -1;
+        s_slots[i].job_sema = -1;
+    }
 
     if (sceKernelCreateLwMutex(&s_status_mutex, "ac_status", 0, 0, NULL) >= 0) {
         s_mutex_initialized = 1;
     } else {
-        logLine("ac: WARN status mutex create failed\n");
+        logLine("ac: status mutex create failed\n");
+        return;
     }
 
     for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
@@ -1637,10 +1433,7 @@ void audio_cache_init(void)
         char name[16];
 
         slot->slot_id = i;
-        slot->worker_thread = -1;
-        slot->job_sema = -1;
         slot->self_arg = slot;
-        asb_init(&slot->stream_buf);
 
         snprintf(name, sizeof(name), "ac_job%d", i);
         slot->job_sema = sceKernelCreateSema(name, 0, 0, 64, NULL);
@@ -1674,18 +1467,14 @@ int audio_cache_quiesce(void)
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
     s_shutdown = 1;
+    int wake_failed = 0;
     for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
-        s_slots[i].job_pending = 0;
-        s_slots[i].job_cancel = 1;
-    }
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-
-    for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
-        asb_set_cancelled(&s_slots[i].stream_buf);
-        if (s_slots[i].job_sema >= 0) {
-            sceKernelSignalSema(s_slots[i].job_sema, 1);
+        if (s_slots[i].worker_thread >= 0 && cancel_job_locked(&s_slots[i]) < 0) {
+            wake_failed = 1;
         }
     }
+    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    if (wake_failed) return -1;
 
     for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
         AcSlot *slot = &s_slots[i];
@@ -1723,16 +1512,46 @@ int audio_cache_shutdown(void)
             s_mutex_initialized = 0;
     }
 
-        /* Буферы живого (утёкшего) потока не освобождаем — он может ещё
-         * писать в них; при выходе приложения память заберёт ОС. */
-    for (i = 0; i < AUDIO_CACHE_SLOT_COUNT; ++i) {
-        asb_destroy(&s_slots[i].stream_buf);
-    }
-
     memset(s_slots, 0, sizeof(s_slots));
     s_active_slot = 0;
     logLine("ac: shutdown\n");
     return 0;
+}
+
+/* Caller holds s_status_mutex. */
+static int slot_satisfies_request(const AcSlot *slot)
+{
+    DownloadSettings settings = download_settings_get();
+    return slot->status.quality >= download_settings_required_quality(settings) ||
+        (slot->request_settings.codec == settings.codec &&
+         slot->request_settings.quality == settings.quality);
+}
+
+/* Caller holds s_status_mutex. */
+static int slot_source_matches(const AcSlot *slot, const char *track_id)
+{
+    AudioCacheState state = slot->status.state;
+    return !slot->retire_requested && !slot->job_cancel &&
+        (state == AUDIO_CACHE_DOWNLOADING || state == AUDIO_CACHE_PROGRESSIVE_READY ||
+         state == AUDIO_CACHE_READY) &&
+        strcmp(slot->status.track_id, track_id) == 0 && slot_satisfies_request(slot);
+}
+
+/* Caller holds s_status_mutex. The request may precede publication of a file. */
+static int slot_has_request(const AcSlot *slot, const char *track_id)
+{
+    DownloadSettings settings = download_settings_get();
+    if (slot->job_pending) {
+        return strcmp(slot->pending_job.track.id, track_id) == 0 &&
+            slot->pending_job.settings.codec == settings.codec &&
+            slot->pending_job.settings.quality == settings.quality;
+    }
+    if (slot_source_matches(slot, track_id)) return 1;
+    return !slot->retire_requested && !slot->job_cancel &&
+        slot->status.state == AUDIO_CACHE_IDLE &&
+        strcmp(slot->request_track_id, track_id) == 0 &&
+        slot->request_settings.codec == settings.codec &&
+        slot->request_settings.quality == settings.quality;
 }
 
 int audio_cache_start(const TrackEntry *track, const char *token)
@@ -1747,99 +1566,92 @@ int audio_cache_start(const TrackEntry *track, const char *token)
     }
 
     logLine("ac: start request track_id='%s' active_slot=%d\n", track->id, slot->slot_id);
+    if (!s_mutex_initialized) return -1;
 
-    {
-        AudioCacheStatus cur;
-        audio_cache_get_status(&cur);
-        if ((cur.state == AUDIO_CACHE_DOWNLOADING ||
-             cur.state == AUDIO_CACHE_PROGRESSIVE_READY ||
-             cur.state == AUDIO_CACHE_READY) &&
-            strcmp(cur.track_id, track->id) == 0) {
-            logLine("ac: skip, same track already %s\n",
-                    cur.state == AUDIO_CACHE_READY ? "READY" :
-                    (cur.state == AUDIO_CACHE_PROGRESSIVE_READY ? "PROGRESSIVE_READY" : "DOWNLOADING"));
-            return 0;
-        }
-        if (cur.source_ref_count > 0) {
-            logLine("ac: start refused, source held for track_id='%s' (wanted '%s')\n",
-                    cur.track_id, track->id);
-            return -1;
-        }
+    sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    if (slot_source_matches(slot, track->id) ||
+        (slot->status.source_ref_count == 0 && slot_has_request(slot, track->id))) {
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+        logLine("ac: reuse active request track_id='%s'\n", track->id);
+        return 0;
     }
-
-    cancel_job(prefetch);
-    slot_clear_status(prefetch);
-    return post_job(slot, track, token, 1);
+    if (slot->status.source_ref_count > 0) {
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+        logLine("ac: start refused, active source held (wanted '%s')\n", track->id);
+        return -1;
+    }
+    if (slot_has_request(prefetch, track->id)) {
+        int cancel_rc = cancel_job_locked(slot);
+        AudioCacheState state = prefetch->status.state;
+        if (cancel_rc >= 0) s_active_slot = prefetch->slot_id;
+        sceKernelUnlockLwMutex(&s_status_mutex, 1);
+        if (cancel_rc < 0) return -1;
+        logLine("ac: reuse prefetch active_slot=%d track_id='%s' state=%s\n",
+                prefetch->slot_id, track->id, audio_cache_state_name(state));
+        return 0;
+    }
+    int cancel_rc = cancel_job_locked(prefetch);
+    sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    if (cancel_rc < 0) return -1;
+    return post_job(slot, track, token, 1, prefetch);
 }
 
-void audio_cache_prefetch_start(const TrackEntry *track, const char *token)
+int audio_cache_prefetch_start(const TrackEntry *track, const char *token)
 {
     AcSlot *slot = prefetch_slot();
     AudioCacheStatus status;
+    int active_source_held;
+    int already_requested;
 
     if (!track || track->id[0] == '\0' || !token || token[0] == '\0') {
-        return;
+        return -1;
     }
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    active_source_held = active_slot()->status.source_ref_count > 0 &&
+        strcmp(active_slot()->status.track_id, track->id) == 0;
     status = slot->status;
+    already_requested = slot_has_request(slot, track->id);
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
 
-    if ((status.state == AUDIO_CACHE_DOWNLOADING ||
-         status.state == AUDIO_CACHE_PROGRESSIVE_READY ||
-         status.state == AUDIO_CACHE_READY) &&
-        strcmp(status.track_id, track->id) == 0) {
+    if (active_source_held) return -1;
+
+    if (already_requested) {
         logLine("ac: prefetch skip same track_id='%s' state=%s\n",
                 track->id, audio_cache_state_name(status.state));
-        return;
+        return 0;
     }
 
     logLine("ac: prefetch request slot=%d track_id='%s'\n", slot->slot_id, track->id);
-    post_job(slot, track, token, 0);
+    return s_mutex_initialized ? post_job(slot, track, token, 0, NULL) : -1;
 }
 
-int audio_cache_prefetch_swap(void)
-{
-    AcSlot *slot = prefetch_slot();
-    AcSlot *old  = active_slot();
-    AudioCacheState state;
-
-    if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    state = slot->status.state;
-    if ((state != AUDIO_CACHE_PROGRESSIVE_READY && state != AUDIO_CACHE_READY) ||
-        !slot->status.track_id[0] || !slot->status.path[0]) {
-        if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-        return -1;
-    }
-    s_active_slot = slot->slot_id;
-    if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
-
-    /* Free the old active slot's RAM buffer immediately — the player has
-     * finished with it and the new active slot is now in use. */
-    asb_reset(&old->stream_buf);
-
-    logLine("ac: prefetch swap active_slot=%d track_id='%s' state=%s\n",
-            slot->slot_id, slot->status.track_id,
-            audio_cache_state_name(state));
-    return 0;
-}
-
-AudioCacheState audio_cache_prefetch_get_state(void)
+AudioCacheState audio_cache_prefetch_get_state(const char *track_id)
 {
     AudioCacheState state;
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    state = prefetch_slot()->status.state;
+    state = !track_id || strcmp(prefetch_slot()->status.track_id, track_id) != 0 ||
+        prefetch_slot()->retire_requested || !slot_satisfies_request(prefetch_slot())
+        ? AUDIO_CACHE_IDLE : prefetch_slot()->status.state;
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
     return state;
 }
 
+int audio_cache_prefetch_cancel(void)
+{
+    if (!s_mutex_initialized) return -1;
+    sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
+    int rc = cancel_job_locked(prefetch_slot());
+    sceKernelUnlockLwMutex(&s_status_mutex, 1);
+    return rc;
+}
 AudioCacheState audio_cache_get_state(void)
 {
     AudioCacheState state;
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-    state = s_slots[s_active_slot ? 1 : 0].status.state;
+    state = active_slot()->retire_requested ? AUDIO_CACHE_IDLE : active_slot()->status.state;
     if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
     return state;
 }
@@ -1850,7 +1662,8 @@ bool audio_cache_get_status(AudioCacheStatus *out)
 
     if (s_mutex_initialized) {
         sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
-        *out = s_slots[s_active_slot ? 1 : 0].status;
+        *out = active_slot()->status;
+        if (active_slot()->retire_requested) out->state = AUDIO_CACHE_IDLE;
         sceKernelUnlockLwMutex(&s_status_mutex, 1);
     } else {
         *out = s_slots[s_active_slot ? 1 : 0].status;
@@ -1867,16 +1680,18 @@ bool audio_cache_error_is_network(void)
            net_http_error_is_network(status.error_code);
 }
 
-int audio_cache_get_source(AudioSourceSnapshot *out)
+int audio_cache_get_source(const char *track_id, AudioSourceSnapshot *out)
 {
     AcSlot *slot;
 
-    if (!out) return -1;
+    if (!track_id || !out) return -1;
 
     if (s_mutex_initialized) sceKernelLockLwMutex(&s_status_mutex, 1, NULL);
     slot = &s_slots[s_active_slot ? 1 : 0];
 
-    if ((slot->status.state != AUDIO_CACHE_PROGRESSIVE_READY &&
+    if (strcmp(slot->status.track_id, track_id) != 0 ||
+        slot->retire_requested || slot->commit_state == AC_COMMIT_IN_PROGRESS ||
+        (slot->status.state != AUDIO_CACHE_PROGRESSIVE_READY &&
          slot->status.state != AUDIO_CACHE_READY) ||
         !slot->status.track_id[0] || !slot->status.path[0]) {
         if (s_mutex_initialized) sceKernelUnlockLwMutex(&s_status_mutex, 1);
@@ -1893,9 +1708,6 @@ int audio_cache_get_source(AudioSourceSnapshot *out)
     out->complete = slot->status.complete;
     out->progressive = slot->status.progressive;
     out->error_code = slot->status.error_code;
-    out->use_stream_buf = (slot->stream_buf.buf != NULL);
-    out->slot_id = slot->slot_id;
-    out->stream_buf = out->use_stream_buf ? &slot->stream_buf : NULL;
 
     slot->status.source_ref_count++;
     logLine("ac: source acquire slot=%d track_id='%s' state=%s refs=%d path='%s' bytes=%d/%d bitrate=%d complete=%d\n",
@@ -1920,6 +1732,10 @@ void audio_cache_release_source(const char *track_id)
         if (strcmp(slot->status.track_id, track_id) == 0 &&
             slot->status.source_ref_count > 0) {
             slot->status.source_ref_count--;
+            if ((slot->retire_requested || slot->commit_state == AC_COMMIT_PENDING) &&
+                slot->status.source_ref_count == 0) {
+                (void)wake_slot_locked(slot);
+            }
             logLine("ac: source release slot=%d track_id='%s' refs=%d\n",
                     slot->slot_id, track_id, slot->status.source_ref_count);
             break;

@@ -53,6 +53,12 @@ int hal_input_init(void)
         return -1;
     }
 
+    ret = sceCtrlSetIdleCancelThreshold(-1, -1);
+    if (ret < 0) {
+        logLine("hal_input: failed to disable analog idle cancellation (0x%08X)\n", ret);
+        return -1;
+    }
+
     s_kernel_ctrl_peek = sctrlHENFindFunction("sceController_Service",
                                               "sceCtrl_driver",
                                               CTRL_PEEK_POSITIVE_NID);

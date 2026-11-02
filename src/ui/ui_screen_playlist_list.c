@@ -27,8 +27,8 @@ static int playlist_list_visible_slots(void)
 {
     UiLayoutWidget items;
     int slots;
-    if (ui_layout_get_widget("playlist_list", "items", &items) != 0 ||
-        items.step <= 0.0f || items.h <= 0.0f)
+    items = ui_layout_rows_playlist_list__items;
+    if (items.step <= 0.0f || items.h <= 0.0f)
         return 0;
     slots = (int)(items.h / items.step);
     return slots < PLAYLIST_VISIBLE_SLOTS ? slots : PLAYLIST_VISIBLE_SLOTS;
@@ -41,10 +41,7 @@ void ui_screen_playlist_list_on_enter(AppState *state)
     s_marquee_selected = -1;
     s_marquee_title[0] = '\0';
     s_marquee_start_us = 0;
-    /* Refresh stale data on entry so playlist revisions (the track-cache keys)
-       are current — catches an edit made on another device. A load that just
-       completed (the gated entry from the menu) is NOT redone. */
-    library_playlists_refresh_on_enter(state);
+    (void)state;
 }
 
 /* Navigation-gate hook: kick the active tab's load and report whether the
@@ -184,7 +181,7 @@ void ui_screen_playlist_list_handle_input(AppState *state, const InputState *inp
             }
         }
     }
-    if (input->pressed & PSP_CTRL_CROSS && active_count > 0) {
+    if (input->pressed & (PSP_CTRL_CROSS | PSP_CTRL_SQUARE) && active_count > 0) {
         if (*active_selected < 0 || *active_selected >= active_count) {
             logLine("ui: playlist open rejected tab=%d index=%d count=%d\n",
                     state->playlist_tab, *active_selected, active_count);
@@ -194,7 +191,8 @@ void ui_screen_playlist_list_handle_input(AppState *state, const InputState *inp
         int rc = library_open_playlist(state, &active_list[*active_selected],
                                        state->playlist_tab, *active_selected);
         if (rc == 0) {
-            ui_screens_navigate(state, SCREEN_TRACK_LIST);
+            if (input->pressed & PSP_CTRL_SQUARE) ui_screens_play_playlist(state, -1);
+            else ui_screens_navigate(state, SCREEN_TRACK_LIST);
         } else {
             logLine("ui: playlist open start failed playlist=%d error=%d\n",
                     active_list[*active_selected].playlist_id,
@@ -257,14 +255,12 @@ typedef struct PlaylistListLayoutContext {
 
 static void playlist_list_items_widget(UiLayoutWidget *items)
 {
-    memset(items, 0, sizeof(*items));
-    ui_layout_get_widget("playlist_list", "items", items);
+    *items = ui_layout_rows_playlist_list__items;
 }
 
 static void playlist_list_tabs_widget(UiLayoutWidget *tabs)
 {
-    memset(tabs, 0, sizeof(*tabs));
-    ui_layout_get_widget("playlist_list", "tabs", tabs);
+    *tabs = ui_layout_rows_playlist_list__tabs;
 }
 
 static void playlist_list_tab_widget(int tab_index, UiLayoutWidget *tab)
@@ -273,9 +269,8 @@ static void playlist_list_tab_widget(int tab_index, UiLayoutWidget *tab)
     UiLayoutWidget first;
     const char *label;
 
-    memset(tab, 0, sizeof(*tab));
-    ui_layout_get_widget("playlist_list",
-                         tab_index == 0 ? "tab_my" : "tab_liked", tab);
+    *tab = tab_index == 0 ? ui_layout_slot_playlist_list__tab_my
+                          : ui_layout_slot_playlist_list__tab_liked;
     label = locale_get(tab_index == 0 ? LOCALE_TAB_MY_PLAYLISTS
                                       : LOCALE_TAB_LIKED_PLAYLISTS);
     tab->w = text_measure_width(label);
@@ -284,8 +279,7 @@ static void playlist_list_tab_widget(int tab_index, UiLayoutWidget *tab)
     }
 
     playlist_list_tabs_widget(&tabs);
-    memset(&first, 0, sizeof(first));
-    ui_layout_get_widget("playlist_list", "tab_my", &first);
+    first = ui_layout_slot_playlist_list__tab_my;
     tab->x += first.x + text_measure_width(
         locale_get(LOCALE_TAB_MY_PLAYLISTS)) +
         tabs.step;
@@ -307,10 +301,10 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
     int end_idx;
     int i;
 
-    if (strcmp(widget->binding, "playlist_list.tab_my") == 0 ||
-        strcmp(widget->binding, "playlist_list.tab_liked") == 0) {
+    if (widget == &ui_layout_slot_playlist_list__tab_my ||
+        widget == &ui_layout_slot_playlist_list__tab_liked) {
         UiLayoutWidget tabs;
-        int tab = strcmp(widget->binding, "playlist_list.tab_my") == 0 ? 0 : 1;
+        int tab = widget == &ui_layout_slot_playlist_list__tab_my ? 0 : 1;
         UiLayoutWidget tab_geometry;
         const char *label = locale_get(tab == 0 ? LOCALE_TAB_MY_PLAYLISTS
                                                 : LOCALE_TAB_LIKED_PLAYLISTS);
@@ -325,7 +319,7 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
         return;
     }
 
-    if (strcmp(widget->binding, "playlist_list.tab_indicator") == 0) {
+    if (widget == &ui_layout_slot_playlist_list__tab_indicator) {
         UiLayoutWidget tabs;
         UiLayoutWidget tab;
         playlist_list_tabs_widget(&tabs);
@@ -336,8 +330,8 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
         return;
     }
 
-    if (strcmp(widget->binding, "playlist_list.tabs") == 0 ||
-        strcmp(widget->binding, "playlist_list.items") == 0 ||
+    if (widget == &ui_layout_rows_playlist_list__tabs ||
+        widget == &ui_layout_rows_playlist_list__items ||
         !playlist_list_layout_rows_visible(ctx)) {
         return;
     }
@@ -350,7 +344,7 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
         end_idx = ctx->count;
     }
 
-    if (strcmp(widget->binding, "playlist_list.item_selection") == 0) {
+    if (widget == &ui_layout_slot_playlist_list__item_selection) {
         if (ctx->selected >= start_idx && ctx->selected < end_idx) {
             float row_y = items.y + (float)(ctx->selected - start_idx) * row_step;
             ui_draw_rect(items.x + widget->x, row_y + widget->y,
@@ -365,7 +359,7 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
         float x = items.x + widget->x;
         float y = row_y + widget->y;
 
-        if (strcmp(widget->binding, "playlist_list.item_covers") == 0) {
+        if (widget == &ui_layout_slot_playlist_list__item_covers) {
             if (!cover_manager_draw_cover(COVER_ENTITY_PLAYLIST,
                                           playlist->playlist_id, NULL,
                                           (int)x, (int)y,
@@ -374,8 +368,7 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
                                          playlist->playlist_id, NULL)) {
                 ui_draw_rect(x, y, widget->w, widget->h, widget->color);
             }
-        } else if (strcmp(widget->binding,
-                          "playlist_list.item_titles") == 0) {
+        } else if (widget == &ui_layout_slot_playlist_list__item_titles) {
             u32 color = i == ctx->selected
                             ? widget->color : UI_COLOR_ACTIVE;
             if (ctx->opening_tracks &&
@@ -390,8 +383,7 @@ static void playlist_list_layout_slot(const UiLayoutWidget *widget,
             } else {
                 text_render_clipped(x, y, playlist->title, color, widget->w);
             }
-        } else if (strcmp(widget->binding,
-                          "playlist_list.item_info") == 0) {
+        } else if (widget == &ui_layout_slot_playlist_list__item_info) {
             char info[128];
             format_playlist_info(info, sizeof(info), playlist, ctx->tab);
             text_render_clipped(x, y, info, widget->color, widget->w);
@@ -420,7 +412,8 @@ void ui_screen_playlist_list_render(const AppState *state)
                              : state->liked_playlists_load.status;
         context.tab = state->playlist_tab;
         context.opening_tracks =
-            ui_screens_nav_pending() == SCREEN_TRACK_LIST;
+            ui_screens_nav_pending() == SCREEN_TRACK_LIST ||
+            ui_screens_nav_action() == UI_NAV_PLAYLIST;
         context.opening_color = context.opening_tracks
                                     ? ui_common_pulse_color()
                                     : UI_COLOR_PRIMARY;
@@ -442,7 +435,7 @@ void ui_screen_playlist_list_render(const AppState *state)
         }
         context.marquee_start_us = s_marquee_start_us;
         context.now_us = state->ui_now_us;
-        (void)ui_layout_render("playlist_list", NULL,
+        (void)ui_layout_render(&ui_layout_screen_playlist_list,
                                playlist_list_layout_slot, &context);
         ui_common_draw_header(locale_get(LOCALE_SCREEN_PLAYLIST_LIST));
     }

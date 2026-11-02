@@ -15,6 +15,7 @@
 #include "services/playback_controller.h"
 #include "services/token_loader.h"
 #include "services/ym_api.h"
+#include "services/download_settings.h"
 
 #define SPEED_TEST_DURATION_MS 10000
 #define SPEED_TEST_TICKET_PRIO 0x18
@@ -136,7 +137,9 @@ static int speed_test_worker(SceSize args, void *argp)
 
     ctx.oauth_token = token;
     ctx.timeout_ms = 0;
-    ym = ym_api_download_get_aac_raw(&ctx, track_id, &variant);
+    DownloadSettings settings = download_settings_get();
+    ym = ym_api_download_get_aac_raw(&ctx, track_id,
+                                   download_quality_name(settings.quality), &variant);
     if (ym != YM_OK) {
         logLine("speedtest: url fetch failed track_id='%s' status=%d\n",
                 track_id, ym);

@@ -1,3 +1,4 @@
+#include "services/net_activity.h"
 #include "services/net_tls.h"
 
 #include <pspsdk.h>
@@ -326,7 +327,7 @@ void net_tls_cancel_unbind(void)
     if (s_cancel_mutex_ready) sceKernelUnlockLwMutex(&s_cancel_mutex, 1);
 }
 
-static int tls_cancel_pending(void)
+int net_tls_cancel_requested(void)
 {
     int i;
     int tid = sceKernelGetThreadId();
@@ -563,7 +564,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
                     tls_conn_cleanup(out_conn);
                     return NET_TLS_ERR_OFFLINE;
                 }
-                if (tls_cancel_pending()) {
+                if (net_tls_cancel_requested()) {
                     tls_conn_cleanup(out_conn);
                     return NET_TLS_ERR_CANCELLED;
                 }
@@ -631,7 +632,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
                 tls_conn_cleanup(out_conn);
                 return NET_TLS_ERR_OFFLINE;
             }
-            if (tls_cancel_pending()) {
+            if (net_tls_cancel_requested()) {
                 logLine("tls: sema wait cancelled\n");
                 logger_flush();
                 tls_conn_cleanup(out_conn);
@@ -677,7 +678,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
 
         while ((err = mbedtls_ssl_handshake(&out_conn->ssl)) != 0) {
             if (err == MBEDTLS_ERR_SSL_WANT_READ || err == MBEDTLS_ERR_SSL_WANT_WRITE) {
-                if (tls_cancel_pending()) {
+                if (net_tls_cancel_requested()) {
                     logLine("tls: handshake cancelled iter=%d\n", hs_iter);
                     logger_flush();
                     if (s_tls_handshake_sema >= 0) sceKernelSignalSema(s_tls_handshake_sema, 1);
@@ -735,7 +736,7 @@ int net_tls_connect(const char *hostname, int port, NetTlsConnection *out_conn)
 static int dns_cancel_current_thread(void *ctx)
 {
     (void)ctx;
-    return tls_cancel_pending();
+    return net_tls_cancel_requested();
 }
 
 int net_tls_connection_is_current(const NetTlsConnection *conn)
@@ -847,6 +848,8 @@ static int psp_net_send(void *ctx, const unsigned char *buf, size_t len)
 
     int ret = sceNetInetSend(conn->net.fd, buf, (int)len, 0);
 
+    net_activity_record_transfer(ret);
+
     if (ret > 0) {
         conn->send_deadline_us = 0;  // прогресс
         return ret;
@@ -860,7 +863,7 @@ static int psp_net_send(void *ctx, const unsigned char *buf, size_t len)
     int e = sceNetInetGetErrno();
     if (e == EAGAIN || e == EWOULDBLOCK) {
         u64 now = sceKernelGetSystemTimeWide();
-        if (tls_cancel_pending()) {
+        if (net_tls_cancel_requested()) {
             logLine("tls: send cancelled send#%d tid=%d\n", cnt, tid);
             logger_flush();
             return MBEDTLS_ERR_NET_SEND_FAILED;
@@ -899,6 +902,8 @@ static int psp_net_recv(void *ctx, unsigned char *buf, size_t len)
 
     int ret = sceNetInetRecv(conn->net.fd, buf, (int)len, 0);
 
+    net_activity_record_transfer(ret);
+
     if (ret > 0) {
         conn->recv_deadline_us = 0;  // прогресс: сбрасываем окно тишины
         return ret;
@@ -920,7 +925,7 @@ static int psp_net_recv(void *ctx, unsigned char *buf, size_t len)
             logger_flush();
         }
         u64 now = sceKernelGetSystemTimeWide();
-        if (tls_cancel_pending()) {
+        if (net_tls_cancel_requested()) {
             logLine("tls: recv cancelled tid=%d\n", tid);
             logger_flush();
             return MBEDTLS_ERR_NET_RECV_FAILED;

@@ -8,7 +8,7 @@
 #include <string.h>
 
 #include "cjson/cJSON.h"
-#include "services/libc_guard.h"
+#include "core/json.h"
 #include "core/fs.h"
 #include "core/logger.h"
 #include "services/net_http.h"
@@ -112,7 +112,7 @@ int ym_api_liked_albums(YmApiContext *ctx, int uid,
     if (fetch_json(ctx, url, &resp) != 0) {
         return -1;
     }
-    root = ym_json_parse(resp.body);
+    root = ym_json_parse(resp.body, NULL);
     if (!root) {
         logLine("ym_api_albums: parse failed\n");
         net_http_response_free(&resp);
@@ -215,7 +215,7 @@ int ym_api_album_tracks(YmApiContext *ctx, int album_id,
              "data/logs/album_%d_with_tracks_response.json", album_id);
     log_path[sizeof(log_path) - 1] = '\0';
     save_response_dump(log_path, &resp);
-    root = ym_json_parse(resp.body);
+    root = ym_json_parse(resp.body, NULL);
     if (!root) {
         logLine("ym_api_albums: tracks parse failed\n");
         net_http_response_free(&resp);
@@ -277,7 +277,7 @@ int ym_api_album_tracks(YmApiContext *ctx, int album_id,
             refs[n].album_id = album_id;
             if (ym_api_parse_track_from_object_for_album(e, album_id,
                                                           &entry) == 0) {
-                if (track_meta_store_put(&entry) != 0) {
+                if (track_meta_store_put(&refs[n], &entry, 0) != 0) {
                     logLine("ym_api_albums: metadata store failed track=%s album=%d\n",
                             idbuf, album_id);
                 }

@@ -8,7 +8,7 @@
 #include "core/logger.h"
 
 #define LIST_INDEX_DIR "data/cache/idx"
-#define LIST_INDEX_VERSION 1
+#define LIST_INDEX_VERSION 2
 
 /* Block of records read at a time while scanning (find). */
 #define LIST_INDEX_SCAN_BLOCK 64
@@ -38,7 +38,7 @@ static void list_index_header_fill(ListIndexHeader *h, int revision, int track_c
     memset(h, 0, sizeof(*h));
     memcpy(h->magic, "YMIX", 4);
     h->version = LIST_INDEX_VERSION;
-    h->record_size = LIST_INDEX_ID_SIZE;
+    h->record_size = sizeof(TrackRef);
     h->revision = revision;
     h->track_count = track_count;
 }
@@ -96,45 +96,42 @@ int list_index_writer_open(ListIndexWriter *w, const char *uuid, int revision)
     return 0;
 }
 
-int list_index_writer_append(ListIndexWriter *w, const char *track_id)
+int list_index_writer_append(ListIndexWriter *w, const TrackRef *ref)
 {
-    ListIndexId record;
-
-    if (!w || w->fd < 0 || !track_id || !track_id[0]) {
+    if (!w || w->fd < 0 || !ref || !ref->id[0] ||
+        !memchr(ref->id, '\0', sizeof(ref->id)) || ref->album_id <= 0)
         return -1;
-    }
-    if (strlen(track_id) >= LIST_INDEX_ID_SIZE) {
-        logLine("list_index: track id too long (%d): '%s'\n",
-                (int)strlen(track_id), track_id);
-        return -1;
-    }
-
-    memset(record, 0, sizeof(record));
-    strcpy(record, track_id);
-    if (list_index_write_fully(w->fd, record, sizeof(record)) != 0) {
-        return -1;
+    w->pending[w->pending_count++] = *ref;
+    if (w->pending_count == (int)(sizeof(w->pending) / sizeof(w->pending[0]))) {
+        if (list_index_write_fully(w->fd, w->pending, sizeof(w->pending)) != 0) return -1;
+        w->pending_count = 0;
     }
     w->count++;
     return 0;
 }
-
 int list_index_writer_commit(ListIndexWriter *w)
 {
     ListIndexHeader header;
-    const char *name;
 
     if (!w || w->fd < 0) {
         return -1;
     }
 
+    if (w->pending_count && list_index_write_fully(w->fd, w->pending,
+            w->pending_count * sizeof(w->pending[0])) != 0) {
+        list_index_writer_abort(w);
+        return -1;
+    }
+    w->pending_count = 0;
     list_index_header_fill(&header, w->revision, w->count);
     if (fs_lseek(w->fd, 0, PSP_SEEK_SET) != 0 ||
         list_index_write_fully(w->fd, &header, sizeof(header)) != 0) {
         list_index_writer_abort(w);
         return -1;
     }
-    fs_close(w->fd);
+    int close_rc = fs_close(w->fd);
     w->fd = -1;
+    if (close_rc < 0) return -1;
 
     if (fs_rename(w->part_path, w->final_path) < 0) {
         fs_remove(w->final_path); /* sceIoRename fails if target exists */
@@ -146,19 +143,6 @@ int list_index_writer_commit(ListIndexWriter *w)
         }
     }
 
-    /* Evict older revisions: keep only <uuid>_<revision>.idx. The file name
-       lives at the fixed directory-prefix offset of final_path. */
-    name = w->final_path + strlen(LIST_INDEX_DIR) + 1;
-    {
-        char prefix[96];
-        const char *rev_sep = strrchr(name, '_');
-        size_t prefix_len = rev_sep ? (size_t)(rev_sep - name) + 1 : 0;
-        if (prefix_len > 0 && prefix_len < sizeof(prefix)) {
-            memcpy(prefix, name, prefix_len);
-            prefix[prefix_len] = '\0';
-            fs_remove_siblings(LIST_INDEX_DIR, prefix, name);
-        }
-    }
     return 0;
 }
 
@@ -202,15 +186,20 @@ int list_index_open(ListIndexReader *r, const char *uuid, int revision)
         return -1;
     }
 
-    n = fs_read(r->fd, &header, sizeof(header));
+    n = 0;
+    while (n < (int)sizeof(header)) {
+        int got = fs_read(r->fd, (unsigned char *)&header + n, sizeof(header) - (size_t)n);
+        if (got <= 0) break;
+        n += got;
+    }
     if (n != (int)sizeof(header) ||
         memcmp(header.magic, "YMIX", 4) != 0 ||
         header.version != LIST_INDEX_VERSION ||
-        header.record_size != LIST_INDEX_ID_SIZE ||
+        header.record_size != sizeof(TrackRef) ||
         header.revision != revision ||
         header.track_count < 0 ||
         (SceOff)st.st_size != (SceOff)sizeof(header) +
-            (SceOff)header.track_count * LIST_INDEX_ID_SIZE) {
+            (SceOff)header.track_count * (SceOff)sizeof(TrackRef)) {
         logLine("list_index: invalid index '%s', removing\n", path);
         fs_close(r->fd);
         r->fd = -1;
@@ -231,13 +220,13 @@ void list_index_close(ListIndexReader *r)
     }
 }
 
-int list_index_read_range(ListIndexReader *r, int start, int n, ListIndexId *ids)
+int list_index_read_range(ListIndexReader *r, int start, int n, TrackRef *refs)
 {
     SceOff offset;
     int to_read;
     int got = 0;
 
-    if (!r || r->fd < 0 || !ids || start < 0 || n <= 0) {
+    if (!r || r->fd < 0 || !refs || start < 0 || n <= 0) {
         return -1;
     }
     if (start >= r->count) {
@@ -248,19 +237,20 @@ int list_index_read_range(ListIndexReader *r, int start, int n, ListIndexId *ids
         to_read = r->count - start;
     }
 
-    offset = (SceOff)sizeof(ListIndexHeader) + (SceOff)start * LIST_INDEX_ID_SIZE;
+    offset = (SceOff)sizeof(ListIndexHeader) + (SceOff)start * sizeof(TrackRef);
     if (fs_lseek(r->fd, offset, PSP_SEEK_SET) != offset) {
         return -1;
     }
 
-    while (got < to_read) {
-        int rc = fs_read(r->fd, ids[got],
-                         (size_t)(to_read - got) * LIST_INDEX_ID_SIZE);
-        if (rc <= 0 || rc % LIST_INDEX_ID_SIZE != 0) {
-            return -1;
-        }
-        got += rc / LIST_INDEX_ID_SIZE;
+    size_t bytes = (size_t)to_read * sizeof(*refs);
+    while ((size_t)got < bytes) {
+        int rc = fs_read(r->fd, (unsigned char *)refs + got, bytes - (size_t)got);
+        if (rc <= 0) return -1;
+        got += rc;
     }
+    for (int i = 0; i < to_read; ++i)
+        if (!refs[i].id[0] || !memchr(refs[i].id, '\0', sizeof(refs[i].id)) ||
+            refs[i].album_id <= 0) return -1;
     return to_read;
 }
 
@@ -268,7 +258,7 @@ int list_index_read_range(ListIndexReader *r, int start, int n, ListIndexId *ids
 static int list_index_scan_block(ListIndexReader *r, const char *track_id,
                                  int start, int count)
 {
-    ListIndexId block[LIST_INDEX_SCAN_BLOCK];
+    TrackRef block[LIST_INDEX_SCAN_BLOCK];
     int got;
     int i;
 
@@ -280,7 +270,7 @@ static int list_index_scan_block(ListIndexReader *r, const char *track_id,
         return -1;
     }
     for (i = 0; i < got; i++) {
-        if (strcmp(block[i], track_id) == 0) {
+        if (strcmp(block[i].id, track_id) == 0) {
             return start + i;
         }
     }

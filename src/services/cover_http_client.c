@@ -13,7 +13,6 @@
 #include "core/logger.h"
 #include "mbedtls/ssl.h"
 #include "services/net_stack.h"
-#include "services/net_activity.h"
 
 #define COVER_HOST "avatars.yandex.net"
 #define COVER_PORT 443
@@ -83,7 +82,6 @@ static int client_connect(CoverHttpClient *client)
 
 static int do_download(CoverHttpClient *client, const char *path, const char *file_path)
 {
-    int activity_admitted = 0;
     char request[512];
     snprintf(request, sizeof(request),
              "GET %s HTTP/1.1\r\n"
@@ -214,9 +212,6 @@ static int do_download(CoverHttpClient *client, const char *path, const char *fi
             goto done;
         }
         total_written += body_tail;
-        net_activity_begin();
-        activity_admitted = 1;
-        net_activity_body_bytes(body_tail);
     }
 
     // Stream remaining body bytes.
@@ -245,11 +240,6 @@ static int do_download(CoverHttpClient *client, const char *path, const char *fi
                 goto done;
             }
             total_written += rc;
-            if (!activity_admitted) {
-                net_activity_begin();
-                activity_admitted = 1;
-            }
-            net_activity_body_bytes(rc);
         }
     }
 
@@ -257,7 +247,6 @@ static int do_download(CoverHttpClient *client, const char *path, const char *fi
     ret = 0;
 
 done:
-    if (activity_admitted) net_activity_end();
     free(hdr_buf);
     if (ret == 0 && !net_tls_connection_is_current(&client->conn)) {
         ret = -1;

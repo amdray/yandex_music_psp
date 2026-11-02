@@ -89,15 +89,15 @@ void app_state_reset(AppState *state, ScreenId screen)
 void app_state_free_tracks(AppState *state)
 {
     assert(state);
-    if (state->track_store.ids) {
-        free(state->track_store.ids);
-        state->track_store.ids = NULL;
+    if (state->track_context.refs) {
+        free(state->track_context.refs);
+        state->track_context.refs = NULL;
     }
-    state->track_store.ids_capacity = 0;
-    state->track_store.count = 0;
-    state->track_store.ids_complete = 0;
-    memset(state->track_store.window_valid, 0, sizeof(state->track_store.window_valid));
-    state->track_store.window_start = 0;
+    state->track_context.capacity = 0;
+    state->track_context.count = 0;
+    state->track_context.complete = 0;
+    memset(state->track_window.valid, 0, sizeof(state->track_window.valid));
+    state->track_window.start = 0;
     state->track_ui.track_selected = 0;
     state->track_ui.track_scroll = 0;
 }
@@ -129,13 +129,13 @@ void app_state_reset_track_bootstrap(AppState *state, int playlist_kind,
     state->track_ui.pending_playlist_selected_index = playlist_selected_index;
 }
 
-void app_state_anchor_save(AppState *state, const char *uuid, const char *track_id, int pos)
+void app_state_anchor_save(AppState *state, const char *uuid, int pos)
 {
     TrackAnchor *slot = NULL;
     int i;
 
     assert(state);
-    if (!uuid || !uuid[0] || !track_id || !track_id[0] || pos < 0) {
+    if (!uuid || !uuid[0] || pos < 0 || pos >= state->track_context.count) {
         return;
     }
 
@@ -156,7 +156,13 @@ void app_state_anchor_save(AppState *state, const char *uuid, const char *track_
     }
 
     snprintf(slot->uuid, sizeof(slot->uuid), "%s", uuid);
-    snprintf(slot->track_id, sizeof(slot->track_id), "%s", track_id);
+    slot->ref = state->track_context.refs[pos];
+    slot->occurrence = 0;
+    for (int j = 0; j < pos; ++j) {
+        const TrackRef *ref = &state->track_context.refs[j];
+        if (ref->album_id == slot->ref.album_id && strcmp(ref->id, slot->ref.id) == 0)
+            ++slot->occurrence;
+    }
     slot->pos = pos;
 }
 

@@ -9,79 +9,7 @@
 #include "cjson/cJSON.h"
 
 #include "app/app_state.h"
-#include "services/libc_guard.h"
-
-#include <pspkernel.h>
-
-// ---------------------------------------------------------- libc guard
-// См. libc_guard.h: общий мьютекс для strtod/cJSON (кэш newlib без локов).
-static SceUID s_libc_sema = -1;
-
-void ym_libc_guard_init(void)
-{
-    if (s_libc_sema < 0) {
-        s_libc_sema = sceKernelCreateSema("ym_libc", 0, 1, 1, NULL);
-        if (s_libc_sema < 0) {
-            logLine("libc_guard: sema create failed 0x%08X\n", s_libc_sema);
-        }
-    }
-}
-
-void ym_libc_lock(void)
-{
-    if (s_libc_sema < 0) ym_libc_guard_init();
-    if (s_libc_sema >= 0) sceKernelWaitSema(s_libc_sema, 1, NULL);
-}
-
-void ym_libc_unlock(void)
-{
-    if (s_libc_sema >= 0) sceKernelSignalSema(s_libc_sema, 1);
-}
-
-cJSON *ym_json_parse(const char *text)
-{
-    cJSON *r;
-    ym_libc_lock();
-    r = cJSON_Parse(text);
-    ym_libc_unlock();
-    return r;
-}
-
-cJSON *ym_json_parse_len(const char *text, size_t len)
-{
-    cJSON *r;
-    ym_libc_lock();
-    r = cJSON_ParseWithLength(text, len);
-    ym_libc_unlock();
-    return r;
-}
-
-double ym_strtod(const char *s, char **end)
-{
-    double r;
-    ym_libc_lock();
-    r = strtod(s, end);
-    ym_libc_unlock();
-    return r;
-}
-
-int ym_fmt_fixed(char *out, size_t out_size, double v, int decimals)
-{
-    static const long long kPow[7] = { 1, 10, 100, 1000, 10000, 100000, 1000000 };
-    long long scaled, ip, fp;
-    int neg = 0;
-    if (decimals < 0) decimals = 0;
-    if (decimals > 6) decimals = 6;
-    if (v < 0) { neg = 1; v = -v; }
-    scaled = (long long)(v * (double)kPow[decimals] + 0.5);
-    ip = scaled / kPow[decimals];
-    fp = scaled % kPow[decimals];
-    if (decimals == 0) {
-        return snprintf(out, out_size, "%s%lld", neg ? "-" : "", ip);
-    }
-    return snprintf(out, out_size, "%s%lld.%0*lld", neg ? "-" : "", ip,
-                    decimals, fp);
-}
+#include "core/json.h"
 
 static void set_string_field(char *dst, size_t dst_size, const cJSON *node)
 {
@@ -121,14 +49,11 @@ int api_parser_account_status(const char *json_body, size_t json_size, UserInfo 
 
     memset(info, 0, sizeof(UserInfo));
 
-    root = ym_json_parse(json_body);
+    YmJsonError error;
+    root = ym_json_parse(json_body, &error);
     if (!root) {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr != NULL) {
-            logLine("json: account parse failed at: %s\n", error_ptr);
-        } else {
-            logLine("json: account parse failed (unknown error)\n");
-        }
+        logLine("json: account parse failed status=%d offset=%u sync=%d\n",
+                (int)error.status, (unsigned)error.offset, error.sync_error);
         return -1;
     }
 
@@ -210,14 +135,11 @@ int api_parser_playlists_list(const char *json_body, size_t json_size,
     *out = NULL;
     *out_count = 0;
 
-    root = ym_json_parse(json_body);
+    YmJsonError error;
+    root = ym_json_parse(json_body, &error);
     if (!root) {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr) {
-            logLine("json: playlists parse failed at: %s\n", error_ptr);
-        } else {
-            logLine("json: playlists parse failed (unknown error)\n");
-        }
+        logLine("json: playlists parse failed status=%d offset=%u sync=%d\n",
+                (int)error.status, (unsigned)error.offset, error.sync_error);
         return -1;
     }
 
@@ -352,7 +274,7 @@ int api_parser_liked_playlists(const char *json_body, size_t json_size,
     *out = NULL;
     *out_count = 0;
 
-    root = ym_json_parse(json_body);
+    root = ym_json_parse(json_body, NULL);
     if (!root) {
         logLine("json: liked_playlists parse failed\n");
         return -1;
@@ -496,14 +418,11 @@ int api_parser_liked_artists(const char *json_body, size_t json_size, ArtistEntr
 
     *out_count = 0;
 
-    root = ym_json_parse(json_body);
+    YmJsonError error;
+    root = ym_json_parse(json_body, &error);
     if (!root) {
-        const char *error_ptr = cJSON_GetErrorPtr();
-        if (error_ptr) {
-            logLine("json: liked_artists parse failed at: %s\n", error_ptr);
-        } else {
-            logLine("json: liked_artists parse failed (unknown error)\n");
-        }
+        logLine("json: liked_artists parse failed status=%d offset=%u sync=%d\n",
+                (int)error.status, (unsigned)error.offset, error.sync_error);
         return -1;
     }
 
@@ -610,7 +529,7 @@ int api_parser_artist_brief_info(const char *json_body, size_t json_size, Artist
         return -1;
     }
 
-    cJSON *root = ym_json_parse_len(json_body, json_size);
+    cJSON *root = ym_json_parse_len(json_body, json_size, NULL);
     if (!root) {
         return -1;
     }

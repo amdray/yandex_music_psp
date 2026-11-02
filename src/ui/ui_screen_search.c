@@ -35,7 +35,7 @@ static int s_selected = 0;
 static int s_scroll = 0;
 static int s_generation = 0;
 
-static ListIndexId s_ids[YM_API_SEARCH_MAX];
+static TrackRef s_refs[YM_API_SEARCH_MAX];
 static int s_count = 0;
 
 // Метаданные, подтянутые воркером (POST /tracks) для красивого списка.
@@ -64,20 +64,21 @@ static void search_join_worker(void)
     }
 }
 
-static YmApiStreamDecision search_hydrate_sink(const TrackEntry *entry,
+static YmApiStreamDecision search_hydrate_sink(const TrackRef *ref, const TrackEntry *entry,
                                                void *user_data)
 {
     int k;
 
     (void)user_data;
+    (void)ref;
     if (!entry || !entry->id[0]) {
         return YM_API_STREAM_CONTINUE;
     }
     for (k = 0; k < s_count; k++) {
-        if (strcmp(s_ids[k], entry->id) == 0) {
+        if (strcmp(s_refs[k].id, entry->id) == 0) {
             memcpy(&s_meta[k], entry, sizeof(*entry));
             s_meta_valid[k] = 1;
-            break;
+            s_refs[k].album_id = entry->album_id;
         }
     }
     return YM_API_STREAM_CONTINUE;
@@ -94,7 +95,7 @@ static int search_worker(SceSize args, void *argp)
     net_tls_cancel_bind((volatile int *)&s_cancel);
     ctx.oauth_token = s_token;
     ctx.timeout_ms = 0;
-    n = ym_api_search_tracks(&ctx, s_query, s_ids, YM_API_SEARCH_MAX);
+    n = ym_api_search_tracks(&ctx, s_query, s_refs, YM_API_SEARCH_MAX);
     if (n <= 0) {
         memset(s_token, 0, sizeof(s_token));
         s_count = 0;
@@ -114,7 +115,7 @@ static int search_worker(SceSize args, void *argp)
             step = YM_API_HYDRATE_MAX;
         }
         status = 0;
-        if (ym_api_tracks_hydrate(&ctx, &s_ids[h], step,
+        if (ym_api_tracks_hydrate_refs(&ctx, &s_refs[h], step,
                                   search_hydrate_sink, NULL,
                                   &status) != 0) {
             logLine("search: hydrate failed off=%d status=%d\n", h, status);
@@ -214,18 +215,20 @@ static void search_play_at(AppState *state, int index)
     // Источник PLAYBACK_QUEUE_SOURCE_NONE: результаты поиска — разовый
     // ad-hoc список без привязки к альбому/плейлисту/волне/артисту
     // (других значений enum нет, shared enums не трогаем).
-    if (playback_queue_set_from_ids(s_ids, s_count, index,
+    PlaybackQueueDraft *draft = playback_queue_prepare(s_refs, s_count, index,
                                     PLAYBACK_QUEUE_SOURCE_NONE,
-                                    0, s_generation) != 0) {
+                                    0, s_generation);
+    if (!draft) {
         logLine("search: queue set failed\n");
         logger_flush();
         return;
     }
+    playback_queue_commit(draft);
     logLine("search: play index=%d count=%d\n", index, s_count);
     logger_flush();
     memset(&state->now_playing_track, 0, sizeof(state->now_playing_track));
     snprintf(state->now_playing_track.id,
-             sizeof(state->now_playing_track.id), "%s", s_ids[index]);
+             sizeof(state->now_playing_track.id), "%s", s_refs[index].id);
     ui_screens_navigate(state, SCREEN_NOW_PLAYING);
     playback_controller_request_play_current();
 }
@@ -361,7 +364,7 @@ void ui_screen_search_render(const AppState *state)
                              row + 1, s_meta[row].title);
                 }
             } else {
-                snprintf(line, sizeof(line), "%d. %s", row + 1, s_ids[row]);
+                snprintf(line, sizeof(line), "%d. %s", row + 1, s_refs[row].id);
             }
             ui_draw_text(30.0f, y, line,
                          row == s_selected

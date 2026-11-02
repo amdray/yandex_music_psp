@@ -195,20 +195,22 @@ void ui_screen_artist_menu_handle_input(AppState *state, const InputState *input
          * Метаданные подтянет штатный PENDING-механизм очереди. */
         if (state->artist_brief_loading == 2 &&
             brief->popular_track_count > 0) {
-            ListIndexId ids[ARTIST_MAX_POPULAR_TRACKS];
+            TrackRef refs[ARTIST_MAX_POPULAR_TRACKS] = {0};
             int n = brief->popular_track_count;
             int i;
             if (n > ARTIST_MAX_POPULAR_TRACKS) {
                 n = ARTIST_MAX_POPULAR_TRACKS;
             }
             for (i = 0; i < n; i++) {
-                snprintf(ids[i], sizeof(ids[i]), "%d",
+                snprintf(refs[i].id, sizeof(refs[i].id), "%d",
                          brief->popular_tracks[i].track_id);
             }
-            if (playback_queue_set_from_ids(ids, n, 0,
+            PlaybackQueueDraft *draft = playback_queue_prepare(refs, n, 0,
                                             PLAYBACK_QUEUE_SOURCE_ARTIST,
                                             brief->artist_id,
-                                            s_generation) == 0) {
+                                            s_generation);
+            if (draft) {
+                playback_queue_commit(draft);
                 logLine("artist_menu: play top n=%d artist_id=%d\n",
                         n, brief->artist_id);
                 memset(&state->now_playing_track, 0,

@@ -6,6 +6,7 @@
 #include "services/cover_manager.h"
 #include "services/library.h"
 #include "services/net_client.h"
+#include "services/track_hydrator.h"
 #include "services/token_loader.h"
 #include "services/playback_controller.h"
 #include "services/playback_queue.h"
@@ -86,9 +87,7 @@ int ui_screen_track_list_content_ready(AppState *state)
     return 1;
 }
 
-/* Leaving the screen: remember where the cursor stood as an identity anchor
-   (track id + ordinal hint), so re-entering this playlist relocates the same
-   track even if an external edit shifted its position. */
+/* Preserve the selected occurrence of the requested track and album. */
 void ui_screen_track_list_on_exit(AppState *state)
 {
     if (!state) {
@@ -98,9 +97,8 @@ void ui_screen_track_list_on_exit(AppState *state)
     {
         int sel = state->track_ui.track_selected;
         if (state->track_boot.target_uuid[0] &&
-            sel >= 0 && sel < state->track_store.count) {
-            app_state_anchor_save(state, state->track_boot.target_uuid,
-                                  state->track_store.ids[sel], sel);
+            sel >= 0 && sel < state->track_context.count) {
+            app_state_anchor_save(state, state->track_boot.target_uuid, sel);
         }
     }
     net_client_track_store_unlock();
@@ -122,7 +120,7 @@ void ui_screen_track_list_update(AppState *state)
     int focus;
 
     net_client_track_store_lock();
-    int visible_count = state->track_store.count;
+    int visible_count = state->track_context.count;
     generation = state->track_boot.generation;
     focus = state->track_ui.track_selected;
     if (visible_count > 0) {
@@ -145,9 +143,9 @@ void ui_screen_track_list_update(AppState *state)
            the range hydrate (their cover uris only exist after hydration). */
         int hydrated = 0;
         for (int i = start_idx; i < end_idx + 2 && i < visible_count; ++i) {
-            int slot = i - state->track_store.window_start;
+            int slot = i - state->track_window.start;
             if (slot >= 0 && slot < TRACK_WINDOW_CAPACITY &&
-                state->track_store.window_valid[slot]) {
+                state->track_window.valid[slot]) {
                 hydrated++;
             }
         }
@@ -160,10 +158,10 @@ void ui_screen_track_list_update(AppState *state)
 
             for (int i = start_idx;
                  i < end_idx + 2 && i < visible_count && request_count < 7; ++i) {
-                int slot = i - state->track_store.window_start;
+                int slot = i - state->track_window.start;
                 if (slot >= 0 && slot < TRACK_WINDOW_CAPACITY &&
-                    state->track_store.window_valid[slot]) {
-                    request_tracks[request_count++] = state->track_store.window[slot];
+                    state->track_window.valid[slot]) {
+                    request_tracks[request_count++] = state->track_window.rows[slot];
                 }
             }
         }
@@ -190,12 +188,9 @@ void ui_screen_track_list_update(AppState *state)
 
 void ui_screen_track_list_handle_input(AppState *state, const InputState *input)
 {
-    int start_playback = 0;
-    TrackEntry selected_track;
-    memset(&selected_track, 0, sizeof(selected_track));
-
     net_client_track_store_lock();
-    int visible_count = state->track_store.count;
+    int visible_count = state->track_context.count;
+    int previous_selection = state->track_ui.track_selected;
 
     if (input->pressed & PSP_CTRL_UP) {
         if (state->track_ui.track_selected > 0) {
@@ -215,57 +210,25 @@ void ui_screen_track_list_handle_input(AppState *state, const InputState *input)
             }
         }
     }
-    if (input->pressed & PSP_CTRL_CROSS && visible_count > 0) {
-        /* PLAY_TRACK: tell playback_controller which track to download/play,
-         * then open the NOW_PLAYING screen which reads g_playback state.
-         * Only a hydrated row can start playback — a "..." row has no
-         * metadata yet; the press is ignored until hydration lands. */
-        int selected = state->track_ui.track_selected;
-        int slot = selected - state->track_store.window_start;
-        if (selected >= 0 && selected < visible_count &&
-            slot >= 0 && slot < TRACK_WINDOW_CAPACITY &&
-            state->track_store.window_valid[slot]) {
-            const PlaylistEntry *active_list = (state->playlist_tab == 0) ? state->playlists : state->liked_playlists;
-            int active_count = (state->playlist_tab == 0) ? state->playlist_count : state->liked_playlist_count;
-            int active_selected = (state->playlist_tab == 0) ? state->playlist_selected : state->liked_playlist_selected;
-            int source_id = 0;
-
-            if (active_selected >= 0 && active_selected < active_count) {
-                source_id = active_list[active_selected].playlist_id;
-            }
-
-            if (!state->track_store.window[slot].available) {
-                logLine("ui: play blocked unavailable track_id='%s'\n",
-                        state->track_store.window[slot].id);
-            } else if (playback_queue_set_from_ids(state->track_store.ids,
-                                            visible_count,
-                                            selected,
-                                            PLAYBACK_QUEUE_SOURCE_PLAYLIST,
-                                            source_id,
-                                            state->track_boot.generation) != 0) {
-                logLine("ui: queue set failed selected=%d count=%d\n",
-                        selected, visible_count);
-            } else {
-                logLine("ui: play selected=%d count=%d source_id=%d generation=%d track_id='%s'\n",
-                        selected,
-                        visible_count,
-                        source_id,
-                        state->track_boot.generation,
-                        state->track_store.window[slot].id);
-                memcpy(&selected_track, &state->track_store.window[slot], sizeof(TrackEntry));
-                start_playback = 1;
-            }
-        }
+    int selected = state->track_ui.track_selected;
+    int slot = selected - state->track_window.start;
+    int play = (input->pressed & PSP_CTRL_CROSS) && selected >= 0 &&
+        selected < visible_count && slot >= 0 && slot < TRACK_WINDOW_CAPACITY &&
+        state->track_window.valid[slot] && state->track_window.rows[slot].available;
+    if (input->pressed & PSP_CTRL_CROSS) {
+        int valid = slot >= 0 && slot < TRACK_WINDOW_CAPACITY && state->track_window.valid[slot];
+        logLine("track_play: cross selected=%d count=%d window_start=%d row_ready=%d available=%d complete=%d boot=%d generation=%d accepted=%d\n",
+            selected, visible_count, state->track_window.start, valid,
+            valid ? state->track_window.rows[slot].available : -1,
+            state->track_context.complete, state->track_boot.status,
+            state->track_boot.generation, play != 0);
     }
     net_client_track_store_unlock();
-
-    if (start_playback) {
-        memcpy(&state->now_playing_track, &selected_track, sizeof(TrackEntry));
-        ui_screens_navigate(state, SCREEN_NOW_PLAYING);
-        playback_controller_request_play_current();
-    }
+    if (previous_selection != state->track_ui.track_selected)
+        track_hydrator_cancel(TRACK_HYDRATOR_SCREEN);
+    if (input->pressed & PSP_CTRL_CROSS) logger_flush();
+    if (play) ui_screens_play_playlist(state, selected);
 }
-
 void ui_screen_track_list_render(const AppState *state)
 {
     ui_draw_clear(UI_COLOR_BACKGROUND);
@@ -285,7 +248,7 @@ void ui_screen_track_list_render(const AppState *state)
     int visible_count = 0;
 
     net_client_track_store_lock();
-    visible_count = state->track_store.count;
+    visible_count = state->track_context.count;
     selected_index = state->track_ui.track_selected;
     int start_idx = state->track_ui.track_scroll;
     if (start_idx < 0) {
@@ -300,10 +263,10 @@ void ui_screen_track_list_render(const AppState *state)
         end_idx = visible_count;
     }
     for (int i = start_idx; i < end_idx; ++i) {
-        int slot = i - state->track_store.window_start;
+        int slot = i - state->track_window.start;
         if (slot >= 0 && slot < TRACK_WINDOW_CAPACITY &&
-            state->track_store.window_valid[slot]) {
-            visible_tracks[visible_tracks_count] = state->track_store.window[slot];
+            state->track_window.valid[slot]) {
+            visible_tracks[visible_tracks_count] = state->track_window.rows[slot];
             visible_valid[visible_tracks_count] = 1;
         } else {
             /* Row not hydrated yet (scrolled outside the window): placeholder

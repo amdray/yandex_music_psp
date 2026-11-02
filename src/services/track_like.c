@@ -6,104 +6,186 @@
 #include <string.h>
 
 #include "core/logger.h"
+#include "services/net_tls.h"
 #include "services/token_loader.h"
-#include "services/ym_api_like.h"
 
-typedef struct LikeJob {
-    char token[256];
-    char track_id[40];
+/* The worker exclusively owns s_library while s_tid >= 0. The UI reads
+ * published state only after STOPPED and never reads a changing collection. */
+typedef struct {
+    char token[256]; /* Same token contract as token_loader. */
+    char track_id[TRACK_ID_SIZE];
     int uid;
-    int target;
+    unsigned int generation;
+    int mutate;
+    YmReactionAction action;
     int result;
 } LikeJob;
 
 static SceUID s_tid = -1;
 static LikeJob s_job;
-static char s_marked_track[40];
-static int s_marked_on;
+static YmReactions s_library;
+static int s_uid;
+static unsigned int s_generation;
+static char s_track_id[TRACK_ID_SIZE];
+static YmReaction s_visible = YM_REACTION_UNKNOWN;
+static int s_sync_pending;
+static int s_sync_error;
+static int s_action_error;
+static int s_stopping;
+static volatile int s_cancel;
 
 static int like_worker(SceSize args, void *argp)
 {
     YmApiContext ctx;
-
     (void)args;
     (void)argp;
     ctx.oauth_token = s_job.token;
     ctx.timeout_ms = 0;
-    logLine("like: post id='%s' like=%d\n", s_job.track_id, s_job.target);
-    s_job.result = ym_api_track_like(&ctx, s_job.uid, s_job.track_id,
-                                     s_job.target);
-    if (s_job.result == 0) {
-        logLine("like: ok id='%s' like=%d\n", s_job.track_id, s_job.target);
-    } else {
-        logLine("like: failed id='%s' like=%d\n", s_job.track_id, s_job.target);
-    }
-    logger_flush();
+    net_tls_cancel_bind(&s_cancel);
+    if (s_job.mutate)
+        s_job.result = ym_api_reaction_set(&ctx, s_job.uid, &s_library,
+                                           s_job.track_id, s_job.action);
+    else
+        s_job.result = ym_api_reactions_sync(&ctx, &s_library);
+    net_tls_cancel_unbind();
     memset(s_job.token, 0, sizeof(s_job.token));
     return 0;
 }
 
-void track_like_poll(void)
+static void refresh_visible(void)
+{
+    s_visible = ym_reactions_get(&s_library, s_track_id);
+}
+
+static void poll_worker(void)
 {
     SceKernelThreadRunStatus status;
-
-    if (s_tid < 0) {
-        return;
-    }
+    if (s_tid < 0) return;
     status.size = sizeof(status);
     if (sceKernelReferThreadRunStatus(s_tid, &status) != 0 ||
-        status.status != PSP_THREAD_STOPPED) {
-        return;
-    }
-    if (s_job.result == 0) {
-        snprintf(s_marked_track, sizeof(s_marked_track), "%s", s_job.track_id);
-        s_marked_on = s_job.target;
-    }
-    sceKernelDeleteThread(s_tid);
+        status.status != PSP_THREAD_STOPPED) return;
+    /* Do not reuse the job storage unless the previous thread is gone. */
+    if (sceKernelDeleteThread(s_tid) < 0) return;
     s_tid = -1;
+    if (s_job.generation != s_generation) {
+        ym_reactions_free(&s_library);
+    } else if (s_job.mutate) {
+        if (strcmp(s_job.track_id, s_track_id) == 0)
+            s_action_error = s_job.result;
+        /* Also reconcile an ambiguous failure: the server may have committed
+         * a mutation before the connection/response failed. No mutation retry. */
+        s_sync_pending = 1;
+    } else {
+        s_sync_error = s_job.result;
+    }
     memset(&s_job, 0, sizeof(s_job));
+    refresh_visible();
+}
+
+static int start_job(int mutate)
+{
+    memset(&s_job, 0, sizeof(s_job));
+    if (token_loader_read(s_job.token, sizeof(s_job.token)) != 0)
+        return YM_ERR_AUTH;
+    s_job.uid = s_uid;
+    s_job.generation = s_generation;
+    s_job.mutate = mutate;
+    strcpy(s_job.track_id, s_track_id);
+    s_job.action = s_visible == YM_REACTION_LIKE
+        ? YM_REACTION_REMOVE_LIKE : YM_REACTION_ADD_LIKE;
+    s_job.result = YM_ERR_HTTP;
+    s_cancel = 0;
+    /* В ответах data/research/collection-sync-20261029-101300 максимум
+     * 7 уровней вложенности: до 8 кадров parse_value по 120 байт
+     * в проверенной сборке. Эти 960 байт учитывают только рекурсивные
+     * кадры парсера, а не полную цепочку вызовов потока. */
+    s_tid = sceKernelCreateThread("like_worker", like_worker,
+                                  0x18, 32 * 1024, 0, NULL);
+    if (s_tid < 0) goto fail;
+    if (sceKernelStartThread(s_tid, 0, NULL) < 0) {
+        sceKernelDeleteThread(s_tid);
+        s_tid = -1;
+        goto fail;
+    }
+    return YM_OK;
+fail:
+    memset(s_job.token, 0, sizeof(s_job.token));
+    return YM_ERR_HTTP;
+}
+
+void track_like_update(int uid, const char *track_id)
+{
+    if (s_stopping) return;
+    if (!track_id) track_id = "";
+    if (uid != s_uid) {
+        s_cancel = 1;
+        s_generation++;
+        s_uid = uid;
+        s_visible = YM_REACTION_UNKNOWN;
+        s_sync_error = s_action_error = 0;
+        s_sync_pending = uid > 0;
+        if (s_tid < 0) ym_reactions_free(&s_library);
+    }
+    if (strcmp(track_id, s_track_id) != 0) {
+        s_action_error = 0;
+        if (strlen(track_id) >= sizeof(s_track_id)) {
+            s_track_id[0] = '\0';
+            s_visible = YM_REACTION_UNKNOWN;
+            s_sync_error = YM_ERR_PARSE;
+            return;
+        }
+        strcpy(s_track_id, track_id);
+        s_visible = YM_REACTION_UNKNOWN;
+        if (s_tid < 0) refresh_visible();
+        s_sync_pending = uid > 0;
+    }
+    poll_worker();
+    if (s_tid < 0 && s_uid > 0 && s_sync_pending) {
+        s_sync_pending = 0;
+        s_sync_error = start_job(0);
+    }
+}
+
+YmReaction track_like_state(const char *track_id)
+{
+    return track_id && strcmp(track_id, s_track_id) == 0
+        ? s_visible : YM_REACTION_UNKNOWN;
 }
 
 int track_like_is_on(const char *track_id)
 {
-    return track_id && track_id[0] && s_marked_on &&
-           strcmp(s_marked_track, track_id) == 0;
+    return track_like_state(track_id) == YM_REACTION_LIKE;
+}
+
+int track_like_error(const char *track_id)
+{
+    if (!track_id || strcmp(track_id, s_track_id) != 0) return 0;
+    return s_action_error ? s_action_error : s_sync_error;
 }
 
 void track_like_request_toggle(int uid, const char *track_id)
 {
-    if (!track_id || !track_id[0] || uid <= 0) {
-        return;
+    track_like_update(uid, track_id);
+    if (s_stopping || uid <= 0 || !track_id || !track_id[0] || s_tid >= 0) return;
+    s_action_error = 0;
+    if (s_visible == YM_REACTION_UNKNOWN) {
+        s_sync_pending = 1;
+        return; /* Unknown is not equivalent to unliked. Retry the read first. */
     }
-    track_like_poll();
+    s_action_error = start_job(1);
+}
+
+int track_like_quiesce(void)
+{
+    s_stopping = 1;
+    s_cancel = 1;
     if (s_tid >= 0) {
-        logLine("like: busy, ignored\n");
-        return;
+        /* Same bounded join as net_client_playlist_load_quiesce(). */
+        SceUInt timeout_us = 20000000U;
+        if (sceKernelWaitThreadEnd(s_tid, &timeout_us) < 0) {
+            logLine("reactions: worker still active; resources retained\n");
+            return -1;
+        }
     }
-    if (strlen(track_id) >= sizeof(s_job.track_id)) {
-        logLine("like: track id too long\n");
-        return;
-    }
-    if (token_loader_read(s_job.token, sizeof(s_job.token)) != 0) {
-        logLine("like: no token\n");
-        memset(&s_job, 0, sizeof(s_job));
-        return;
-    }
-    s_job.uid = uid;
-    snprintf(s_job.track_id, sizeof(s_job.track_id), "%s", track_id);
-    s_job.target = track_like_is_on(track_id) ? 0 : 1;
-    s_job.result = -1;
-    s_tid = sceKernelCreateThread("like_worker", like_worker,
-                                  0x18, 32 * 1024, 0, NULL);
-    if (s_tid < 0) {
-        logLine("like: create thread failed 0x%08X\n", s_tid);
-        memset(&s_job, 0, sizeof(s_job));
-        return;
-    }
-    if (sceKernelStartThread(s_tid, 0, NULL) < 0) {
-        logLine("like: start thread failed\n");
-        sceKernelDeleteThread(s_tid);
-        s_tid = -1;
-        memset(&s_job, 0, sizeof(s_job));
-    }
+    return 0;
 }

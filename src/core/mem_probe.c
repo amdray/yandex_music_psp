@@ -1,3 +1,5 @@
+/* Статически проверен и зафиксирован: сбор показателей памяти
+ * и история отсчётов. */
 #include "core/mem_probe.h"
 
 #include <malloc.h>
@@ -10,53 +12,31 @@ static int s_history_start = 0;
 static int s_history_count = 0;
 static u64 s_last_sample_us = 0;
 
-/* Defined by PSP_HEAP_SIZE_KB(...) in main.c (expands to
- * `int sce_newlib_heap_kb_size = <kb>`). Positive = fixed heap size in KB;
- * negative = "all free minus |value| KB" (dynamic, no fixed cap). */
+/* Defined by PSP_HEAP_SIZE_KB(...) in main.c. */
 extern int sce_newlib_heap_kb_size;
 
-size_t mem_heap_cap(void)
+static u32 configured_heap_size(void)
 {
     int kb = sce_newlib_heap_kb_size;
-    if (kb <= 0) return 0;                 /* dynamic sizing: no fixed ceiling */
-    return (size_t)kb * 1024u;
-}
-
-size_t mem_heap_used(void)
-{
-    struct mallinfo mi = mallinfo();
-    return (size_t)mi.uordblks;
-}
-
-size_t mem_heap_free(void)
-{
-    size_t cap  = mem_heap_cap();
-    size_t used = mem_heap_used();
-    if (cap == 0) return 0;
-    return cap > used ? cap - used : 0;
-}
-
-size_t mem_partition_free(void)
-{
-    int f = sceKernelMaxFreeMemSize();
-    return f > 0 ? (size_t)f : 0;
+    return kb > 0 ? (u32)kb * 1024u : 0;
 }
 
 void mem_probe_update(u64 now_us)
 {
     MemProbeSample sample;
+    struct mallinfo mi;
     int slot;
 
     if (s_history_count > 0 && now_us - s_last_sample_us < MEM_PROBE_INTERVAL_US) {
         return;
     }
 
-    sample.heap_cap = (u32)mem_heap_cap();
-    sample.heap_used = (u32)mem_heap_used();
-    if (sample.heap_used > sample.heap_cap && sample.heap_cap != 0) {
-        sample.heap_used = sample.heap_cap;
-    }
-    sample.largest_free = (u32)mem_partition_free();
+    sample.time_us = now_us;
+    sample.heap_configured = configured_heap_size();
+    mi = mallinfo();
+    sample.heap_used = (u32)mi.uordblks;
+    sample.partition_free = sceKernelTotalFreeMemSize();
+    sample.partition_largest_free = sceKernelMaxFreeMemSize();
 
     if (s_history_count < MEM_PROBE_HISTORY_CAPACITY) {
         slot = (s_history_start + s_history_count) % MEM_PROBE_HISTORY_CAPACITY;

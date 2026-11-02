@@ -8,7 +8,6 @@
 
 #include "core/fs.h"
 #include "core/logger.h"
-#include "services/ym_api.h"
 
 #define EQ_CFG_PATH "config/eq.cfg"
 #define EQ_TOAST_US 2500000ULL
@@ -278,12 +277,11 @@ void eq_save(void)
     int w, len;
 
     len = snprintf(buf, sizeof(buf),
-                   "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\nquality=%s\n",
+                   "preset=%d\ncustom=%d,%d,%d,%d,%d,%d,%d\n",
                    s_preset,
                    (int)s_custom[0], (int)s_custom[1], (int)s_custom[2],
                    (int)s_custom[3], (int)s_custom[4], (int)s_custom[5],
-                   (int)s_custom[6],
-                   ym_api_download_quality());
+                   (int)s_custom[6]);
     if (len <= 0 || len >= (int)sizeof(buf)) {
         return;
     }
@@ -299,7 +297,6 @@ void eq_init(void)
     int n, p, b;
     int g[EQ_BANDS];
     const char *pl;
-    char q[8];
 
     for (b = 0; b < EQ_BANDS; b++) {
         s_custom[b] = 0.0f;
@@ -323,10 +320,6 @@ void eq_init(void)
                 for (b = 0; b < EQ_BANDS; b++) {
                     s_custom[b] = clamp_db((float)g[b]);
                 }
-            }
-            pl = strstr(buf, "quality=");
-            if (pl && sscanf(pl, "quality=%7s", q) == 1) {
-                ym_api_download_set_quality(q);
             }
             logLine("eq: loaded preset=%d\n", s_preset);
         }

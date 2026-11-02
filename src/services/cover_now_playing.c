@@ -6,8 +6,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "core/fs.h"
 #include "core/logger.h"
+#include "core/fs.h"
 #include "services/audio_player.h"
 #include "services/cover_storage.h"
 #include "services/image_loader.h"
@@ -223,7 +223,6 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
         int stride_bytes = 0;
         int downloaded = 0;
         int commit_rc;
-        SceUID fd;
 
         if (sceKernelWaitSema(s_worker_sema, 1, NULL) < 0 || !s_worker_running) break;
 
@@ -249,13 +248,20 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
 
         if (kind == COVER_JOB_NONE) continue;
 
-        cover_storage_build_path(COVER_ENTITY_ALBUM, request.album_id,
-                                 COVER_SIZE_NOW_PLAYING, cover_path, sizeof(cover_path));
+        if (cover_storage_build_path(COVER_ENTITY_ALBUM, request.album_id,
+                                     COVER_SIZE_NOW_PLAYING, cover_path, sizeof(cover_path)) != 0) {
+            logLine("cover_now_playing: invalid cache path id=%d\n", request.album_id);
+            if (kind == COVER_JOB_CURRENT) set_current_error_if_current(&request);
+            goto job_done;
+        }
 
-        fd = fs_open(cover_path, PSP_O_RDONLY, 0);
-        if (fd >= 0) {
-            fs_close(fd);
-        } else {
+        int stored = cover_storage_contains(cover_path);
+        if (stored < 0) {
+            logLine("cover_now_playing: cache access failed id=%d\n", request.album_id);
+            if (kind == COVER_JOB_CURRENT) set_current_error_if_current(&request);
+            goto job_done;
+        }
+        if (stored == 0) {
             if (net_client_build_cover_url(request.cover_uri, COVER_SIZE_NOW_PLAYING,
                                            cover_url, sizeof(cover_url)) != 0) {
                 logLine("cover_now_playing: cover URL exceeds buffer album_id=%d\n",
@@ -276,7 +282,6 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
                 goto job_done;
             }
             downloaded = 1;
-            fs_evict_oldest("data/cache/covers", COVER_DISK_KEEP);
         }
 
         state_lock();
@@ -284,10 +289,11 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
         state_unlock();
         if (commit_rc != 0) goto job_done;
 
-        if (image_load_rgba8888(cover_path, &decoded_rgba, &w, &h, &stride_bytes) != 0) {
+        int dec_rc = image_load_rgba8888(cover_path, &decoded_rgba, &w, &h, &stride_bytes);
+        if (dec_rc == IMAGE_ERR_INVALID_DATA) fs_remove(cover_path);
+        if (dec_rc != IMAGE_OK) {
             logLine("cover_now_playing: decode failed album_id=%d path=%s\n",
                     request.album_id, cover_path);
-            fs_remove(cover_path);
             if (kind == COVER_JOB_CURRENT) set_current_error_if_current(&request);
             goto job_done;
         }

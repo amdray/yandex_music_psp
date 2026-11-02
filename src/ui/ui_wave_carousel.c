@@ -9,16 +9,15 @@
 
 #include "app/app_state.h"
 #include "core/logger.h"
-#include "services/audio_player.h"
 #include "services/cover_manager.h"
 #include "services/locale.h"
-#include "services/playback_controller.h"
 #include "services/token_loader.h"
 #include "services/wave.h"
 #include "services/ym_api_rotor.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_common.h"
 #include "ui/ui_glow_bg.h"
+#include "ui/ui_screens.h"
 
 #define CAROUSEL_MAX_CARDS 8
 #define CAROUSEL_VISIBLE 6
@@ -31,7 +30,6 @@ static int s_selected = 0;
 static int s_scroll = 0;
 static int s_loading = 0;   // воркер карточек летит
 static int s_error = 0;
-static int s_pending_session = 0;  // ждём session/new после выбора
 static SceUID s_tid = -1;
 static char s_token[256];
 static int s_want_album = 0;
@@ -135,7 +133,6 @@ void carousel_open(AppState *state)
     s_selected = 0;
     s_scroll = 0;
     s_error = 0;
-    s_pending_session = 0;
     memset(s_cards, 0, sizeof(s_cards));
     if (album_id <= 0) {
         // Без контекста альбома — только «волна по треку», без запроса.
@@ -169,7 +166,6 @@ void carousel_open(AppState *state)
 void carousel_close(void)
 {
     s_open = 0;
-    s_pending_session = 0;
     carousel_join();
     s_loading = 0;
 }
@@ -190,62 +186,30 @@ static void carousel_reap(void)
     }
 }
 
-// Запуск сессии по набору сидов: текущий трек закрывается одним skip.
+/* Context selection uses the same transition as the main menu. */
 static void carousel_start_session(AppState *state, const char *const *seeds,
                                    int seed_count, int wave_model)
 {
-    char token[256];
-    AudioPlayerSnapshot snap;
-    char tid[40];
-    int alb = 0, pos = 0, len = 0;
+    WaveRequestParams params = {0};
+    int i;
 
-    if (!state || !seeds || seed_count <= 0) {
+    if (!state || !seeds || seed_count <= 0 || seed_count > WAVE_SEEDS_MAX) {
         return;
     }
-    snprintf(tid, sizeof(tid), "%s", state->now_playing_track.id);
-    alb = state->now_playing_track.album_id;
-    if (audio_player_get_snapshot(&snap)) {
-        pos = snap.position_ms;
-        len = snap.duration_ms;
+    params.seed_count = seed_count;
+    params.include_wave_model = wave_model;
+    for (i = 0; i < seed_count; i++) {
+        if (!seeds[i] || strlen(seeds[i]) >= sizeof(params.seeds[i])) return;
+        strcpy(params.seeds[i], seeds[i]);
     }
-    if (tid[0] && pos > 0) {
-        wave_note_skip(tid, alb, pos, len);
-    }
-    if (token_loader_read(token, sizeof(token)) != 0) {
-        return;
-    }
-    logLine("carousel: start session seeds=%d\n", seed_count);
-    wave_start_seeds(token, seeds, seed_count, wave_model);
-    memset(token, 0, sizeof(token));
-    s_pending_session = 1;
-    s_open = 0;  // оверлей закрываем сразу, трек подхватит update
+    ui_screens_start_wave(state, &params);
+    s_open = 0;
 }
 
 void carousel_update(AppState *state)
 {
-    char first_id[40];
-    int rc;
-
+    (void)state;
     carousel_reap();
-    if (!s_open && !s_pending_session) {
-        return;
-    }
-    if (!s_pending_session) {
-        return;
-    }
-    rc = wave_poll_first(first_id, sizeof(first_id));
-    if (rc == 1) {
-        memset(&state->now_playing_track, 0, sizeof(state->now_playing_track));
-        snprintf(state->now_playing_track.id, sizeof(state->now_playing_track.id),
-                 "%s", first_id);
-        s_pending_session = 0;
-        playback_controller_request_play_current();
-        logLine("carousel: session playing\n");
-    } else if (rc == -1) {
-        s_pending_session = 0;
-        logLine("carousel: session failed\n");
-    }
-    logger_flush();
 }
 
 void carousel_input(AppState *state, const InputState *input)
@@ -286,12 +250,8 @@ void carousel_input(AppState *state, const InputState *input)
                      state->now_playing_track.id);
             logLine("carousel: track wave\n");
             {
-                // seeds[] должен жить до вызова — локальный массив ок
-                // (wave_start_seeds копирует синхронно внутрь start).
-                static char s_seed_copy[64];
                 const char *arr[1];
-                snprintf(s_seed_copy, sizeof(s_seed_copy), "%s", seedbuf);
-                arr[0] = s_seed_copy;
+                arr[0] = seedbuf;
                 carousel_start_session(state, arr, 1, 1);
             }
         } else {

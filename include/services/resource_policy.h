@@ -8,7 +8,6 @@ typedef enum {
 
 void resource_policy_set_audio_active(int active);
 int resource_policy_is_audio_active(void);
-int resource_policy_may_start(ResourceClass cls);
 void resource_policy_cooperate(ResourceClass cls, int bytes);
 
 #endif

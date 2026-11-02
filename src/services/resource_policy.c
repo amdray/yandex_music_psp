@@ -26,19 +26,6 @@ int resource_policy_is_audio_active(void)
     return s_audio_active ? 1 : 0;
 }
 
-int resource_policy_may_start(ResourceClass cls)
-{
-    if (!resource_policy_is_audio_active()) {
-        return 1;
-    }
-
-    if (cls == RESOURCE_CLASS_BROWSER_COVER) {
-        return 1;
-    }
-
-    return 1;
-}
-
 void resource_policy_cooperate(ResourceClass cls, int bytes)
 {
     if (cls == RESOURCE_CLASS_BROWSER_COVER) {

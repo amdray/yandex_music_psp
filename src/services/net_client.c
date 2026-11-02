@@ -81,18 +81,6 @@ typedef struct {
     ArtistBriefInfo brief;
 } ArtistLoadResult;
 
-typedef struct {
-    struct AppState *state;
-    int generation;
-    int playlist_kind;
-    /* Revision-keyed ordered id-index written while the response streams. */
-    ListIndexWriter index_writer;
-    int index_active;
-    ListIndexId *staged_ids;
-    int staged_count;
-    int staged_capacity;
-    YmPlaylistTracksParser ym_parser;
-} TrackBootstrapParser;
 
 static SceUID s_track_boot_thread = -1;
 static SceUID s_track_boot_sema = -1;
@@ -204,18 +192,18 @@ int net_client_track_window_ready_locked(const struct AppState *state, int pos, 
     int end;
     int i;
 
-    if (!state || state->track_store.count <= 0 || pos < 0 ||
-        pos >= state->track_store.count) {
+    if (!state || state->track_context.count <= 0 || pos < 0 ||
+        pos >= state->track_context.count) {
         return 0;
     }
     end = pos + span;
-    if (end > state->track_store.count) {
-        end = state->track_store.count;
+    if (end > state->track_context.count) {
+        end = state->track_context.count;
     }
     for (i = pos; i < end; i++) {
-        int slot = i - state->track_store.window_start;
+        int slot = i - state->track_window.start;
         if (slot < 0 || slot >= TRACK_WINDOW_CAPACITY ||
-            !state->track_store.window_valid[slot]) {
+            !state->track_window.valid[slot]) {
             return 0;
         }
     }
@@ -256,25 +244,25 @@ static int track_boot_ensure_id_capacity(struct AppState *state, int required)
     if (!state) {
         return -1;
     }
-    if (required <= state->track_store.ids_capacity) {
+    if (required <= state->track_context.capacity) {
         return 0;
     }
 
-    int new_capacity = state->track_store.ids_capacity > 0
-                           ? state->track_store.ids_capacity
+    int new_capacity = state->track_context.capacity > 0
+                           ? state->track_context.capacity
                            : TRACK_BOOT_INITIAL_CAPACITY;
     while (new_capacity < required) {
         new_capacity *= 2;
     }
 
-    ListIndexId *new_ids = (ListIndexId *)realloc(state->track_store.ids,
-                                                  (size_t)new_capacity * sizeof(ListIndexId));
+    TrackRef *new_ids = (TrackRef *)realloc(state->track_context.refs,
+                                                  (size_t)new_capacity * sizeof(TrackRef));
     if (!new_ids) {
         return -1;
     }
 
-    state->track_store.ids = new_ids;
-    state->track_store.ids_capacity = new_capacity;
+    state->track_context.refs = new_ids;
+    state->track_context.capacity = new_capacity;
     return 0;
 }
 
@@ -282,69 +270,14 @@ static int track_boot_ensure_id_capacity(struct AppState *state, int required)
    Caller holds the track-store lock. */
 static void track_window_set_locked(struct AppState *state, int pos, const TrackEntry *entry)
 {
-    int slot = pos - state->track_store.window_start;
+    int slot = pos - state->track_window.start;
     if (slot >= 0 && slot < TRACK_WINDOW_CAPACITY) {
-        memcpy(&state->track_store.window[slot], entry, sizeof(TrackEntry));
-        state->track_store.window_valid[slot] = 1;
+        memcpy(&state->track_window.rows[slot], entry, sizeof(TrackEntry));
+        state->track_window.valid[slot] = 1;
     }
 }
 
-static YmApiStreamDecision track_boot_on_track_id(const char *track_id, void *user_data)
-{
-    TrackBootstrapParser *parser = (TrackBootstrapParser *)user_data;
-    int new_capacity;
-    ListIndexId *new_ids;
-
-    if (!parser || !parser->state || !track_id || !track_id[0]) {
-        return YM_API_STREAM_ERROR;
-    }
-    if (track_boot_is_stale(parser->state, parser->generation,
-                            parser->playlist_kind)) {
-        return YM_API_STREAM_ERROR;
-    }
-    if (parser->staged_count >= parser->staged_capacity) {
-        new_capacity = parser->staged_capacity > 0
-                           ? parser->staged_capacity * 2
-                           : TRACK_BOOT_INITIAL_CAPACITY;
-        new_ids = (ListIndexId *)realloc(parser->staged_ids,
-                                         (size_t)new_capacity * sizeof(ListIndexId));
-        if (!new_ids) return YM_API_STREAM_ERROR;
-        parser->staged_ids = new_ids;
-        parser->staged_capacity = new_capacity;
-    }
-    memset(parser->staged_ids[parser->staged_count], 0, sizeof(ListIndexId));
-    snprintf(parser->staged_ids[parser->staged_count], sizeof(ListIndexId),
-             "%s", track_id);
-    ++parser->staged_count;
-
-    /* Частичная публикация каждые 64 id: экран входит по первым строкам
-     * (гейт ждёт окно, не весь список), хвост докачивается в фоне.
-     * Без этого список на 2500 треков висит до конца всего стрима. */
-    if ((parser->staged_count % LIST_INDEX_LOAD_BLOCK) == 0) {
-        net_client_track_store_lock();
-        if (!track_boot_is_stale(parser->state, parser->generation,
-                                 parser->playlist_kind) &&
-            track_boot_ensure_id_capacity(parser->state,
-                                          parser->staged_count) == 0) {
-            memcpy(parser->state->track_store.ids, parser->staged_ids,
-                   (size_t)parser->staged_count * sizeof(ListIndexId));
-            parser->state->track_store.count = parser->staged_count;
-            parser->state->track_boot.loaded_count = parser->staged_count;
-        }
-        net_client_track_store_unlock();
-    }
-
-    if (parser->index_active &&
-        list_index_writer_append(&parser->index_writer, track_id) != 0) {
-        logLine("track_boot: index write-through failed, disabling\n");
-        list_index_writer_abort(&parser->index_writer);
-        parser->index_active = 0;
-    }
-
-    return YM_API_STREAM_CONTINUE;
-}
-
-static void track_hydrator_sink_cb(const TrackEntry *entry, int position, int generation)
+static void track_hydrator_sink_cb(const TrackRef *ref, const TrackEntry *entry, int position, unsigned int generation)
 {
     struct AppState *state = s_track_state;
 
@@ -352,7 +285,10 @@ static void track_hydrator_sink_cb(const TrackEntry *entry, int position, int ge
         return;
     }
     net_client_track_store_lock();
-    if (state->track_boot.generation == generation) {
+    if ((unsigned int)state->track_boot.generation == generation &&
+        position >= 0 && position < state->track_context.count &&
+        strcmp(state->track_context.refs[position].id, ref->id) == 0 &&
+        state->track_context.refs[position].album_id == ref->album_id) {
         track_window_set_locked(state, position, entry);
     }
     net_client_track_store_unlock();
@@ -364,14 +300,11 @@ void net_client_track_window_focus(struct AppState *state, const char *token, in
                                        TRACK_WINDOW_CAPACITY);
 }
 
-void net_client_track_window_focus_span(struct AppState *state, const char *token,
+int net_client_track_window_focus_span(struct AppState *state, const char *token,
                                         int focus, int want_span)
 {
-    static int s_req_start = -1;
-    static int s_req_gen = -1;
-    static int s_req_span = -1;
-    static u64 s_req_us = 0;
-    ListIndexId slice[TRACK_WINDOW_CAPACITY];
+    TrackRef slice[TRACK_WINDOW_CAPACITY];
+    int positions[TRACK_WINDOW_CAPACITY];
     int count;
     int start;
     int span;
@@ -380,16 +313,16 @@ void net_client_track_window_focus_span(struct AppState *state, const char *toke
     int i;
 
     if (!state || !token || !token[0]) {
-        return;
+        return -1;
     }
 
     span = want_span;
 
     net_client_track_store_lock();
-    count = state->track_store.count;
+    count = state->track_context.count;
     if (count <= 0) {
         net_client_track_store_unlock();
-        return;
+        return 0;
     }
     if (focus < 0) {
         focus = 0;
@@ -412,25 +345,25 @@ void net_client_track_window_focus_span(struct AppState *state, const char *toke
         start = 0;
     }
 
-    if (start != state->track_store.window_start) {
-        TrackRuntimeStorage *ts = &state->track_store;
-        int shift = start - ts->window_start;
+    if (start != state->track_window.start) {
+        TrackListWindow *ts = &state->track_window;
+        int shift = start - ts->start;
         if (shift > 0 && shift < TRACK_WINDOW_CAPACITY) {
-            memmove(&ts->window[0], &ts->window[shift],
+            memmove(&ts->rows[0], &ts->rows[shift],
                     (size_t)(TRACK_WINDOW_CAPACITY - shift) * sizeof(TrackEntry));
-            memmove(&ts->window_valid[0], &ts->window_valid[shift],
+            memmove(&ts->valid[0], &ts->valid[shift],
                     (size_t)(TRACK_WINDOW_CAPACITY - shift));
-            memset(&ts->window_valid[TRACK_WINDOW_CAPACITY - shift], 0, (size_t)shift);
+            memset(&ts->valid[TRACK_WINDOW_CAPACITY - shift], 0, (size_t)shift);
         } else if (shift < 0 && -shift < TRACK_WINDOW_CAPACITY) {
-            memmove(&ts->window[-shift], &ts->window[0],
+            memmove(&ts->rows[-shift], &ts->rows[0],
                     (size_t)(TRACK_WINDOW_CAPACITY + shift) * sizeof(TrackEntry));
-            memmove(&ts->window_valid[-shift], &ts->window_valid[0],
+            memmove(&ts->valid[-shift], &ts->valid[0],
                     (size_t)(TRACK_WINDOW_CAPACITY + shift));
-            memset(&ts->window_valid[0], 0, (size_t)(-shift));
+            memset(&ts->valid[0], 0, (size_t)(-shift));
         } else {
-            memset(ts->window_valid, 0, sizeof(ts->window_valid));
+            memset(ts->valid, 0, sizeof(ts->valid));
         }
-        ts->window_start = start;
+        ts->start = start;
     }
 
     if (start + span > count) {
@@ -438,84 +371,43 @@ void net_client_track_window_focus_span(struct AppState *state, const char *toke
     }
     if (span <= 0) {
         net_client_track_store_unlock();
-        return;
+        return 0;
     }
     for (i = 0; i < span; i++) {
-        if (!state->track_store.window_valid[i]) {
-            missing = 1;
-            break;
+        if (!state->track_window.valid[i]) {
+            slice[missing] = state->track_context.refs[start + i];
+            positions[missing++] = start + i;
         }
     }
     gen = state->track_boot.generation;
-    if (missing) {
-        memcpy(slice, state->track_store.ids + start,
-               (size_t)span * sizeof(ListIndexId));
-    }
     net_client_track_store_unlock();
 
     if (!missing) {
-        return;
+        return 1;
     }
 
-    /* Dedup identical requests; allow a retry every 2 s so a lost/failed
-       hydration can never wedge the gate or leave permanent "..." rows. */
-    {
-        u64 now = sceKernelGetSystemTimeWide();
-        if (start == s_req_start && gen == s_req_gen && span == s_req_span &&
-            (now - s_req_us) < 2000000ULL) {
-            return;
-        }
-        s_req_start = start;
-        s_req_gen = gen;
-        s_req_span = span;
-        s_req_us = now;
-    }
-    track_hydrator_request_window(token, slice, start, span, gen);
+    int rc = track_hydrator_request(TRACK_HYDRATOR_SCREEN, token, slice, positions, missing, gen);
+    return rc < 0 ? -1 : 0;
 }
-
-static int track_boot_on_chunk(const char *data, int size, void *user_data)
-{
-    TrackBootstrapParser *parser = (TrackBootstrapParser *)user_data;
-    int feed_rc;
-
-    if (!parser || !data || size <= 0) {
-        return -1;
-    }
-
-    feed_rc = ym_api_playlist_tracks_parser_feed(&parser->ym_parser,
-                                                 data,
-                                                 (size_t)size);
-    if (feed_rc != 0) {
-        return -1;
-    }
-
-    resource_policy_cooperate(RESOURCE_CLASS_PLAYLIST_BOOTSTRAP, size);
-
-    return 0;
-}
-
 /* Publish the id order as complete (shared by cache-hit and network). The
    navigation gate still waits until the entry window is hydrated. */
 static void track_boot_publish_full_ready(TrackBootstrapJob *job, const char *src)
 {
     net_client_track_store_lock();
     if (!track_boot_is_stale(job->state, job->generation, job->playlist_kind)) {
-        job->state->track_boot.loaded_count = job->state->track_store.count;
-        job->state->track_store.ids_complete = 1;
+        job->state->track_boot.loaded_count = job->state->track_context.count;
+        job->state->track_context.complete = 1;
         job->state->track_boot.status = TRACK_BOOT_FULL_READY;
         track_boot_log_mem("full_ready", job->playlist_kind,
-                           job->state->track_store.count,
-                           job->state->track_store.count);
+                           job->state->track_context.count,
+                           job->state->track_context.count);
         logLine("track_boot: full ready (%s) kind=%d count=%d\n",
-                src, job->playlist_kind, job->state->track_store.count);
+                src, job->playlist_kind, job->state->track_context.count);
     }
     net_client_track_store_unlock();
 }
 
-/* Load the id order from the disk index. Metadata is NOT touched here — rows
-   hydrate on demand from the store / POST /tracks, so a metadata eviction
-   never forces a blob refetch. Returns 0 on success, -1 on miss/corruption
-   (caller refetches). */
+/* Load composition only; screen metadata belongs to its view generation. */
 static int track_boot_load_from_cache(TrackBootstrapJob *job)
 {
     ListIndexReader reader;
@@ -527,7 +419,7 @@ static int track_boot_load_from_cache(TrackBootstrapJob *job)
     }
 
     while (pos < reader.count) {
-        ListIndexId ids[LIST_INDEX_LOAD_BLOCK];
+        TrackRef ids[LIST_INDEX_LOAD_BLOCK];
         int got = list_index_read_range(&reader, pos, LIST_INDEX_LOAD_BLOCK, ids);
 
         if (got <= 0) {
@@ -542,9 +434,9 @@ static int track_boot_load_from_cache(TrackBootstrapJob *job)
             rc = -1;
             break;
         }
-        memcpy(job->state->track_store.ids + pos, ids,
-               (size_t)got * sizeof(ListIndexId));
-        job->state->track_store.count = pos + got;
+        memcpy(job->state->track_context.refs + pos, ids,
+               (size_t)got * sizeof(TrackRef));
+        job->state->track_context.count = pos + got;
         job->state->track_boot.loaded_count = pos + got;
         net_client_track_store_unlock();
 
@@ -586,8 +478,7 @@ static int track_boot_worker(SceSize args __attribute__((unused)), void *argp __
 
         char url[256];
 
-        /* HIT: this exact revision is indexed and fully hydratable — rebuild
-           from disk, zero network. */
+        /* The exact composition revision is cached; no composition request is needed. */
         if (job.uuid[0]) {
             if (track_boot_load_from_cache(&job) == 0) {
                 track_boot_publish_full_ready(&job, "cache");
@@ -595,83 +486,71 @@ static int track_boot_worker(SceSize args __attribute__((unused)), void *argp __
             }
             /* Miss / corrupt index: drop the partial order and refetch. */
             net_client_track_store_lock();
-            job.state->track_store.count = 0;
-            job.state->track_store.ids_complete = 0;
-            memset(job.state->track_store.window_valid, 0,
-                   sizeof(job.state->track_store.window_valid));
+            if (track_boot_is_stale(job.state, job.generation, job.playlist_kind)) {
+                net_client_track_store_unlock();
+                continue;
+            }
+            job.state->track_context.count = 0;
+            job.state->track_context.complete = 0;
+            memset(job.state->track_window.valid, 0,
+                   sizeof(job.state->track_window.valid));
             net_client_track_store_unlock();
         }
 
-        TrackBootstrapParser parser;
-        memset(&parser, 0, sizeof(parser));
-        parser.state = job.state;
-        parser.generation = job.generation;
-        parser.playlist_kind = job.playlist_kind;
-
-        int url_rc = ym_api_playlist_tracks_build_url(job.uid, job.playlist_kind,
-                                                      url, sizeof(url));
-        if (url_rc != 0) {
+        if (ym_api_playlist_tracks_build_url(job.uid, job.playlist_kind, url, sizeof(url)) != 0) {
             track_boot_publish_error(job.state, job.generation, job.playlist_kind, -2);
             continue;
         }
-
-        int parser_rc = ym_api_playlist_tracks_parser_init(&parser.ym_parser,
-                                                           track_boot_on_track_id,
-                                                           &parser);
-        if (parser_rc != 0) {
-            track_boot_publish_error(job.state, job.generation, job.playlist_kind, -2);
-            continue;
-        }
-
-        /* On a miss, write the id-index while the short references stream. */
-        if (job.uuid[0] &&
-            list_index_writer_open(&parser.index_writer, job.uuid, job.revision) == 0) {
-            parser.index_active = 1;
-        }
-
+        NetHttpResponse response = {0};
         net_tls_cancel_bind(&s_track_boot_cancel);
-        int rc = http_stream(&(HttpRequest){
-                .method = HTTP_GET, .url = url, .token = job.token,
-                .accept = "application/json"
-            }, &(HttpSink){ .on_chunk = track_boot_on_chunk, .user = &parser });
+        int rc = http_request(&(HttpRequest){
+            .method = HTTP_GET, .url = url, .token = job.token,
+            .accept = "application/json"
+        }, &response);
         net_tls_cancel_unbind();
-        ym_api_playlist_tracks_parser_destroy(&parser.ym_parser);
-
+        TrackRef *refs = NULL;
+        int count = 0, revision = 0;
+        if (rc == 0 && response.status_code == 200)
+            rc = ym_api_parse_playlist_composition(response.body, (size_t)response.body_size,
+                                                   &refs, &count, &revision);
+        else rc = -1;
+        net_http_response_free(&response);
         if (rc != 0) {
-            if (parser.index_active) {
-                list_index_writer_abort(&parser.index_writer);
-            }
-            free(parser.staged_ids);
             track_boot_publish_error(job.state, job.generation, job.playlist_kind, -2);
             continue;
         }
         if (track_boot_is_stale(job.state, job.generation, job.playlist_kind)) {
-            if (parser.index_active) {
-                list_index_writer_abort(&parser.index_writer);
-            }
-            free(parser.staged_ids);
+            free(refs);
             continue;
         }
-
-        if (parser.index_active &&
-            list_index_writer_commit(&parser.index_writer) != 0) {
-            parser.index_active = 0;
+        ListIndexWriter writer;
+        int cached = 0;
+        if (job.uuid[0] && list_index_writer_open(&writer, job.uuid, revision) == 0) {
+            int written = 0;
+            while (written < count && list_index_writer_append(&writer, &refs[written]) == 0)
+                ++written;
+            if (written == count) cached = list_index_writer_commit(&writer) == 0;
+            else list_index_writer_abort(&writer);
         }
-
         net_client_track_store_lock();
         if (track_boot_is_stale(job.state, job.generation, job.playlist_kind)) {
             net_client_track_store_unlock();
-            free(parser.staged_ids);
+            free(refs);
             continue;
         }
-        free(job.state->track_store.ids);
-        job.state->track_store.ids = parser.staged_ids;
-        job.state->track_store.ids_capacity = parser.staged_capacity;
-        job.state->track_store.count = parser.staged_count;
-        parser.staged_ids = NULL;
+        free(job.state->track_context.refs);
+        job.state->track_context.refs = refs;
+        job.state->track_context.capacity = count;
+        job.state->track_context.count = count;
+        job.state->track_context.revision = revision;
+        PlaylistEntry *lists[] = {job.state->playlists, job.state->liked_playlists};
+        int lengths[] = {job.state->playlist_count, job.state->liked_playlist_count};
+        for (int list = 0; list < 2; ++list)
+            for (int i = 0; i < lengths[list]; ++i)
+                if (strcmp(lists[list][i].uuid, job.uuid) == 0)
+                    lists[list][i].revision = revision;
         net_client_track_store_unlock();
-
-        track_boot_publish_full_ready(&job, parser.index_active ? "net+cache" : "net");
+        track_boot_publish_full_ready(&job, cached ? "net+cache" : "net");
     }
 
     logLine("track_boot: worker stopped\n");
@@ -1587,8 +1466,8 @@ int net_client_track_bootstrap_init(void)
         return 0;
     }
 
-    track_meta_store_init();
-    track_hydrator_init(track_hydrator_sink_cb);
+    if (track_meta_store_init() < 0) return -1;
+    if (track_hydrator_init(track_hydrator_sink_cb) < 0) return -1;
     s_track_boot_cancel = 0;
 
     /* One-time eviction of the retired raw-JSON track cache. */
@@ -1703,9 +1582,9 @@ int net_client_track_bootstrap_start(const char *token, int uid, int playlist_ki
     state->track_boot.status = TRACK_BOOT_LOADING;
     state->track_boot.loaded_count = 0;
     state->track_boot.error_code = 0;
-    state->track_store.ids_complete = 0;
-    memset(state->track_store.window_valid, 0, sizeof(state->track_store.window_valid));
-    state->track_store.window_start = 0;
+    state->track_context.complete = 0;
+    memset(state->track_window.valid, 0, sizeof(state->track_window.valid));
+    state->track_window.start = 0;
     s_track_state = state;
     track_boot_log_mem("bootstrap_start", playlist_kind, 0, 0);
     net_client_track_store_unlock();

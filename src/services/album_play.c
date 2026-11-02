@@ -115,13 +115,15 @@ int album_play_poll(char *out_first_id, int id_size)
     }
     done = s_state;
     if (done == 1) {
-        if (!s_result_refs || s_result_count <= 0 ||
-            playback_queue_set_from_refs(s_result_refs, s_result_count, 0,
+        PlaybackQueueDraft *draft = playback_queue_prepare(s_result_refs, s_result_count, 0,
                                          PLAYBACK_QUEUE_SOURCE_ALBUM,
-                                         s_album_id, 0) != 0) {
+                                         s_album_id, 0);
+        if (!draft) {
             logLine("album_play: queue set failed\n");
             done = -1;
-        } else if (out_first_id && id_size > 0) {
+        } else {
+            playback_queue_commit(draft);
+            if (out_first_id && id_size > 0)
             snprintf(out_first_id, (size_t)id_size, "%s",
                      s_result_refs[0].id);
         }

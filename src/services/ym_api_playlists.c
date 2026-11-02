@@ -7,7 +7,7 @@
 #include <string.h>
 
 #include <cjson/cJSON.h>
-#include "services/libc_guard.h"
+#include "core/json.h"
 
 #include "core/fs.h"
 #include "core/logger.h"
@@ -267,68 +267,6 @@ int ym_api_playlist_tracks_build_url(int uid,
 
 /* Full-track parsing lives in ym_api_track_parse.c (shared with Rotor);
  * this unit keeps only the playlist id-stream helpers. */
-static int ym_api_parse_track_id(const char *item_json,
-                                 size_t item_size,
-                                 char *out_id,
-                                 size_t out_size)
-{
-    cJSON *root;
-    cJSON *id;
-
-    if (!item_json || item_size == 0 || !out_id || out_size == 0) {
-        return -1;
-    }
-    root = ym_json_parse_len(item_json, item_size);
-    if (!root) {
-        return 1;
-    }
-    id = cJSON_GetObjectItemCaseSensitive(root, "id");
-    if (!id) {
-        cJSON_Delete(root);
-        return 1;
-    }
-    if (cJSON_IsString(id) && id->valuestring && id->valuestring[0]) {
-        if (strlen(id->valuestring) >= out_size) {
-            cJSON_Delete(root);
-            return 1;
-        }
-        snprintf(out_id, out_size, "%s", id->valuestring);
-    } else if (cJSON_IsNumber(id)) {
-        double v = id->valuedouble;  /* без %.0f: см. libc_guard.h */
-        int written = snprintf(out_id, out_size, "%lld",
-                               (long long)(v >= 0 ? v + 0.5 : v - 0.5));
-        if (written <= 0 || (size_t)written >= out_size) {
-            cJSON_Delete(root);
-            return 1;
-        }
-    } else {
-        cJSON_Delete(root);
-        return 1;
-    }
-    cJSON_Delete(root);
-    return 0;
-}
-
-static int track_object_has_album(cJSON *item, int album_id)
-{
-    cJSON *albums = cJSON_GetObjectItemCaseSensitive(item, "albums");
-    int i;
-
-    if (album_id <= 0 || !cJSON_IsArray(albums)) {
-        return album_id <= 0;
-    }
-    for (i = 0; i < cJSON_GetArraySize(albums); ++i) {
-        cJSON *album = cJSON_GetArrayItem(albums, i);
-        cJSON *id = album ? cJSON_GetObjectItemCaseSensitive(album, "id") : NULL;
-        int value = cJSON_IsNumber(id) ? id->valueint
-            : (cJSON_IsString(id) && id->valuestring ? atoi(id->valuestring) : 0);
-        if (value == album_id) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
                                const TrackRef *refs,
                                int count,
@@ -336,8 +274,7 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
                                void *user_data,
                                int *out_status)
 {
-    char payload[YM_API_HYDRATE_MAX * (TRACK_ID_SIZE + 13) + 16];
-    unsigned char used[YM_API_HYDRATE_MAX];
+    char payload[YM_API_HYDRATE_MAX * (TRACK_ID_SIZE + sizeof("&trackIds=") - 1 + 11) + sizeof("removeDuplicates=false&withProgress=true")];
     NetHttpResponse response;
     cJSON *root = NULL;
     cJSON *result = NULL;
@@ -353,18 +290,18 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
         return -1;
     }
 
-    payload_len = snprintf(payload, sizeof(payload), "track-ids=");
+    payload_len = snprintf(payload, sizeof(payload), "removeDuplicates=false&withProgress=true");
     for (i = 0; i < count; i++) {
         int n;
         if (refs[i].album_id > 0) {
             n = snprintf(payload + payload_len,
                          sizeof(payload) - (size_t)payload_len,
-                         "%s%s:%d", i ? "," : "", refs[i].id,
+                         "&trackIds=%s:%d", refs[i].id,
                          refs[i].album_id);
         } else {
             n = snprintf(payload + payload_len,
                          sizeof(payload) - (size_t)payload_len,
-                         "%s%s", i ? "," : "", refs[i].id);
+                         "&trackIds=%s", refs[i].id);
         }
         if (n < 0 || (size_t)(payload_len + n) >= sizeof(payload)) {
             return -1;
@@ -397,7 +334,7 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
         return -1;
     }
 
-    root = ym_json_parse_len(response.body, (size_t)response.body_size);
+    root = ym_json_parse_len(response.body, (size_t)response.body_size, NULL);
     net_http_response_free(&response);
     if (!root) {
         if (out_status) {
@@ -407,54 +344,36 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
     }
 
     result = cJSON_GetObjectItem(root, "result");
-    memset(used, 0, sizeof(used));
-    if (result && cJSON_IsArray(result)) {
-        cJSON *item = NULL;
-        cJSON_ArrayForEach(item, result) {
-            TrackEntry entry;
-            char result_id[TRACK_ID_SIZE];
-            cJSON *id_node = cJSON_GetObjectItemCaseSensitive(item, "id");
-            int preferred_album_id = 0;
-            int request_index = -1;
-            int rc;
-
-            if (ym_api_parse_track_id_node(id_node, result_id,
-                                           sizeof(result_id)) != 0) {
-                continue;
+    if (!cJSON_IsArray(result) || cJSON_GetArraySize(result) != count) {
+        logLine("ym_api_tracks: response count mismatch requested=%d received=%d\n",
+                count, cJSON_IsArray(result) ? cJSON_GetArraySize(result) : -1);
+        if (out_status) *out_status = NET_LOAD_ERR_DATA;
+        cJSON_Delete(root);
+        return -1;
+    }
+    /* Validate the complete positional mapping before publishing any entry. */
+    cJSON *checked;
+    i = 0;
+    cJSON_ArrayForEach(checked, result) {
+        char id[TRACK_ID_SIZE];
+        if (ym_api_parse_track_id_node(cJSON_GetObjectItemCaseSensitive(checked, "id"), id, sizeof(id)) != 0 ||
+            strcmp(id, refs[i++].id) != 0) {
+            logLine("ym_api_tracks: response identity mismatch\n");
+            if (out_status) *out_status = NET_LOAD_ERR_DATA;
+            cJSON_Delete(root);
+            return -1;
+        }
+    }
+    cJSON *item = NULL;
+    i = 0;
+    cJSON_ArrayForEach(item, result) {
+        TrackEntry entry;
+        int request_index = i++;
+        if (ym_api_parse_track_from_object(item, &entry) == 0) {
+            delivered++;
+            if (on_track(&refs[request_index], &entry, user_data) != YM_API_STREAM_CONTINUE) {
+                break;
             }
-            /* Prefer an exact requested release over a generic id-only
-               request when both forms occur in one hydration batch. */
-            for (i = 0; i < count; ++i) {
-                if (!used[i] && refs[i].album_id > 0 &&
-                    strcmp(refs[i].id, result_id) == 0 &&
-                    track_object_has_album(item, refs[i].album_id)) {
-                    request_index = i;
-                    preferred_album_id = refs[i].album_id;
-                    break;
-                }
-            }
-            if (request_index < 0) {
-                for (i = 0; i < count; ++i) {
-                    if (!used[i] && refs[i].album_id == 0 &&
-                        strcmp(refs[i].id, result_id) == 0) {
-                        request_index = i;
-                        break;
-                    }
-                }
-            }
-            if (request_index < 0) {
-                continue;
-            }
-            rc = ym_api_parse_track_from_object_for_album(
-                item, preferred_album_id, &entry);
-            if (rc == 0) {
-                used[request_index] = 1;
-                delivered++;
-                if (on_track(&entry, user_data) != YM_API_STREAM_CONTINUE) {
-                    break;
-                }
-            }
-            /* rc == 1: item without a usable id — skipped by design. */
         }
     }
     cJSON_Delete(root);
@@ -466,206 +385,41 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
     return 0;
 }
 
-int ym_api_tracks_hydrate(YmApiContext *ctx,
-                          const ListIndexId *ids,
-                          int count,
-                          YmApiTrackCallback on_track,
-                          void *user_data,
-                          int *out_status)
+int ym_api_parse_playlist_composition(const char *json, size_t size,
+                                      TrackRef **out_refs, int *out_count, int *out_revision)
 {
-    TrackRef refs[YM_API_HYDRATE_MAX];
-    int i;
-
-    if (!ids || count <= 0 || count > YM_API_HYDRATE_MAX) {
-        return -1;
+    if (!json || !out_refs || !out_count || !out_revision) return -1;
+    *out_refs = NULL;
+    *out_count = 0;
+    cJSON *root = ym_json_parse_len(json, size, NULL);
+    if (!root) return -1;
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "result");
+    cJSON *revision = cJSON_GetObjectItemCaseSensitive(result, "revision");
+    cJSON *tracks = cJSON_GetObjectItemCaseSensitive(result, "tracks");
+    if (!cJSON_IsNumber(revision) || revision->valuedouble < 0 ||
+        revision->valuedouble > 2147483647.0 || revision->valuedouble != revision->valueint ||
+        !cJSON_IsArray(tracks)) { cJSON_Delete(root); return -1; }
+    int count = cJSON_GetArraySize(tracks);
+    TrackRef *refs = count ? calloc((size_t)count, sizeof(*refs)) : NULL;
+    if (count && !refs) { cJSON_Delete(root); return -1; }
+    int i = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, tracks) {
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "id");
+        cJSON *album = cJSON_GetObjectItemCaseSensitive(item, "albumId");
+        if (!cJSON_IsNumber(id) || !cJSON_IsNumber(album) ||
+            id->valuedouble <= 0 || id->valuedouble > 9007199254740991.0 ||
+            (double)(long long)id->valuedouble != id->valuedouble ||
+            album->valuedouble <= 0 || album->valuedouble > 2147483647.0 ||
+            album->valuedouble != album->valueint) {
+            free(refs); cJSON_Delete(root); return -1;
+        }
+        snprintf(refs[i].id, sizeof(refs[i].id), "%lld", (long long)id->valuedouble);
+        refs[i++].album_id = album->valueint;
     }
-    memset(refs, 0, sizeof(refs));
-    for (i = 0; i < count; ++i) {
-        snprintf(refs[i].id, sizeof(refs[i].id), "%s", ids[i]);
-    }
-    return ym_api_tracks_hydrate_refs(ctx, refs, count, on_track,
-                                      user_data, out_status);
-}
-
-int ym_api_playlist_tracks_parser_init(YmPlaylistTracksParser *parser,
-                                       YmApiTrackIdCallback on_track_id,
-                                       void *user_data)
-{
-    if (!parser || !on_track_id) {
-        return -1;
-    }
-
-    memset(parser, 0, sizeof(*parser));
-    parser->on_track_id = on_track_id;
-    parser->user_data = user_data;
+    *out_refs = refs;
+    *out_count = count;
+    *out_revision = revision->valueint;
+    cJSON_Delete(root);
     return 0;
-}
-
-static int ym_api_playlist_tracks_feed_char(YmPlaylistTracksParser *parser, char c)
-{
-    static const char result_key[] = "\"result\"";
-    static const char tracks_key[] = "\"tracks\"";
-
-    if (!parser) {
-        return -1;
-    }
-
-    if (!parser->in_result_object) {
-        if (parser->waiting_result_object) {
-            if (c == '{') {
-                parser->in_result_object = 1;
-                parser->waiting_result_object = 0;
-            }
-            return 0;
-        }
-
-        if (c == result_key[parser->result_key_match]) {
-            parser->result_key_match++;
-            if (result_key[parser->result_key_match] == '\0') {
-                parser->result_key_match = 0;
-                parser->waiting_result_object = 1;
-            }
-        } else {
-            parser->result_key_match = (c == result_key[0]) ? 1 : 0;
-        }
-        return 0;
-    }
-
-    if (!parser->in_tracks_array) {
-        if (parser->waiting_array_start) {
-            if (c == '[') {
-                parser->in_tracks_array = 1;
-                parser->waiting_array_start = 0;
-            }
-            return 0;
-        }
-
-        if (c == tracks_key[parser->key_match]) {
-            parser->key_match++;
-            if (tracks_key[parser->key_match] == '\0') {
-                parser->key_match = 0;
-                parser->waiting_array_start = 1;
-            }
-        } else {
-            parser->key_match = (c == tracks_key[0]) ? 1 : 0;
-        }
-        return 0;
-    }
-
-    if (!parser->capturing_object) {
-        if (c == ']') {
-            parser->in_tracks_array = 0;
-            return 0;
-        }
-        if (c == '{') {
-            parser->capturing_object = 1;
-            parser->object_depth = 1;
-            parser->in_string = 0;
-            parser->escape_next = 0;
-            parser->obj_len = 0;
-            if (parser->obj_cap <= 0) {
-                parser->obj_cap = 2048;
-                parser->obj_buf = (char *)malloc((size_t)parser->obj_cap);
-                if (!parser->obj_buf) {
-                    return -1;
-                }
-            }
-            parser->obj_buf[parser->obj_len++] = c;
-        }
-        return 0;
-    }
-
-    if (parser->obj_len + 2 > parser->obj_cap) {
-        int new_cap = parser->obj_cap * 2;
-        char *new_buf = (char *)realloc(parser->obj_buf, (size_t)new_cap);
-        if (!new_buf) {
-            return -1;
-        }
-        parser->obj_buf = new_buf;
-        parser->obj_cap = new_cap;
-    }
-    parser->obj_buf[parser->obj_len++] = c;
-
-    if (parser->in_string) {
-        if (parser->escape_next) {
-            parser->escape_next = 0;
-        } else if (c == '\\') {
-            parser->escape_next = 1;
-        } else if (c == '"') {
-            parser->in_string = 0;
-        }
-        return 0;
-    }
-
-    if (c == '"') {
-        parser->in_string = 1;
-        return 0;
-    }
-    if (c == '{') {
-        parser->object_depth++;
-        return 0;
-    }
-    if (c == '}') {
-        parser->object_depth--;
-        if (parser->object_depth == 0) {
-            int parse_rc;
-            YmApiStreamDecision decision = YM_API_STREAM_CONTINUE;
-
-            parser->obj_buf[parser->obj_len] = '\0';
-            char track_id[LIST_INDEX_ID_SIZE];
-            parse_rc = ym_api_parse_track_id(parser->obj_buf,
-                                             (size_t)parser->obj_len,
-                                             track_id, sizeof(track_id));
-            if (parse_rc == 0) {
-                decision = parser->on_track_id(track_id, parser->user_data);
-            }
-            parser->capturing_object = 0;
-            parser->obj_len = 0;
-
-            if (parse_rc == 0) {
-                if (decision == YM_API_STREAM_STOP) {
-                    return 1;
-                }
-                if (decision == YM_API_STREAM_ERROR) {
-                    return -1;
-                }
-            }
-        }
-    }
-
-    return 0;
-}
-
-int ym_api_playlist_tracks_parser_feed(YmPlaylistTracksParser *parser,
-                                       const char *data,
-                                       size_t size)
-{
-    if (!parser || (!data && size > 0)) {
-        return -1;
-    }
-    if (size == 0) {
-        return 0;
-    }
-
-    for (size_t i = 0; i < size; ++i) {
-        int rc = ym_api_playlist_tracks_feed_char(parser, data[i]);
-        if (rc != 0) {
-            return rc;
-        }
-    }
-
-    return 0;
-}
-
-void ym_api_playlist_tracks_parser_destroy(YmPlaylistTracksParser *parser)
-{
-    if (!parser) {
-        return;
-    }
-    if (parser->obj_buf) {
-        free(parser->obj_buf);
-        parser->obj_buf = NULL;
-    }
-    parser->obj_len = 0;
-    parser->obj_cap = 0;
 }

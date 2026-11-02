@@ -4,7 +4,6 @@
 #include <stddef.h>
 
 #include "services/ym_api_types.h"
-#include "services/list_index.h"
 #include "app/playlist.h"
 
 /* Load-failure cause carried in PlaylistLoadState.error_code and surfaced to the
@@ -16,30 +15,22 @@
 
 YmStatus ym_api_download_get_mp3_raw(YmApiContext *ctx,
                                      const char *track_id,
+                                     const char *quality,
                                      YmDownloadVariant *out);
 
-/* FLAC lossless: quality=lossless, полный список кодеков (sign — без запятых).
- * Сервер отдаёт flac-mp4 (MP4-контейнер) — вызыватель демуксит в сырой fLaC.
+/* FLAC family with quality=lossless. FLAC-MP4 remains in its container.
  * YM_ERR_UNSUPPORTED, если сервер выбрал другой кодек (aac/mp3). */
 YmStatus ym_api_download_get_flac_raw(YmApiContext *ctx,
                                       const char *track_id,
                                       YmDownloadVariant *out);
 
-/* AAC: полный список кодеков, quality=текущая (lq -> he-aac-mp4@64,
- * nq -> aac-mp4@192, hq -> aac-mp4@256). YM_ERR_UNSUPPORTED, если сервер
- * выбрал другой кодек. Контейнер MP4 (esds + сэмплы) — декодер faad2. */
+/* Классический AAC: codecs=aac-mp4, quality задаёт вызывающий, без HE-AAC.
+ * YM_ERR_UNSUPPORTED, если сервер выбрал другой кодек.
+ * Контейнер MP4; фактический битрейт определяется ответом сервера. */
 YmStatus ym_api_download_get_aac_raw(YmApiContext *ctx,
                                      const char *track_id,
+                                     const char *quality,
                                      YmDownloadVariant *out);
-
-/* Качество для следующих треков: "lq" / "nq" (192) / "hq" (256) / "mp3" /
- * "auto" (по скорости соединения) / "flac" (тест lossless, фолбэк hq). */
-void ym_api_download_set_quality(const char *q);
-const char *ym_api_download_quality(void);
-/* Что реально просим у сервера: lq/nq/hq (auto/flac/mp3 разворачиваются). */
-const char *ym_api_download_effective_quality(void);
-/* 1 — выбран режим «FLAC (тест)»: пробовать lossless до AAC. */
-int ym_api_download_flac_enabled(void);
 
 /* out_status (optional) receives the load-failure cause: 0 on success,
    an HTTP status on non-200, or a NET_LOAD_ERR_* code otherwise. */
@@ -66,19 +57,10 @@ int ym_api_playlist_tracks_build_url(int uid,
                                      char *out,
                                      size_t out_size);
 
-/* Hydration: fetch full metadata for up to YM_API_HYDRATE_MAX track ids in one
-   POST /tracks (server accepts >=500 per request — the cap here is sized to the
-   UI window, not the API). on_track is called per resolved entry, including
-   no-rights entries marked available=0. An item without a usable id is skipped,
-   so fewer callbacks than ids is still possible. out_status as above. */
+/* Fetch metadata in request order. Validate all returned IDs before callbacks.
+   Rights-blocked entries retain their positions with available=0.
+   YM_API_HYDRATE_MAX is the application's batch capacity, not a server limit. */
 #define YM_API_HYDRATE_MAX 64
-
-int ym_api_tracks_hydrate(YmApiContext *ctx,
-                          const ListIndexId *ids,
-                          int count,
-                          YmApiTrackCallback on_track,
-                          void *user_data,
-                          int *out_status);
 
 int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
                                const TrackRef *refs,
@@ -87,14 +69,8 @@ int ym_api_tracks_hydrate_refs(YmApiContext *ctx,
                                void *user_data,
                                int *out_status);
 
-int ym_api_playlist_tracks_parser_init(YmPlaylistTracksParser *parser,
-                                       YmApiTrackIdCallback on_track_id,
-                                       void *user_data);
-
-int ym_api_playlist_tracks_parser_feed(YmPlaylistTracksParser *parser,
-                                       const char *data,
-                                       size_t size);
-
-void ym_api_playlist_tracks_parser_destroy(YmPlaylistTracksParser *parser);
+/* Parse composition and its revision from one complete response. Caller owns refs. */
+int ym_api_parse_playlist_composition(const char *json, size_t size,
+                                      TrackRef **out_refs, int *out_count, int *out_revision);
 
 #endif

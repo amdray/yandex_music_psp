@@ -3,24 +3,15 @@
 
 #include <pspkernel.h>
 #include <stdint.h>
+#include "app/track.h"
 
-/* Ordered track-id index of a list (playlist / album / likes), cached on the
-   Memory Stick as one file per (uuid, revision). Fixed-size records give O(1)
-   seek to any position; the revision baked into the file name makes a cache
-   hit a pure stat and turns every playlist edit into a new immutable file.
-
-   Record width: real dumps contain UUID-form track ids (36 chars max, see
-   track.h calibration), so ids are fixed 40-byte NUL-padded ASCII, never
-   integers. Files are little-endian PSP-local; no cross-host portability. */
-
-#define LIST_INDEX_ID_SIZE 40
-
-typedef char ListIndexId[LIST_INDEX_ID_SIZE];
-
+/* Playlist membership persisted as TrackRef records under (uuid, revision).
+   Metadata is stored separately. Files are PSP-local; each published revision
+   contains the complete ordered membership. */
 typedef struct {
     char magic[4];        /* "YMIX" */
     uint16_t version;     /* LIST_INDEX_VERSION */
-    uint16_t record_size; /* LIST_INDEX_ID_SIZE */
+    uint16_t record_size; /* sizeof(TrackRef) */
     int32_t revision;
     int32_t track_count;  /* final count; -1 while the .part is being written */
     uint32_t reserved[4];
@@ -30,6 +21,8 @@ typedef struct {
     SceUID fd;
     int count;
     int revision;
+    TrackRef pending[64];
+    int pending_count;
     char part_path[160];
     char final_path[160];
 } ListIndexWriter;
@@ -44,7 +37,7 @@ typedef struct {
    Commit finalizes the header, renames .part to the immutable name and evicts
    older revisions of the same uuid. */
 int list_index_writer_open(ListIndexWriter *w, const char *uuid, int revision);
-int list_index_writer_append(ListIndexWriter *w, const char *track_id);
+int list_index_writer_append(ListIndexWriter *w, const TrackRef *ref);
 int list_index_writer_commit(ListIndexWriter *w);
 void list_index_writer_abort(ListIndexWriter *w);
 
@@ -53,9 +46,9 @@ void list_index_writer_abort(ListIndexWriter *w);
 int list_index_open(ListIndexReader *r, const char *uuid, int revision);
 void list_index_close(ListIndexReader *r);
 
-/* Copy ids for positions [start, start+n) into ids[]; returns the number of
+/* Copy references for positions [start, start+n) into refs[]; returns the number of
    records actually read (clamped to track_count), or -1 on I/O error. */
-int list_index_read_range(ListIndexReader *r, int start, int n, ListIndexId *ids);
+int list_index_read_range(ListIndexReader *r, int start, int n, TrackRef *refs);
 
 /* Locate track_id, scanning outward from hint_pos (the position the track had
    when the anchor was saved). Returns the position or -1 if absent. */

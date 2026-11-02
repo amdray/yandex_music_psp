@@ -1,3 +1,4 @@
+#include "services/net_activity.h"
 #include "services/dns.h"
 
 #include <pspkernel.h>
@@ -228,6 +229,7 @@ static int udp_exchange(const struct in_addr *server,
                 sent = (int)sceNetInetSendto(fd, query, query_size, 0,
                                             (struct sockaddr *)&peer,
                                             sizeof(peer));
+                net_activity_record_transfer(sent);
                 if (sent == (int)query_size) break;
                 if (sent >= 0) { rc = DNS_ERR_LOOKUP; goto done; }
                 {
@@ -253,6 +255,7 @@ static int udp_exchange(const struct in_addr *server,
                                              DNS_WIRE_MAX_PACKET, 0,
                                              (struct sockaddr *)&from,
                                              &from_len);
+                net_activity_record_transfer(got);
                 if (got < 0) {
                     int e = sceNetInetGetErrno();
                     if (e == EAGAIN || e == EWOULDBLOCK) continue;
@@ -289,6 +292,7 @@ static int tcp_send_all(int fd, const unsigned char *buf, size_t size,
         int sent;
         if (rc != 0) return rc;
         sent = (int)sceNetInetSend(fd, buf + done, size - done, 0);
+        net_activity_record_transfer(sent);
         if (sent > 0) done += (size_t)sent;
         else if (sent == 0) return DNS_ERR_LOOKUP;
         else {
@@ -309,6 +313,7 @@ static int tcp_recv_all(int fd, unsigned char *buf, size_t size,
         int got;
         if (rc != 0) return rc;
         got = (int)sceNetInetRecv(fd, buf + done, size - done, 0);
+        net_activity_record_transfer(got);
         if (got > 0) done += (size_t)got;
         else if (got == 0) return DNS_ERR_LOOKUP;
         else {

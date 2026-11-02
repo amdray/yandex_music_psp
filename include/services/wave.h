@@ -2,21 +2,16 @@
 #define YM_SERVICES_WAVE_H
 
 #include <stddef.h>
+#include "app/track.h"
+
+#define WAVE_SEEDS_MAX 4
+#define WAVE_SEED_SIZE 64
 
 /* Rotor "My wave" session (spec sections 2-4, 7-9).
  *
- * Lifecycle (unchanged for existing UI callers):
- *   wave_start_first(token) fetches session/new on a worker;
- *   wave_poll_first() applies the first batch to the queue exactly once;
- *   wave_service() refills near the tail every frame from now_playing;
- *   wave_reset() drops the session (generation-guarded: a late worker
- *   result never applies to a newer session).
- *
- * Reporting hooks for the playback controller (spec 8.2/8.3/8.5):
- *   wave_note_skip()/wave_note_finished() enqueue the terminal Rotor event
- *   for the given track with really-audible time; they resolve batch_id
- *   from the queue FLOW metadata and drop the event when the session is
- *   gone. radioFinished is never sent (spec 4.6).
+ * prepare/poll/commit/cancel operate on a request id. Only commit replaces
+ * the active session and queue. service runs after playback_controller_service
+ * on every frame, including after the requesting screen has left.
  */
 
 typedef struct {
@@ -25,6 +20,7 @@ typedef struct {
     char radio_session_id[64];
     int refill_in_flight;
     int terminated;
+    int radio_started;
 } WaveSession;
 
 /* Context carousel card (spec 2.1/section 7). Stored/parsed by the UI layer;
@@ -32,7 +28,7 @@ typedef struct {
 typedef struct {
     char name[128];
     char description[160];
-    char seeds[4][64];
+    char seeds[WAVE_SEEDS_MAX][WAVE_SEED_SIZE];
     int seed_count;
     char cover_uri[256];
     char animation_uri[256];
@@ -47,36 +43,44 @@ typedef struct {
     unsigned int generation;
 } WaveArtistCutout;
 
-void wave_start_first(const char *token);
-/* Start with explicit seeds (track-wave: one "track:<id>" seed with
- * include_wave_model=1; carousel: full data.wave.seeds array). */
-void wave_start_seeds(const char *token, const char *const *seeds,
-                      int seed_count, int include_wave_model);
-/* 0 идёт, 1 готово (first_id заполнен), -1 провал. Одноразовый. */
-int wave_poll_first(char *out_first_id, int id_size);
-/* Держать волну бесконечной: вызывать каждый кадр из now_playing. */
-void wave_service(void);
-void wave_reset(void);
-/* Уход с экрана без убийства сессии (см. wave.c). */
-void wave_dismiss_screen(void);
-/* Восстановить сессию после ребута (lastplay v2): активна с данным
- * radio_session_id, generation свежая. Пустой id игнорируется. */
-void wave_restore_session(const char *session_id, int terminated);
+typedef struct WaveRequestParams {
+    char seeds[WAVE_SEEDS_MAX][WAVE_SEED_SIZE];
+    int seed_count;
+    int include_wave_model;
+} WaveRequestParams;
 
+typedef enum {
+    WAVE_PREPARE_FAILED,
+    WAVE_PREPARE_PENDING,
+    WAVE_PREPARE_EXISTING
+} WavePrepareStatus;
+
+typedef struct {
+    WavePrepareStatus status;
+    unsigned int request_id; /* Only PENDING owns a request. */
+} WavePrepareResult;
+
+/* Equal contexts reuse the active queue or outstanding request. Context identity
+ * is the seed multiset; include_wave_model only controls the response format.
+ * Only PENDING requires playback stop before the next service call. */
+WavePrepareResult wave_prepare(const WaveRequestParams *params);
+/* Clone the saved FLOW queue; poll/commit/cancel use the same request lifecycle. */
+WavePrepareResult wave_prepare_restore(void);
+/* 0 pending, 1 full first-track data ready, -1 failed or superseded. */
+int wave_poll(unsigned int request_id, TrackEntry *first);
+/* Commit once, only for the current ready request. 0 success, -1 failure. */
+int wave_commit(unsigned int request_id, TrackEntry *first);
+void wave_cancel(unsigned int request_id);
+/* Cleanup and first requests run unconditionally; refill_enabled follows the
+ * playback screen's existing admission policy. */
+void wave_service(int refill_enabled);
+int wave_quiesce(void);
 /* Session introspection for the controller/reporter (0 ok, -1 inactive). */
 int wave_is_active(void);
 unsigned int wave_current_generation(void);
 int wave_get_session(WaveSession *out);
 int wave_get_session_id(char *out, size_t out_size);
-
-/* Manual-transition terminal events (spec 8.3/8.5): enqueue skip (manual
- * next/previous/stop, decoder error after first PCM) or trackFinished
- * (natural EOF) with really-audible time. played_ms/len_ms are
- * milliseconds; conversion to seconds happens inside. Dropped silently
- * (with a short log) when the session is gone. */
-void wave_note_skip(const char *track_id, int album_id,
-                    int played_ms, int len_ms);
-void wave_note_finished(const char *track_id, int album_id,
-                        int played_ms, int len_ms);
+/* Notify the first audible PCM once per active session. */
+void wave_report_started(unsigned int generation, const char *token);
 
 #endif

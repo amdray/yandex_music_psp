@@ -1,4 +1,5 @@
 #include "core/fs.h"
+#include "core/io_profile.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,6 +19,8 @@
  */
 static SceLwMutexWorkarea fs_mutex;
 static int fs_initialized = 0;
+static uint64_t s_fs_held_start;
+static int s_fs_kind, s_fs_fd;
 
 /* Initialize filesystem mutex.
  * Must be called from main() before any threads are created.
@@ -53,19 +56,26 @@ void fs_shutdown(void)
     }
 }
 
-static int fs_lock_internal(void)
+static int fs_lock_internal(int kind, int fd)
 {
     if (!fs_initialized) {
         logLine("fs: ERROR - mutex not initialized! Call fs_init() first.\n");
         return -1;
     }
+    uint64_t before = sceKernelGetSystemTimeWide();
     sceKernelLockLwMutex(&fs_mutex, 1, NULL);
+    s_fs_held_start = sceKernelGetSystemTimeWide();
+    s_fs_kind = kind;
+    s_fs_fd = fd;
+    io_profile_event(IP_FS_WAIT, fd, kind, before, s_fs_held_start);
     return 0;
 }
 
 static void fs_unlock_internal(void)
 {
     if (fs_initialized) {
+        io_profile_event(IP_FS_HELD, s_fs_fd, s_fs_kind, s_fs_held_start,
+                         sceKernelGetSystemTimeWide());
         sceKernelUnlockLwMutex(&fs_mutex, 1);
     }
 }
@@ -96,7 +106,7 @@ SceUID fs_open(const char *path, int flags, int mode)
         use_path = abs_path;
     }
     
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     fd = sceIoOpen(use_path, flags, mode);
     fs_unlock_internal();
     return fd;
@@ -105,7 +115,7 @@ SceUID fs_open(const char *path, int flags, int mode)
 int fs_close(SceUID fd)
 {
     int rc;
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     rc = sceIoClose(fd);
     fs_unlock_internal();
     return rc;
@@ -114,8 +124,10 @@ int fs_close(SceUID fd)
 int fs_read(SceUID fd, void *buf, size_t size)
 {
     int rc;
-    fs_lock_internal();
+    fs_lock_internal(IP_READ, fd);
+    uint64_t before = sceKernelGetSystemTimeWide();
     rc = sceIoRead(fd, buf, size);
+    io_profile_event(IP_READ, fd, rc, before, sceKernelGetSystemTimeWide());
     fs_unlock_internal();
     return rc;
 }
@@ -123,8 +135,10 @@ int fs_read(SceUID fd, void *buf, size_t size)
 int fs_write(SceUID fd, const void *buf, size_t size)
 {
     int rc;
-    fs_lock_internal();
+    fs_lock_internal(IP_WRITE, fd);
+    uint64_t before = sceKernelGetSystemTimeWide();
     rc = sceIoWrite(fd, buf, size);
+    io_profile_event(IP_WRITE, fd, rc, before, sceKernelGetSystemTimeWide());
     fs_unlock_internal();
     return rc;
 }
@@ -132,8 +146,10 @@ int fs_write(SceUID fd, const void *buf, size_t size)
 SceOff fs_lseek(SceUID fd, SceOff offset, int whence)
 {
     SceOff rc;
-    fs_lock_internal();
+    fs_lock_internal(IP_SEEK, fd);
+    uint64_t before = sceKernelGetSystemTimeWide();
     rc = sceIoLseek(fd, offset, whence);
+    io_profile_event(IP_SEEK, fd, whence, before, sceKernelGetSystemTimeWide());
     fs_unlock_internal();
     return rc;
 }
@@ -148,7 +164,7 @@ int fs_getstat(const char *path, SceIoStat *st)
         use_path = abs_path;
     }
 
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     rc = sceIoGetstat(use_path, st);
     fs_unlock_internal();
     return rc;
@@ -164,7 +180,7 @@ int fs_remove(const char *path)
         use_path = abs_path;
     }
 
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     rc = sceIoRemove(use_path);
     fs_unlock_internal();
     return rc;
@@ -185,7 +201,7 @@ int fs_rename(const char *old_path, const char *new_path)
         use_new_path = abs_new_path;
     }
 
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     rc = sceIoRename(use_old_path, use_new_path);
     fs_unlock_internal();
     return rc;
@@ -206,7 +222,7 @@ int fs_remove_siblings(const char *dir, const char *prefix, const char *keep_nam
         use_dir = abs_dir;
     }
 
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     SceUID dfd = sceIoDopen(use_dir);
     if (dfd < 0) {
         fs_unlock_internal();
@@ -250,7 +266,7 @@ int fs_remove_siblings(const char *dir, const char *prefix, const char *keep_nam
 int fs_mkdir(const char *path, int mode)
 {
     int rc;
-    fs_lock_internal();
+    fs_lock_internal(IP_OTHER, -1);
     rc = sceIoMkdir(path, mode);
     fs_unlock_internal();
     return rc;
@@ -260,16 +276,17 @@ int fs_write_atomic(const char *path, const void *data, size_t size)
 {
     const uint8_t *ptr = (const uint8_t *)data;
     size_t remaining = size;
-    size_t path_len;
     SceUID fd;
+    char abs_path[512];
 
     if (!path || !path[0] || !data) {
         return -1;
     }
-    path_len = strlen(path);
+    if (fs_make_abs_path(path, abs_path, sizeof(abs_path)) != 0) return -1;
+    path = abs_path;
     {
-        char tmp_path[path_len + sizeof(".tmp")];
-        char old_path[path_len + sizeof(".old")];
+        char tmp_path[512];
+        char old_path[512];
 
         if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >= (int)sizeof(tmp_path)) {
             return -1;
@@ -278,7 +295,7 @@ int fs_write_atomic(const char *path, const void *data, size_t size)
             return -1;
         }
 
-        fs_lock_internal();
+        fs_lock_internal(IP_OTHER, -1);
         fd = sceIoOpen(tmp_path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0666);
         if (fd < 0) {
             fs_unlock_internal();
@@ -296,7 +313,12 @@ int fs_write_atomic(const char *path, const void *data, size_t size)
             ptr += written;
             remaining -= (size_t)written;
         }
-        sceIoClose(fd);
+        int close_rc = sceIoClose(fd);
+        if (close_rc < 0) {
+            sceIoRemove(tmp_path);
+            fs_unlock_internal();
+            return close_rc;
+        }
         fs_unlock_internal();
 
         {
@@ -304,10 +326,15 @@ int fs_write_atomic(const char *path, const void *data, size_t size)
             int exists;
             int res;
 
-            fs_lock_internal();
+            fs_lock_internal(IP_OTHER, -1);
             exists = (sceIoGetstat(path, &st) >= 0);
             if (exists) {
-                sceIoRename(path, old_path);
+                res = sceIoRename(path, old_path);
+                if (res < 0) {
+                    sceIoRemove(tmp_path);
+                    fs_unlock_internal();
+                    return res;
+                }
             }
             res = sceIoRename(tmp_path, path);
             if (res >= 0) {

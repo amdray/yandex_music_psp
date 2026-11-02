@@ -62,6 +62,8 @@ int net_tls_write(NetTlsConnection *conn, const unsigned char *buf, size_t len);
 // останется занят чужим tid). Потоки без bind ведут себя как раньше.
 void net_tls_cancel_bind(volatile int *flag);
 void net_tls_cancel_unbind(void);
+/* Cancellation flag bound to the calling thread. */
+int net_tls_cancel_requested(void);
 
 /* Recovery and shutdown close admission and wait for connection owners to
  * release their TLS contexts before APCTL or shared TLS state is changed. */

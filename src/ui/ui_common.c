@@ -1,4 +1,5 @@
 #include "ui/ui_common.h"
+#include "core/time_format.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_icon_atlas.h"
 #include "ui/ui_layout.h"
@@ -15,16 +16,14 @@
 #include <pspkernel.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 void ui_common_draw_header(const char *title)
 {
     UiLayoutWidget title_widget;
     UiLayoutWidget rule_widget;
 
-    if (ui_layout_get_widget("screen_header", "title", &title_widget) != 0 ||
-        ui_layout_get_widget("screen_header", "title_rule", &rule_widget) != 0)
-        return;
+    title_widget = ui_layout_slot_screen_header__title;
+    rule_widget = ui_layout_rect_screen_header__title_rule;
     if (title_widget.w > 0.0f) {
         text_render_clipped(title_widget.x, title_widget.y, title,
                             title_widget.color, title_widget.w);
@@ -504,15 +503,14 @@ void ui_common_draw_top_status(void)
     int active_bars = 0;
     int i;
 
-    if (ui_layout_get_widget("status_overlay", "wifi", &wifi) != 0 ||
-        ui_layout_get_widget("status_overlay", "playback_state", &playback_state) != 0 ||
-        ui_layout_get_widget("status_overlay", "network_activity", &network_activity) != 0 ||
-        ui_layout_get_widget("status_overlay", "eq_profile", &eq_profile) != 0 ||
-        ui_layout_get_widget("status_overlay", "clock", &clock) != 0 ||
-        ui_layout_get_widget("status_overlay", "volume", &volume) != 0 ||
-        ui_layout_get_widget("status_overlay", "battery_percent", &battery_percent) != 0 ||
-        ui_layout_get_widget("status_overlay", "battery", &battery) != 0)
-        return;
+    wifi = ui_layout_slot_status_overlay__wifi;
+    playback_state = ui_layout_slot_status_overlay__playback_state;
+    network_activity = ui_layout_slot_status_overlay__network_activity;
+    eq_profile = ui_layout_slot_status_overlay__eq_profile;
+    clock = ui_layout_slot_status_overlay__clock;
+    volume = ui_layout_slot_status_overlay__volume;
+    battery_percent = ui_layout_slot_status_overlay__battery_percent;
+    battery = ui_layout_slot_status_overlay__battery;
     net_ui_status_get_snapshot(&net);
     system_status_get_snapshot(&status);
 
@@ -568,12 +566,7 @@ void ui_common_draw_top_status(void)
     {
         unsigned long long monotonic_now = sceKernelGetSystemTimeWide();
         if (s_clock_next_us == 0 || monotonic_now >= s_clock_next_us) {
-            time_t wall_now = time(NULL);
-            struct tm *local = localtime(&wall_now);
-            if (local) {
-                snprintf(s_clock_text, sizeof(s_clock_text), "%02d:%02d",
-                         local->tm_hour, local->tm_min);
-            }
+            ym_time_format(s_clock_text, sizeof(s_clock_text), YM_TIME_LOCAL);
             s_clock_next_us = monotonic_now + 1000000ULL;
         }
     }
@@ -584,13 +577,13 @@ void ui_common_draw_top_status(void)
     draw_volume_light(&volume, &status);
     draw_eq_profile(&eq_profile);
 
-    if (net.download_alpha > 0U && net.state == NET_UI_ONLINE) {
+    if (net.activity_alpha > 0U && net.state == NET_UI_ONLINE) {
         int icon_width;
         int icon_height;
         if (ui_icon_atlas_get_size("in_network", &icon_width, &icon_height) == 0) {
             unsigned int base_alpha = (network_activity.color >> 24) & 0xFFU;
             unsigned int alpha =
-                (base_alpha * net.download_alpha + 127U) / 255U;
+                (base_alpha * net.activity_alpha + 127U) / 255U;
             unsigned int color =
                 (network_activity.color & 0x00FFFFFFU) | (alpha << 24);
             int icon_x = (int)network_activity.x +
@@ -608,6 +601,7 @@ void ui_common_draw_top_status(void)
         float inner_w = body_w - 4.0f;
         float fill_width;
         if (!status.battery_available) return;
+        if (status.battery_charging > 0) battery.color = UI_COLOR_ACCENT;
         snprintf(percent, sizeof(percent), "%d%%", status.battery_percent);
         percent_width = text_measure_width(percent);
         ui_draw_text(battery_percent.x + battery_percent.w - percent_width,

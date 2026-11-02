@@ -9,8 +9,9 @@
 #include "ui/ui_common.h"
 #include "services/locale.h"
 #include "core/logger.h"
-#include "core/fs.h"
-#include "services/ya_auth.h"
+#include "services/token_loader.h"
+#include "services/playback_reporter.h"
+#include "services/ya_device_auth.h"
 #include "services/ya_qr_auth.h"
 #include "fonts/text.h"
 #include "services/qrcodegen.h"
@@ -137,44 +138,6 @@ static int login_elapsed_s(void)
     return (int)((now - s_codes_us) / 1000000ULL);
 }
 
-// Сохранить токен в формате token_loader (YANDEX_TOKEN = "...").
-// Пишем через fs-слой (он резолвит путь в ms0:/... сам): сырые sceIo*
-// fs_write_atomic с относительным путём под ARK не видят каталог игры —
-// так и падала запись. Прямая TRUNC-запись, как логи net_client
-// (сохранение account_status_response.json на этом же железе — ок).
-static int login_save_token(const char *token)
-{
-    char buf[320];
-    int len;
-    SceUID fd;
-    int w;
-
-    if (!token || !token[0]) {
-        return -1;
-    }
-    len = snprintf(buf, sizeof(buf), "YANDEX_TOKEN = \"%s\"\n", token);
-    if (len <= 0 || len >= (int)sizeof(buf)) {
-        return -1;
-    }
-    fd = fs_open("config/token.txt",
-                 PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (fd < 0) {
-        logLine("login: save open failed 0x%08X\n", fd);
-        logger_flush();
-        return -1;
-    }
-    w = fs_write(fd, buf, (size_t)len);
-    fs_close(fd);
-    if (w != len) {
-        logLine("login: save short %d/%d\n", w, len);
-        logger_flush();
-        return -1;
-    }
-    logLine("login: token saved len=%d\n", len);
-    logger_flush();
-    return 0;
-}
-
 // Проверить токен (как ya_init), сохранить. 0 = ок (s_result уже 0).
 static int login_finish(const char *tok)
 {
@@ -185,11 +148,12 @@ static int login_finish(const char *tok)
         s_result = -1;
         return -1;
     }
-    if (login_save_token(tok) != 0) {
+    if (token_loader_save(tok) != 0) {
         snprintf(s_msg, sizeof(s_msg), "Ошибка записи.");
         s_result = -1;
         return -1;
     }
+    playback_reporter_set_account(s_user.uid, tok);
     s_result = 0;
     logLine("login: ok\n");
     logger_flush();
@@ -197,9 +161,9 @@ static int login_finish(const char *tok)
 }
 
 // Вход по QR (Яндекс Паспорт). QR обновляется сам по таймеру/протуханию.
-static void login_qr_flow(void)
+static void login_qr_flow(YaQrAuth *ctx)
 {
-    char tok[256];
+    char tok[TOKEN_LOADER_CAPACITY];
     int regen, net_err = 0;
 
     for (regen = 0; regen < QR_MAX_REGEN && !s_cancel; regen++) {
@@ -207,7 +171,7 @@ static void login_qr_flow(void)
         s_codes_ready = 0;
         s_qr_size = 0;
         s_msg[0] = '\0';
-        r = ya_qr_begin(s_qr_text, sizeof(s_qr_text), s_msg, sizeof(s_msg));
+        r = ya_qr_begin(ctx, s_qr_text, sizeof(s_qr_text), s_msg, sizeof(s_msg));
         if (s_cancel) break;
         if (r != 0) {
             if (!s_msg[0]) snprintf(s_msg, sizeof(s_msg), "Не вышло (%d)", r);
@@ -235,7 +199,7 @@ static void login_qr_flow(void)
                 break;  // новый QR
             }
             s_tries++;
-            r = ya_qr_poll(tok, sizeof(tok), s_msg, sizeof(s_msg));
+            r = ya_qr_poll(ctx, tok, sizeof(tok), s_msg, sizeof(s_msg));
             s_lastrc = r;
             if (r == 1) {
                 s_msg[0] = '\0';
@@ -264,29 +228,12 @@ static void login_qr_flow(void)
     }
 }
 
-static int login_worker(SceSize args, void *argp)
+static void login_device_flow(YaDeviceAuth *ctx)
 {
-    char tok[256];
+    char tok[TOKEN_LOADER_CAPACITY];
     int r;
     int interval;
 
-    (void)args;
-    (void)argp;
-    logLine("login: worker start mode=%d\n", s_mode);
-    net_tls_cancel_bind((volatile int *)&s_cancel);
-    if (s_mode == 0) {
-        login_qr_flow();
-        ya_qr_reset();
-        net_tls_cancel_unbind();
-        if (s_cancel) {
-            logLine("login: cancelled\n");
-        } else if (s_result != 0) {
-            s_result = -1;
-            logLine("login: failed\n");
-        }
-        logger_flush();
-        return 0;
-    }
     if (!s_device_id[0]) {
         ya_device_id(s_device_id, sizeof(s_device_id));
     }
@@ -294,14 +241,13 @@ static int login_worker(SceSize args, void *argp)
     // Шаг 1: запрос кодов (как do_login_begin).
     s_codes_ready = 0;
     s_qr_size = 0;
-    r = ya_device_begin(s_device_id, &s_dc);
+    r = ya_device_begin(ctx, s_device_id, &s_dc);
     if (r != 0) {
         snprintf(s_msg, sizeof(s_msg), "Не вышло (%d) %s", r, s_dc.err);
         s_result = -1;
         logLine("login: begin failed %d\n", r);
         logger_flush();
-        net_tls_cancel_unbind();
-        return 0;
+        return;
     }
     s_codes_ready = 1;
     s_codes_us = sceKernelGetSystemTimeWide();
@@ -334,15 +280,14 @@ static int login_worker(SceSize args, void *argp)
             break;
         }
         s_tries++;
-        r = ya_device_poll(s_dc.device_code, tok, sizeof(tok));
+        r = ya_device_poll(ctx, s_dc.device_code, tok, sizeof(tok));
         s_lastrc = r;
         if (r == 1) {
             // Проверка токена (как ya_init) и сохранение.
             if (login_finish(tok) != 0) {
                 break;
             }
-            net_tls_cancel_unbind();
-            return 0;
+            return;
         }
         if (r < 0) {
             // Как в нашем main.c: -2 = отклонён/протух, иначе сеть.
@@ -358,7 +303,6 @@ static int login_worker(SceSize args, void *argp)
         // r == 0: ещё не подтвердили — ждём дальше.
     }
 
-    net_tls_cancel_unbind();
     if (s_cancel) {
         logLine("login: cancelled\n");
     } else if (s_result != 0) {
@@ -366,6 +310,43 @@ static int login_worker(SceSize args, void *argp)
         logLine("login: failed\n");
     }
     logger_flush();
+    return;
+}
+
+static int login_worker(SceSize args, void *argp)
+{
+    (void)args;
+    (void)argp;
+    logLine("login: worker start mode=%d\n", s_mode);
+    net_tls_cancel_bind((volatile int *)&s_cancel);
+    if (s_mode == 0) {
+        YaQrAuth *ctx = ya_qr_create();
+        if (ctx) {
+            login_qr_flow(ctx);
+            ya_qr_destroy(ctx);
+        } else {
+            snprintf(s_msg, sizeof(s_msg), "Недостаточно памяти.");
+            s_result = -1;
+        }
+        net_tls_cancel_unbind();
+        if (s_cancel) {
+            logLine("login: cancelled\n");
+        } else if (s_result != 0) {
+            s_result = -1;
+            logLine("login: failed\n");
+        }
+        logger_flush();
+        return 0;
+    }
+    YaDeviceAuth *ctx = ya_device_create();
+    if (ctx) {
+        login_device_flow(ctx);
+        ya_device_destroy(ctx);
+    } else {
+        snprintf(s_msg, sizeof(s_msg), "Недостаточно памяти.");
+        s_result = -1;
+    }
+    net_tls_cancel_unbind();
     return 0;
 }
 

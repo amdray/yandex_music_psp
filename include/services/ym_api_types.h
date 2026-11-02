@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "app/track.h"
+#include "app/audio_quality.h"
 
 typedef enum {
     YM_OK = 0,
@@ -13,7 +14,8 @@ typedef enum {
     YM_ERR_NOT_FOUND = -4,
     YM_ERR_UNSUPPORTED = -5,
     YM_ERR_NO_MEMORY = -6,
-    YM_ERR_NETWORK = -7
+    YM_ERR_NETWORK = -7,
+    YM_ERR_CANCELLED = -8
 } YmStatus;
 
 typedef struct {
@@ -26,6 +28,7 @@ typedef struct {
     char codec[16];
     char transport[16];
     int bitrate_kbps;
+    AudioQuality quality;
     int encrypted;                 /* 1 = transport encraw, поток AES-128-CTR */
     unsigned char aes_key[16];     /* ключ из downloadInfo.key (hex), nonce = 0 */
 } YmDownloadVariant;
@@ -37,31 +40,10 @@ typedef enum {
 } YmApiStreamDecision;
 
 typedef YmApiStreamDecision (*YmApiTrackCallback)(
+    const TrackRef *ref,
     const TrackEntry *entry,
     void *user_data
 );
 
-typedef YmApiStreamDecision (*YmApiTrackIdCallback)(
-    const char *track_id,
-    void *user_data
-);
-
-typedef struct YmPlaylistTracksParser {
-    int result_key_match;
-    int waiting_result_object;
-    int in_result_object;
-    int key_match;
-    int waiting_array_start;
-    int in_tracks_array;
-    int capturing_object;
-    int object_depth;
-    int in_string;
-    int escape_next;
-    char *obj_buf;
-    int obj_len;
-    int obj_cap;
-    YmApiTrackIdCallback on_track_id;
-    void *user_data;
-} YmPlaylistTracksParser;
 
 #endif

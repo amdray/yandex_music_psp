@@ -33,7 +33,7 @@ typedef struct {
     int duration_ms;
     int available;
     char cover_uri[96];  // URL обложки альбома (с %% для размера)
-    char background_video_uri[192];
+    unsigned int accent_color; /* derivedColors.accent as opaque ABGR; 0 if absent. */
 } TrackEntry;
 
 #endif

@@ -4,13 +4,15 @@
 #include "app/app_state.h"
 #include "fonts/text.h"
 #include "services/locale.h"
+#include "ui/ui_screens.h"
 
-// Один пункт меню описывается ровно один раз: метка + экран перехода.
+// Один пункт меню: метка, назначение и действие перехода.
 // Отрисовка, границы навигации и переход выводятся из таблицы таких строк.
 typedef struct MenuItem {
     LocaleKey label;
     ScreenId  target;
     int       requires_auth;
+    UiNavAction action;
 } MenuItem;
 
 void ui_common_draw_header(const char *title);

@@ -9,6 +9,11 @@
 
 #include "core/fs.h"
 #include "services/locale.h"
+#include "services/last_play.h"
+#include "services/wave.h"
+#include "services/playback_reporter.h"
+#include "services/playback_queue.h"
+#include "services/playback_controller.h"
 #include "services/image_loader.h"
 #include "services/token_loader.h"
 #include "services/net_client.h"
@@ -367,7 +372,7 @@ static const char *splash_state_name(SplashState state)
         "storage", "cache", "index", "locale", "token", "net_start",
         "net_wait", "time_sync_start", "time_sync_wait", "image_start",
         "image_wait", "wlan_off", "net_error", "auth_start", "auth_wait",
-        "auth_error", "ready"
+        "auth_error", "wave_wait", "ready"
     };
     return (state >= SPLASH_STATE_STORAGE && state <= SPLASH_STATE_READY)
         ? names[state] : "invalid";
@@ -387,6 +392,7 @@ static const char *splash_state_status(SplashState state)
     case SPLASH_STATE_TIME_SYNC_WAIT:
     case SPLASH_STATE_IMAGE_START:
     case SPLASH_STATE_IMAGE_WAIT: return locale_get(LOCALE_SPLASH_NET);
+    case SPLASH_STATE_WAVE_WAIT: return locale_get(LOCALE_SPLASH_WAVE);
     case SPLASH_STATE_WLAN_OFF: return locale_get(LOCALE_SPLASH_WLAN_OFF);
     case SPLASH_STATE_NET_ERROR: return locale_get(LOCALE_SPLASH_NET_ERROR);
     case SPLASH_STATE_AUTH_START:
@@ -407,6 +413,31 @@ static void splash_set_state(SplashFlow *flow, SplashState next)
     flow->ready = (next == SPLASH_STATE_READY);
     logLine("splash: state %s -> %s\n",
             splash_state_name(previous), splash_state_name(next));
+}
+
+static void splash_finish(SplashFlow *flow, AppState *app)
+{
+    int autoplay = last_play_autostart_enabled();
+    int restored = last_play_restore(app, autoplay) == 0;
+    flow->playback_resume_requested = restored && autoplay;
+    PlaybackQueueInfo queue;
+    if (restored && playback_queue_get_info(&queue) == 0 &&
+        queue.source == PLAYBACK_QUEUE_SOURCE_FLOW) {
+        playback_controller_get_restored_pause(app->now_playing_track.id,
+                                               &flow->restore_position_ms);
+        WavePrepareResult request = wave_prepare_restore();
+        if (request.status == WAVE_PREPARE_PENDING) {
+            flow->wave_request_id = request.request_id;
+            splash_set_state(flow, SPLASH_STATE_WAVE_WAIT);
+            return;
+        }
+        flow->playback_resume_requested = 0;
+        logLine("splash: wave restore preparation failed\n");
+    }
+    if (restored && !autoplay) {
+        logLine("splash: saved session loaded without autoplay\n");
+    }
+    splash_set_state(flow, SPLASH_STATE_READY);
 }
 
 void splash_flow_init(SplashFlow *flow)
@@ -435,6 +466,7 @@ int splash_flow_has_error(const SplashFlow *flow)
 
 static void apply_retry_reset(SplashFlow *flow)
 {
+    flow->playback_resume_requested = 0;
     if (flow->state == SPLASH_STATE_AUTH_ERROR) {
         flow->auth_result = -2;
         flow->auth_cancel = 0;
@@ -475,6 +507,10 @@ int splash_flow_quiesce(SplashFlow *flow)
 {
     int quiesced = 1;
     if (!flow) return 0;
+    if (flow->wave_request_id) {
+        wave_cancel(flow->wave_request_id);
+        flow->wave_request_id = 0;
+    }
     if (flow->time_sync_thread_id >= 0) {
         SceUInt timeout_us = 10000000U;
         __sync_lock_test_and_set(&flow->time_sync_cancel, 1U);
@@ -729,7 +765,7 @@ void splash_flow_tick(SplashFlow *flow, AppState *app)
     case SPLASH_STATE_AUTH_START:
         if (!flow->token[0]) {
             logLine("splash: empty token -> menu as guest\n");
-            splash_set_state(flow, SPLASH_STATE_READY);
+            splash_finish(flow, app);
             break;
         }
         flow->auth_result = -2;
@@ -766,11 +802,34 @@ void splash_flow_tick(SplashFlow *flow, AppState *app)
         if (flow->auth_result == 0) {
             __sync_synchronize();
             memcpy(&app->currentUser, &flow->auth_user_info, sizeof(UserInfo));
+            playback_reporter_set_account(app->currentUser.uid, flow->token);
             cleanup_auth_thread(flow);
-            splash_set_state(flow, SPLASH_STATE_READY);
+            splash_finish(flow, app);
         } else if (flow->auth_result == -1) {
             cleanup_auth_thread(flow);
             splash_set_state(flow, SPLASH_STATE_AUTH_ERROR);
+        }
+        break;
+    case SPLASH_STATE_WAVE_WAIT:
+        {
+            TrackEntry current;
+            int ready = wave_poll(flow->wave_request_id, &current);
+            if (ready == 0) break;
+            if (ready > 0 && wave_commit(flow->wave_request_id, &current) == 0) {
+                app->now_playing_track = current;
+                playback_controller_restore_paused_current(flow->restore_position_ms);
+                last_play_save();
+                if (flow->playback_resume_requested)
+                    playback_controller_request_resume_current(flow->restore_position_ms);
+                logLine("splash: wave restored position_ms=%d autoplay=%d\n",
+                        flow->restore_position_ms, flow->playback_resume_requested);
+            } else {
+                flow->playback_resume_requested = 0;
+                logLine("splash: wave clone failed, autoplay cancelled\n");
+            }
+            wave_cancel(flow->wave_request_id);
+            flow->wave_request_id = 0;
+            splash_set_state(flow, SPLASH_STATE_READY);
         }
         break;
     case SPLASH_STATE_READY:

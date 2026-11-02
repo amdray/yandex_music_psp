@@ -10,178 +10,121 @@
 #include "services/track_meta_store.h"
 
 typedef struct {
-    int pending;
-    char token[256];
-    ListIndexId ids[TRACK_HYDRATOR_JOB_MAX];
-    int album_ids[TRACK_HYDRATOR_JOB_MAX];
+    TrackRef refs[TRACK_HYDRATOR_JOB_MAX];
     int positions[TRACK_HYDRATOR_JOB_MAX];
+    char token[256];
     int count;
-    int generation;
+    unsigned int generation;
+    unsigned int serial;
+    int pending;
+    int result;
 } HydratorJob;
-
-static SceUID s_thread = -1;
-static SceUID s_sema = -1;
+static SceUID s_thread = -1, s_sema = -1;
 static SceLwMutexWorkarea s_mutex;
-static int s_mutex_initialized = 0;
-static volatile int s_running = 0;
-static volatile int s_cancel_requested = 0;
+static int s_mutex_initialized;
+static volatile int s_running, s_cancel_requested;
+static TrackHydratorSink s_sink;
+static HydratorJob s_jobs[TRACK_HYDRATOR_CONSUMERS];
+static void hydrator_lock(void) { sceKernelLockLwMutex(&s_mutex, 1, NULL); }
+static void hydrator_unlock(void) { sceKernelUnlockLwMutex(&s_mutex, 1); }
 
-static TrackHydratorSink s_sink = NULL;
-static HydratorJob s_track_job;   /* playback: served first */
-static HydratorJob s_window_job;  /* list window */
-
-static void hydrator_lock(void)
+typedef struct { int result; unsigned int view_generation; } HydratorPublication;
+static YmApiStreamDecision hydrator_on_track(const TrackRef *ref, const TrackEntry *entry, void *user)
 {
-    if (s_mutex_initialized) {
-        sceKernelLockLwMutex(&s_mutex, 1, NULL);
-    }
-}
-
-static void hydrator_unlock(void)
-{
-    if (s_mutex_initialized) {
-        sceKernelUnlockLwMutex(&s_mutex, 1);
-    }
-}
-
-/* Context for mapping hydrated entries back to list positions. */
-typedef struct {
-    HydratorJob *job;
-    int delivered;
-} HydrateDeliver;
-
-static YmApiStreamDecision hydrator_on_track(const TrackEntry *entry, void *user_data)
-{
-    HydrateDeliver *ctx = (HydrateDeliver *)user_data;
-    int i;
-
-    if (!ctx || !entry) {
-        return YM_API_STREAM_ERROR;
-    }
-
-    track_meta_store_put(entry);
-
-    for (i = 0; i < ctx->job->count; i++) {
-        if (strcmp(ctx->job->ids[i], entry->id) == 0 &&
-            (ctx->job->album_ids[i] == 0 ||
-             ctx->job->album_ids[i] == entry->album_id)) {
-            if (s_sink) {
-                s_sink(entry, ctx->job->positions[i], ctx->job->generation);
-            }
-            ctx->delivered++;
-            break;
-        }
-    }
+    HydratorPublication *publication = user;
+    int rc = track_meta_store_put(ref, entry, publication->view_generation);
+    if (rc != 0) publication->result = rc;
     return YM_API_STREAM_CONTINUE;
 }
 
-static void hydrator_run_job(HydratorJob *job)
+static int hydrator_run_job(HydratorJob *job, TrackHydratorConsumer consumer)
 {
-    ListIndexId misses[TRACK_HYDRATOR_JOB_MAX];
-    int miss_album_ids[TRACK_HYDRATOR_JOB_MAX];
-    int miss_pos[TRACK_HYDRATOR_JOB_MAX];
-    int miss_count = 0;
-    int i;
-
-    /* Store first: most window slots are hits after one blob/likes pass. */
-    for (i = 0; i < job->count; i++) {
-        TrackEntry entry;
-        if (track_meta_store_get_for(job->ids[i], job->album_ids[i],
-                                     &entry) == 0) {
-            if (s_sink) {
-                s_sink(&entry, job->positions[i], job->generation);
-            }
-        } else {
-            memcpy(misses[miss_count], job->ids[i], sizeof(ListIndexId));
-            miss_album_ids[miss_count] = job->album_ids[i];
-            miss_pos[miss_count] = job->positions[i];
-            miss_count++;
+    TrackRef missing[TRACK_HYDRATOR_JOB_MAX];
+    int count = 0, status = 0;
+    HydratorPublication publication = {0, consumer == TRACK_HYDRATOR_SCREEN ? job->generation : 0};
+    TrackEntry entry;
+    for (int i = 0; i < job->count; ++i) {
+        int rc = track_meta_store_load_for(job->refs[i].id, job->refs[i].album_id,
+                                          &entry, publication.view_generation);
+        if (rc == TRACK_META_ERROR) {
+            logLine("hydrator: store read failed consumer=%d generation=%u serial=%u track=%s album=%d\n",
+                consumer, job->generation, job->serial, job->refs[i].id, job->refs[i].album_id);
+            return -1;
+        }
+        if (rc == TRACK_META_MISSING) {
+            int j;
+            for (j = 0; j < count; ++j)
+                if (missing[j].album_id == job->refs[i].album_id &&
+                    strcmp(missing[j].id, job->refs[i].id) == 0) break;
+            if (j == count) missing[count++] = job->refs[i];
         }
     }
-
-    if (miss_count > 0) {
-        YmApiContext ctx;
-        HydrateDeliver deliver;
-        HydratorJob net_job;
-        int status = 0;
-
-        /* Re-shape the job to just the misses so the callback maps ids to
-           positions without touching the original arrays. */
-        memset(&net_job, 0, sizeof(net_job));
-        memcpy(net_job.ids, misses, (size_t)miss_count * sizeof(ListIndexId));
-        memcpy(net_job.album_ids, miss_album_ids,
-               (size_t)miss_count * sizeof(int));
-        memcpy(net_job.positions, miss_pos, (size_t)miss_count * sizeof(int));
-        net_job.count = miss_count;
-        net_job.generation = job->generation;
-
-        deliver.job = &net_job;
-        deliver.delivered = 0;
-
-        ctx.oauth_token = job->token;
-        ctx.timeout_ms = 0;
-
-        int hydrate_rc;
+    if (count) {
+        YmApiContext ctx = {job->token, 0};
         net_tls_cancel_bind(&s_cancel_requested);
-        {
-            TrackRef refs[TRACK_HYDRATOR_JOB_MAX];
-            for (i = 0; i < miss_count; ++i) {
-                memset(&refs[i], 0, sizeof(refs[i]));
-                snprintf(refs[i].id, sizeof(refs[i].id), "%s",
-                         net_job.ids[i]);
-                refs[i].album_id = net_job.album_ids[i];
-            }
-            hydrate_rc = ym_api_tracks_hydrate_refs(
-                &ctx, refs, miss_count, hydrator_on_track, &deliver, &status);
-        }
+        int rc = ym_api_tracks_hydrate_refs(&ctx, missing, count,
+                                             hydrator_on_track, &publication, &status);
         net_tls_cancel_unbind();
-        if (hydrate_rc != 0) {
-            logLine("hydrator: net hydrate failed status=%d gen=%d\n",
-                    status, job->generation);
-        } else {
-            logLine("hydrator: hydrated %d/%d misses gen=%d\n",
-                    deliver.delivered, miss_count, job->generation);
+        if (rc < 0 || publication.result) {
+            logLine("hydrator: batch failed consumer=%d generation=%u serial=%u requested=%d api=%d status=%d store_failed=%d\n",
+                consumer, job->generation, job->serial, count, rc, status, publication.result);
+            return rc < 0 && status == NET_LOAD_ERR_TRANSPORT && !publication.result
+                ? TRACK_HYDRATOR_TRANSPORT_ERROR : -1;
         }
     }
-}
-
-static int hydrator_worker(SceSize args __attribute__((unused)),
-                           void *argp __attribute__((unused)))
-{
-    logLine("hydrator: worker started\n");
-
-    while (s_running) {
-        HydratorJob job;
-
-        if (sceKernelWaitSema(s_sema, 1, NULL) < 0) {
-            break;
+    for (int i = 0; i < job->count; ++i) {
+        if (track_meta_store_get_for(job->refs[i].id, job->refs[i].album_id, &entry) != 0) {
+            logLine("hydrator: unresolved consumer=%d generation=%u serial=%u position=%d track=%s album=%d\n",
+                consumer, job->generation, job->serial,
+                job->positions[i], job->refs[i].id, job->refs[i].album_id);
+            return -1;
         }
-        if (!s_running) {
-            break;
-        }
-
-        hydrator_lock();
-        if (s_track_job.pending) {
-            memcpy(&job, &s_track_job, sizeof(job));
-            s_track_job.pending = 0;
-        } else if (s_window_job.pending) {
-            memcpy(&job, &s_window_job, sizeof(job));
-            s_window_job.pending = 0;
-        } else {
-            hydrator_unlock();
-            continue;
-        }
-        hydrator_unlock();
-
-        if (job.count > 0 && job.token[0]) {
-            hydrator_run_job(&job);
-        }
+        if (consumer == TRACK_HYDRATOR_SCREEN && s_sink)
+            s_sink(&job->refs[i], &entry, job->positions[i], job->generation);
     }
-
-    logLine("hydrator: worker stopped\n");
     return 0;
 }
 
+static int hydrator_worker(SceSize args, void *argp)
+{
+    (void)args; (void)argp;
+    while (s_running) {
+        if (sceKernelWaitSema(s_sema, 1, NULL) < 0) break;
+        for (;;) {
+            HydratorJob job;
+            int consumer;
+            hydrator_lock();
+            for (consumer = 0; consumer < TRACK_HYDRATOR_CONSUMERS; ++consumer)
+                if (s_jobs[consumer].pending) break;
+            if (!s_running || consumer == TRACK_HYDRATOR_CONSUMERS) {
+                hydrator_unlock();
+                break;
+            }
+            job = s_jobs[consumer];
+            s_jobs[consumer].pending = 0;
+            track_meta_store_set_active_job(job.refs, job.count);
+            hydrator_unlock();
+            logLine("hydrator: start consumer=%d generation=%u serial=%u count=%d track=%s album=%d\n",
+                consumer, job.generation, job.serial, job.count, job.refs[0].id, job.refs[0].album_id);
+            int rc = hydrator_run_job(&job, (TrackHydratorConsumer)consumer);
+            hydrator_lock();
+            int cancelled = s_jobs[consumer].serial != job.serial;
+            if (!cancelled) {
+                s_jobs[consumer].result = rc;
+            }
+            track_meta_store_set_active_job(NULL, 0);
+            hydrator_unlock();
+            if (cancelled)
+                logLine("hydrator: cancelled consumer=%d generation=%u serial=%u count=%d\n",
+                        consumer, job.generation, job.serial, job.count);
+            else
+                logLine("hydrator: consumer=%d generation=%u count=%d result=%d serial=%u\n",
+                        consumer, job.generation, job.count, rc, job.serial);
+            logger_flush();
+        }
+    }
+    return 0;
+}
 int track_hydrator_init(TrackHydratorSink sink)
 {
     if (s_running) {
@@ -194,15 +137,16 @@ int track_hydrator_init(TrackHydratorSink sink)
 
     if (sceKernelCreateLwMutex(&s_mutex, "hydrator", 0, 0, NULL) >= 0) {
         s_mutex_initialized = 1;
-    }
+    } else return -1;
 
     s_sema = sceKernelCreateSema("hydrator", 0, 0, 255, NULL);
     if (s_sema < 0) {
+        sceKernelDeleteLwMutex(&s_mutex);
+        s_mutex_initialized = 0;
         return -1;
     }
 
-    memset(&s_track_job, 0, sizeof(s_track_job));
-    memset(&s_window_job, 0, sizeof(s_window_job));
+    memset(s_jobs, 0, sizeof(s_jobs));
     s_cancel_requested = 0;
 
     s_running = 1;
@@ -215,6 +159,8 @@ int track_hydrator_init(TrackHydratorSink sink)
         }
         sceKernelDeleteSema(s_sema);
         s_sema = -1;
+        sceKernelDeleteLwMutex(&s_mutex);
+        s_mutex_initialized = 0;
         return -1;
     }
     return 0;
@@ -257,58 +203,71 @@ int track_hydrator_shutdown(void)
     return 0;
 }
 
-int track_hydrator_request_window(const char *token,
-                                  const ListIndexId *ids,
-                                  int start,
-                                  int count,
-                                  int generation)
+int track_hydrator_request(TrackHydratorConsumer consumer, const char *token,
+                           const TrackRef *refs, const int *positions,
+                           int count, unsigned int generation)
 {
-    int i;
-
-    if (!s_running || !token || !token[0] || !ids ||
-        count <= 0 || count > TRACK_HYDRATOR_JOB_MAX) {
+    if (!s_running || consumer < 0 || consumer >= TRACK_HYDRATOR_CONSUMERS ||
+        !token || !token[0] || !refs || count <= 0 || count > TRACK_HYDRATOR_JOB_MAX)
         return -1;
-    }
-
     hydrator_lock();
-    s_window_job.pending = 1;
-    snprintf(s_window_job.token, sizeof(s_window_job.token), "%s", token);
-    memcpy(s_window_job.ids, ids, (size_t)count * sizeof(ListIndexId));
-    memset(s_window_job.album_ids, 0, (size_t)count * sizeof(int));
-    for (i = 0; i < count; i++) {
-        s_window_job.positions[i] = start + i;
+    HydratorJob *job = &s_jobs[consumer];
+    /* Rendering may consume part of an active screen batch between frames. */
+    if (consumer == TRACK_HYDRATOR_SCREEN && positions &&
+        job->generation == generation && job->result == 1) {
+        int covered = 1;
+        for (int i = 0; i < count && covered; ++i) {
+            int j;
+            for (j = 0; j < job->count; ++j)
+                if (job->positions[j] == positions[i] &&
+                    job->refs[j].album_id == refs[i].album_id &&
+                    strcmp(job->refs[j].id, refs[i].id) == 0) break;
+            if (j == job->count) covered = 0;
+        }
+        if (covered) { hydrator_unlock(); return 1; }
     }
-    s_window_job.count = count;
-    s_window_job.generation = generation;
+    int same = job->count == count && job->generation == generation &&
+        memcmp(job->refs, refs, (size_t)count * sizeof(*refs)) == 0;
+    if (same && positions)
+        same = memcmp(job->positions, positions, (size_t)count * sizeof(*positions)) == 0;
+    if (same && job->result == 0) {
+        TrackEntry entry;
+        for (int i = 0; i < count; ++i) {
+            if (track_meta_store_get_for(refs[i].id, refs[i].album_id, &entry) != 0) {
+                same = 0;
+                break;
+            }
+        }
+    }
+    if (!same) {
+        track_meta_store_set_working_set(consumer, refs, count);
+        memcpy(job->refs, refs, (size_t)count * sizeof(*refs));
+        if (positions) memcpy(job->positions, positions, (size_t)count * sizeof(*positions));
+        else memset(job->positions, 0, sizeof(job->positions));
+        snprintf(job->token, sizeof(job->token), "%s", token);
+        job->count = count;
+        job->generation = generation;
+        ++job->serial;
+        job->pending = 1;
+        job->result = 1;
+        logLine("hydrator: demand consumer=%d generation=%u serial=%u count=%d track=%s album=%d\n",
+            consumer, generation, job->serial, count, refs[0].id, refs[0].album_id);
+    }
+    int result = job->result;
     hydrator_unlock();
-
-    sceKernelSignalSema(s_sema, 1);
-    return 0;
+    if (!same) sceKernelSignalSema(s_sema, 1);
+    return result;
 }
 
-int track_hydrator_request_track(const char *token,
-                                 const char *track_id,
-                                 int album_id,
-                                 int position,
-                                 int generation)
+void track_hydrator_cancel(TrackHydratorConsumer consumer)
 {
-    if (!s_running || !token || !token[0] ||
-        !track_id || !track_id[0] ||
-        strlen(track_id) >= LIST_INDEX_ID_SIZE) {
-        return -1;
-    }
-
+    if (!s_running || consumer < 0 || consumer >= TRACK_HYDRATOR_CONSUMERS) return;
     hydrator_lock();
-    s_track_job.pending = 1;
-    snprintf(s_track_job.token, sizeof(s_track_job.token), "%s", token);
-    memset(s_track_job.ids[0], 0, sizeof(ListIndexId));
-    strcpy(s_track_job.ids[0], track_id);
-    s_track_job.album_ids[0] = album_id;
-    s_track_job.positions[0] = position;
-    s_track_job.count = 1;
-    s_track_job.generation = generation;
+    logLine("hydrator: cancel demand consumer=%d generation=%u serial=%u count=%d\n",
+        consumer, s_jobs[consumer].generation, s_jobs[consumer].serial, s_jobs[consumer].count);
+    s_jobs[consumer].count = 0;
+    s_jobs[consumer].pending = 0;
+    ++s_jobs[consumer].serial;
     hydrator_unlock();
-
-    sceKernelSignalSema(s_sema, 1);
-    return 0;
+    track_meta_store_set_working_set(consumer, NULL, 0);
 }

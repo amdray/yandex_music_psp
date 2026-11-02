@@ -9,8 +9,8 @@
 
 #include <pspkernel.h>
 
-#include "core/fs.h"
 #include "core/logger.h"
+#include "core/fs.h"
 #include "hal/hal_gfx_config.h"
 #include "hal/hal_gpu.h"
 #include "services/cover_cache.h"
@@ -72,7 +72,7 @@ static int s_last_visible_playlist_kinds[PLAYLIST_VISIBLE_SLOTS] = {0, 0, 0, 0, 
 static int s_last_visible_count = 0;
 /* Set to 1 by playback_controller when a critical fetch is in progress.
  * Worker re-queues the item and sleeps until resume signals the sema. */
-static volatile int s_network_paused = 0;
+static int s_network_pause_count = 0;
 /* Browser cover work should run only while browsing screens are active. */
 static volatile int s_browsing_active = 1;
 
@@ -209,21 +209,31 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
         // 64 is enough for the current entity-id and size contract.
         char temp_file_rel[64];
         const char *size = cover_size_local[0] ? cover_size_local : "30x30";
-        cover_storage_build_path(entity_type, entity_id, size, temp_file_rel, sizeof(temp_file_rel));
+        if (cover_storage_build_path(entity_type, entity_id, size,
+                                     temp_file_rel, sizeof(temp_file_rel)) != 0) {
+            logLine("cover_manager: invalid cache path id=%d\n", entity_id);
+            queue_release(queue_slot);
+            close_cover_connection_if_batch_complete();
+            continue;
+        }
 
         // Check if file already exists (was downloaded previously but not in cache)
-        SceUID fd_check = fs_open(temp_file_rel, PSP_O_RDONLY, 0);
-        int need_download = 1;
-        if (fd_check >= 0) {
-            fs_close(fd_check);
-            need_download = 0;
+        int stored = cover_storage_contains(temp_file_rel);
+        if (stored < 0) {
+            logLine("cover_manager: cache access failed id=%d\n", entity_id);
+            queue_release(queue_slot);
+            close_cover_connection_if_batch_complete();
+            continue;
+        }
+        int need_download = stored == 0;
+        if (!need_download) {
             logLine("cover_manager: worker file exists, skipping download %s id=%d\n", 
                     entity_type_str, entity_id);
         }
 
         /* If playback fetch is in progress, re-queue this item and block
          * on the semaphore until cover_manager_resume_network() wakes us. */
-        if (need_download && s_network_paused) {
+        if (need_download && __sync_fetch_and_add(&s_network_pause_count, 0) > 0) {
             logLine("cover_manager: network paused, re-queuing %s id=%d\n",
                     entity_type_str, entity_id);
             queue_lock();
@@ -233,21 +243,12 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
             continue;  /* go back to sceKernelWaitSema at top of loop */
         }
 
-        if (need_download && !resource_policy_may_start(RESOURCE_CLASS_BROWSER_COVER)) {
-            logLine("cover_manager: policy blocked download %s id=%d\n",
-                    entity_type_str, entity_id);
-            queue_lock();
-            s_load_queue[queue_slot].state = LOAD_QUEUE_QUEUED;
-            queue_unlock();
-            cover_http_client_shutdown(&s_cover_http);
-            continue;
-        }
-
         // Download to file if needed (persistent keep-alive connection to avatars.yandex.net)
         if (need_download) {
             u64 t_dl0 = sceKernelGetSystemTimeWide();
             net_tls_cancel_bind(&s_cancel_requested);
             int dl_rc = cover_http_client_download(&s_cover_http, cover_uri, temp_file_rel);
+            if (dl_rc != 0) fs_remove(temp_file_rel);
             net_tls_cancel_unbind();
             u64 t_dl1 = sceKernelGetSystemTimeWide();
             logLine("cover_manager: download took %u us rc=%d\n", (unsigned)(t_dl1 - t_dl0), dl_rc);
@@ -269,11 +270,11 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
         // Decode to RAM (format detected by signature in image_load_rgba8888)
         u64 t_dec0 = sceKernelGetSystemTimeWide();
         int dec_rc = image_load_rgba8888(temp_file_rel, &rgba_data, &w, &h, &stride_bytes);
+        if (dec_rc == IMAGE_ERR_INVALID_DATA) fs_remove(temp_file_rel);
         u64 t_dec1 = sceKernelGetSystemTimeWide();
         logLine("cover_manager: decode took %u us rc=%d\n", (unsigned)(t_dec1 - t_dec0), dec_rc);
-        if (dec_rc != 0) {
+        if (dec_rc != IMAGE_OK) {
             logLine("cover_manager: worker decode failed %s id=%d\n", entity_type_str, entity_id);
-            fs_remove(temp_file_rel);
             queue_release(queue_slot);
             close_cover_connection_if_batch_complete();
             continue;
@@ -285,17 +286,6 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
             image_free_rgba8888(rgba_data);
             queue_release(queue_slot);
             break;
-        }
-
-        // File is kept in cache, don't remove it
-        if (need_download) {
-            /* Чистка каталога = листинг + stat каждого файла на медленной
-             * карте. Не после каждой обложки, а раз в N скачанных. */
-            static int s_downloads_since_evict = 0;
-            if (++s_downloads_since_evict >= 24) {
-                s_downloads_since_evict = 0;
-                fs_evict_oldest("data/cache/covers", COVER_DISK_KEEP);
-            }
         }
 
         // Add to pending queue
@@ -346,10 +336,12 @@ static int worker_thread(SceSize args __attribute__((unused)), void *argp __attr
     return 0;
 }
 
-void cover_manager_pause_network(void)
+void cover_manager_pause_network(int *held)
 {
-    s_network_paused = 1;
-    logLine("cover_manager: network paused\n");
+    if (*held) return;
+    *held = 1;
+    int count = __sync_add_and_fetch(&s_network_pause_count, 1);
+    logLine("cover_manager: network pause acquired owners=%d\n", count);
 }
 
 void cover_manager_set_browsing_active(int active)
@@ -384,9 +376,11 @@ int cover_manager_is_browsing_active(void)
     return s_browsing_active ? 1 : 0;
 }
 
-void cover_manager_resume_network(void)
+void cover_manager_resume_network(int *held)
 {
-    s_network_paused = 0;
+    if (!*held) return;
+    *held = 0;
+    if (__sync_sub_and_fetch(&s_network_pause_count, 1) != 0) return;
     logLine("cover_manager: network resumed\n");
     if (s_worker_sema < 0) {
         return;

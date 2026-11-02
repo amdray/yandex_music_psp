@@ -19,11 +19,15 @@ typedef enum {
 typedef struct {
     AudioPlayerState state;
     int              position_ms;
+    int              total_played_ms;
+    int              seek_pending;
+    int              seek_target_ms; /* valid while seek_pending is set */
     int              duration_ms;
     int              error_code;
     int              sample_rate;
     int              channels;
     int              bitrate_kbps;
+    int              bits_per_sample;
     char             codec[8];
     char             track_id[40];
     char             title[128];
@@ -42,7 +46,8 @@ void             audio_player_stop(void);
 /* Time-based seek for CBR MP3 streams (read cursor inside the current
  * source; no cache job restart, no new API surface for position).
  * Non-blocking and UI-thread safe: queues at most one pending request,
- * consumed by the worker thread on its next decode iteration.
+ * held pending until the worker completes it or stops. The snapshot exposes
+ * its target separately from the actual playback position.
  * Returns 0 if the seek was queued, -1 when idle (no worker running, or
  * state IDLE/STOPPED/STOPPING/FINISHED/ERROR) or a seek is already pending.
  * target_ms is clamped to >= 0 worker-side; target at/past duration_ms
@@ -71,7 +76,7 @@ void             audio_player_get_scope(short *points);
 /* WAVE-REPORT: really-audible reporting (spec section 6). The worker
  * publishes FIRST_PCM once per run after the first successful
  * sceAudioSRCOutputBlocking, plus a terminal snapshot (reason + audible_ms
- * from really-output samples, never wall-clock) before cleanup. No malloc,
+ * from monotonic PLAYING intervals, independent of seek position) before cleanup. No malloc,
  * no HTTP/JSON on the audio thread; the controller consumes both exactly
  * once via the take_ functions (0 = event present, -1 = none). */
 typedef enum {
@@ -92,6 +97,7 @@ int audio_player_take_terminal_snapshot(char *out_track_id,
                                         unsigned int *out_generation,
                                         AudioEndReason *out_reason,
                                         int *out_audible_ms,
-                                        int *out_had_first_pcm);
+                                        int *out_had_first_pcm,
+                                        int *out_position_ms);
 
 #endif /* YM_AUDIO_PLAYER_H */

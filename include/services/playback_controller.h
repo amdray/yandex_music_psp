@@ -32,6 +32,8 @@ void          playback_controller_init(void);
 void          playback_controller_shutdown(void);
 int           playback_controller_quiesce(void);
 void          playback_controller_request_play_current(void);
+/* Accept full metadata from a committed context and start it from service(). */
+void          playback_controller_request_play_prepared(const TrackEntry *track);
 /* Start the current queue item and apply one absolute seek after its worker
  * becomes ready. Used only to restore a persisted playback session. */
 void          playback_controller_request_resume_current(int position_ms);
@@ -48,6 +50,8 @@ int           playback_controller_get_restored_pause(const char *track_id,
 /* Deferred queue navigation. UI code only submits intent; the controller
  * resolves metadata and switches the player/cache from service(). */
 void          playback_controller_request_next(void);
+/* Back selects previous during the first 3 seconds or while paused;
+ * otherwise it seeks the current track to its beginning. */
 void          playback_controller_request_previous(void);
 void          playback_controller_request_toggle_pause(void);
 void          playback_controller_request_stop(void);

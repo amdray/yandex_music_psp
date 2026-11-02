@@ -5,7 +5,6 @@
 #include "services/locale.h"
 #include "services/token_loader.h"
 #include "core/logger.h"
-#include "core/fs.h"
 #include <pspctrl.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,10 +18,14 @@ void ui_screen_account_handle_input(AppState *state, const InputState *input)
     }
     // С профилем квадрат — выход: чистим токен (файл + кэш) и профиль.
     if ((input->pressed & PSP_CTRL_SQUARE) && state->currentUser.uid > 0) {
-        logLine("account: logout\n");
+        int rc;
+        logLine("account: logout requested\n");
         logger_flush();
-        fs_remove("config/token.txt");
-        token_loader_clear();
+        rc = token_loader_remove();
+        if (rc != 0) {
+            logLine("account: logout failed 0x%08X\n", (unsigned int)rc);
+            return;
+        }
         memset(&state->currentUser, 0, sizeof(state->currentUser));
     }
 }
@@ -60,7 +63,6 @@ void ui_screen_account_render(const AppState *state)
                 ui_draw_text(16.0f, y, locale_get(LOCALE_ACCOUNT_SUBSCRIPTION_INACTIVE), UI_COLOR_INACTIVE);
             }
         } else {
-            ui_draw_text(16.0f, 48.0f, locale_get(LOCALE_ACCOUNT_LOAD_ERROR), UI_COLOR_ERROR);
             ui_draw_text(16.0f, 72.0f, locale_get(LOCALE_ACCOUNT_LOGIN_PROMPT), UI_COLOR_ACCENT);
         }
     }

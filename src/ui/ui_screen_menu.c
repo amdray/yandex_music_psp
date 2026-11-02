@@ -8,54 +8,73 @@
 #include "ui/ui_theme.h"
 #include "services/locale.h"
 #include "services/eq.h"
-#include "services/ym_api.h"
+#include "services/download_settings.h"
+#include "services/screen_idle.h"
+#include "services/cpu_clock.h"
 #include "services/last_play.h"
+#include "services/audio_cache.h"
 #include "services/playback_controller.h"
+#include "services/wave.h"
 #include "services/speed_test.h"
 #include "app/app_state.h"
 #include "core/logger.h"
-#include "services/net_speed.h"
 #include "fonts/text.h"
 #include <pspctrl.h>
 #include <stdio.h>
 #include <string.h>
 
 // Единственный источник правды для главного меню: порядок = порядок на экране,
-// метка и экран перехода в одной строке. Добавил строку — пункт сам появился
+// метка, действие и экран назначения в одной строке. Добавил строку — пункт сам появился
 // в отрисовке, стал навигируемым и кликабельным. Рассинхрон невозможен by design.
 static const MenuItem kMainMenu[] = {
-    { LOCALE_MENU_NOW_PLAYING, SCREEN_NOW_PLAYING,   0 },
-    { LOCALE_MENU_ALBUMS,      SCREEN_ALBUM_LIST,    0 },
-    { LOCALE_MENU_PLAYLISTS,   SCREEN_PLAYLIST_LIST, 1 },
-    { LOCALE_MENU_ARTISTS,     SCREEN_ARTIST,        0 },
-    { LOCALE_MENU_WAVE,        SCREEN_WAVE,          0 },
-    { LOCALE_MENU_SEARCH,      SCREEN_SEARCH,        0 },
-    { LOCALE_MENU_SETTINGS,    SCREEN_SETTINGS,      0 },
+    { LOCALE_MENU_NOW_PLAYING, SCREEN_NOW_PLAYING,   0, UI_NAV_SCREEN },
+    { LOCALE_MENU_ALBUMS,      SCREEN_ALBUM_LIST,    0, UI_NAV_SCREEN },
+    { LOCALE_MENU_PLAYLISTS,   SCREEN_PLAYLIST_LIST, 1, UI_NAV_SCREEN },
+    { LOCALE_MENU_ARTISTS,     SCREEN_ARTIST,        0, UI_NAV_SCREEN },
+    { LOCALE_MENU_WAVE,        SCREEN_NOW_PLAYING,   0, UI_NAV_WAVE },
+    { LOCALE_MENU_SEARCH,      SCREEN_SEARCH,        0, UI_NAV_SCREEN },
+    { LOCALE_MENU_SETTINGS,    SCREEN_SETTINGS,      0, UI_NAV_SCREEN },
 };
 
 static const MenuItem kSettingsMenu[] = {
-    { LOCALE_MENU_ACCOUNT,     SCREEN_ACCOUNT,       0 },
-    { LOCALE_MENU_NET_INFO,    SCREEN_NET_INFO,      0 },
-    { LOCALE_MENU_SPEED_TEST,  SCREEN_COUNT,         0 },
-    { LOCALE_MENU_HELP,        SCREEN_HELP,          0 },
-    { LOCALE_MENU_EQ,          SCREEN_EQ,            0 },
-    { LOCALE_MENU_AUDIO_QUALITY, SCREEN_COUNT,       0 },
-    { LOCALE_MENU_AUTOPLAY,    SCREEN_COUNT,         0 },
-    { LOCALE_MENU_GLOW_STYLE,  SCREEN_COUNT,         0 },
-    { LOCALE_MENU_THEME,       SCREEN_COUNT,         0 },
-    { LOCALE_MENU_IDLE,        SCREEN_COUNT,         0 },
-    { LOCALE_MENU_IDLE_DELAY,  SCREEN_COUNT,         0 },
-    { LOCALE_MENU_LOGS,        SCREEN_COUNT,         0 },
-    { LOCALE_MENU_MEMORY,      SCREEN_MEMORY,        0 },
+    { LOCALE_SETTINGS_PLAYBACK, SCREEN_SETTINGS_PLAYBACK, 0, UI_NAV_SCREEN },
+    { LOCALE_SETTINGS_DISPLAY, SCREEN_SETTINGS_DISPLAY, 0, UI_NAV_SCREEN },
+    { LOCALE_MENU_CPU_CLOCK,   SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_ACCOUNT,     SCREEN_ACCOUNT,       0, UI_NAV_SCREEN },
+    { LOCALE_SETTINGS_DIAGNOSTICS, SCREEN_SETTINGS_DIAGNOSTICS, 0, UI_NAV_SCREEN },
+    { LOCALE_MENU_HELP,        SCREEN_HELP,          0, UI_NAV_SCREEN },
 };
-#define MAIN_MENU_COUNT ((int)(sizeof(kMainMenu) / sizeof(kMainMenu[0])))
-#define SETTINGS_MENU_COUNT ((int)(sizeof(kSettingsMenu) / sizeof(kSettingsMenu[0])))
+
+static const MenuItem kPlaybackSettingsMenu[] = {
+    { LOCALE_MENU_AUDIO_CODEC, SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_AUDIO_QUALITY, SCREEN_COUNT,       0, UI_NAV_SCREEN },
+    { LOCALE_MENU_EQ,          SCREEN_EQ,            0, UI_NAV_SCREEN },
+    { LOCALE_MENU_AUTOPLAY,    SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_RETAIN_DOWNLOADS, SCREEN_COUNT,    0, UI_NAV_SCREEN },
+};
+
+static const MenuItem kDisplaySettingsMenu[] = {
+    { LOCALE_MENU_GLOW_STYLE,  SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_THEME,       SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_IDLE,        SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_IDLE_DELAY,  SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_SCREEN_OFF,  SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_SCREEN_OFF_ON_POWER, SCREEN_COUNT, 0, UI_NAV_SCREEN },
+};
+
+static const MenuItem kDiagnosticsSettingsMenu[] = {
+    { LOCALE_MENU_NET_INFO,    SCREEN_NET_INFO,      0, UI_NAV_SCREEN },
+    { LOCALE_MENU_SPEED_TEST,  SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_LOGS,        SCREEN_COUNT,         0, UI_NAV_SCREEN },
+    { LOCALE_MENU_MEMORY,      SCREEN_MEMORY,        0, UI_NAV_SCREEN },
+};
+#define MENU_COUNT(items) ((int)(sizeof(items) / sizeof((items)[0])))
 
 static int menu_item_enabled(const MenuItem *item, const AppState *state)
 {
     if (!item || !state) return 0;
     if (item->requires_auth && state->currentUser.uid <= 0) return 0;
-    if (item->target == SCREEN_NOW_PLAYING &&
+    if (item->action == UI_NAV_SCREEN && item->target == SCREEN_NOW_PLAYING &&
         !playback_controller_has_current()) return 0;
     return 1;
 }
@@ -65,7 +84,6 @@ typedef struct MenuLayoutContext {
     const MenuItem *items;
     int item_count;
     int selected_index;
-    ScreenId pending;
     u32 pending_color;
 } MenuLayoutContext;
 
@@ -75,7 +93,7 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
     float row_step = widget->step;
     int i;
 
-    if (strcmp(widget->binding, "menu.items") == 0) {
+    if (widget == &ui_layout_rows_menu__items) {
         int visible = (int)((262.0f - widget->y) / row_step);
         int first = 0;
         if (visible < 1) visible = 1;
@@ -90,30 +108,23 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
             u32 color = !enabled ? UI_COLOR_INACTIVE
                                  : (i == ctx->selected_index
                                         ? widget->color : UI_COLOR_ACTIVE);
-            if (enabled && ctx->pending != SCREEN_COUNT &&
-                ctx->items[i].target == ctx->pending) {
+            if (enabled && ui_screens_nav_matches(ctx->items[i].action,
+                                                  ctx->items[i].target)) {
                 color = ctx->pending_color;
             }
-            if (ctx->items[i].label == LOCALE_MENU_AUDIO_QUALITY) {
-                const char *q = ym_api_download_quality();
-                LocaleKey key = LOCALE_QUALITY_NORMAL;
-                if (q && strcmp(q, "hq") == 0) key = LOCALE_QUALITY_HIGH;
-                else if (q && strcmp(q, "lq") == 0) key = LOCALE_QUALITY_LOW;
-                else if (q && strcmp(q, "mp3") == 0) key = LOCALE_QUALITY_MP3;
-                else if (q && strcmp(q, "flac") == 0) key = LOCALE_QUALITY_FLAC;
-                else if (q && strcmp(q, "auto") == 0) key = LOCALE_QUALITY_AUTO;
-                if (key == LOCALE_QUALITY_AUTO) {
-                    /* Авто: показываем, что выбрано сейчас по скорости сети. */
-                    const char *e = ym_api_download_effective_quality();
-                    LocaleKey ek = LOCALE_QUALITY_NORMAL;
-                    if (e && strcmp(e, "hq") == 0) ek = LOCALE_QUALITY_HIGH;
-                    else if (e && strcmp(e, "lq") == 0) ek = LOCALE_QUALITY_LOW;
-                    snprintf(quality_row, sizeof(quality_row), "%s: %s (%s)",
-                             label, locale_get(key), locale_get(ek));
-                } else {
-                    snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
-                             locale_get(key));
-                }
+            if (ctx->items[i].label == LOCALE_MENU_AUDIO_CODEC ||
+                ctx->items[i].label == LOCALE_MENU_AUDIO_QUALITY) {
+                DownloadSettings settings = download_settings_get();
+                const char *value = ctx->items[i].label == LOCALE_MENU_AUDIO_CODEC
+                    ? download_codec_name(settings.codec)
+                    : settings.codec == DOWNLOAD_CODEC_FLAC
+                        ? "lossless" : download_quality_name(settings.quality);
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                         value);
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_CPU_CLOCK) {
+                snprintf(quality_row, sizeof(quality_row), "%s: %d %s", label,
+                         cpu_clock_mhz(), locale_get(LOCALE_UNIT_MHZ));
                 label = quality_row;
             } else if (ctx->items[i].label == LOCALE_MENU_LOGS) {
                 snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
@@ -132,6 +143,23 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
                 snprintf(quality_row, sizeof(quality_row), "%s: %d %s", label,
                          idle_get_delay_s(), locale_get(LOCALE_UNIT_SEC));
                 label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_SCREEN_OFF) {
+                int delay = screen_idle_delay_s();
+                if (delay == 0) {
+                    snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                             locale_get(LOCALE_NEVER));
+                } else {
+                    snprintf(quality_row, sizeof(quality_row), "%s: %d %s", label,
+                             delay >= 60 ? delay / 60 : delay,
+                             locale_get(delay >= 60 ? LOCALE_UNIT_MIN
+                                                    : LOCALE_UNIT_SEC));
+                }
+                label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_SCREEN_OFF_ON_POWER) {
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                         locale_get(screen_idle_off_on_power()
+                             ? LOCALE_YES : LOCALE_NO));
+                label = quality_row;
             } else if (ctx->items[i].label == LOCALE_MENU_SPEED_TEST) {
                 char st[40];
                 speed_test_status(st, sizeof(st));
@@ -143,6 +171,11 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
                         ? LOCALE_SETTING_ON : LOCALE_SETTING_OFF);
                 snprintf(quality_row, sizeof(quality_row), "%s: %s", label, value);
                 label = quality_row;
+            } else if (ctx->items[i].label == LOCALE_MENU_RETAIN_DOWNLOADS) {
+                snprintf(quality_row, sizeof(quality_row), "%s: %s", label,
+                         locale_get(audio_cache_retain_downloads()
+                             ? LOCALE_SETTING_ON : LOCALE_SETTING_OFF));
+                label = quality_row;
             } else if (ctx->items[i].label == LOCALE_MENU_GLOW_STYLE) {
                 const char *value = locale_get(
                     glow_bg_style_name_key(glow_bg_get_style()));
@@ -151,12 +184,12 @@ static void menu_layout_slot(const UiLayoutWidget *widget, void *user_data)
             }
             text_render_font(TEXT_FONT_UI16, widget->x, y, label, color);
         }
-    } else if (strcmp(widget->binding, "menu.selection") == 0) {
+    } else if (widget == &ui_layout_slot_menu__selection) {
         UiLayoutWidget items;
         const MenuItem *selected = &ctx->items[ctx->selected_index];
         u32 color;
 
-        if (ui_layout_get_widget("menu", "items", &items) != 0) return;
+        items = ui_layout_rows_menu__items;
         row_step = items.step;
         color = menu_item_enabled(selected, ctx->state)
                     ? widget->color : UI_COLOR_INACTIVE;
@@ -199,7 +232,12 @@ static void menu_handle_input(AppState *state, const InputState *input,
         }
         logLine("ui: %s select index=%d/%d target=%d\n",
                 log_name, *selected_index, item_count, (int)item->target);
-        ui_screens_navigate(state, item->target);
+        if (item->action == UI_NAV_WAVE) {
+            WaveRequestParams params = {0};
+            ui_screens_start_wave(state, &params);
+        } else {
+            ui_screens_navigate(state, item->target);
+        }
     }
 }
 
@@ -211,86 +249,65 @@ static void menu_render(const AppState *state, const MenuItem *items,
     context.items = items;
     context.item_count = item_count;
     context.selected_index = selected_index;
-    context.pending = ui_screens_nav_pending();
-    context.pending_color = context.pending == SCREEN_COUNT
+    context.pending_color = ui_screens_nav_action() == UI_NAV_NONE
         ? UI_COLOR_PRIMARY : ui_common_pulse_color();
-    (void)ui_layout_render("menu", NULL, menu_layout_slot, &context);
+    (void)ui_layout_render(&ui_layout_screen_menu, menu_layout_slot, &context);
     ui_common_draw_header(locale_get(title));
 }
 
 void ui_screen_menu_handle_input(AppState *state, const InputState *input)
 {
-    menu_handle_input(state, input, kMainMenu, MAIN_MENU_COUNT,
+    menu_handle_input(state, input, kMainMenu, MENU_COUNT(kMainMenu),
                       &state->menu_index, "menu");
 }
 
 void ui_screen_menu_render(const AppState *state)
 {
-    menu_render(state, kMainMenu, MAIN_MENU_COUNT, state->menu_index,
+    menu_render(state, kMainMenu, MENU_COUNT(kMainMenu), state->menu_index,
                 LOCALE_MENU_TITLE);
 }
 
-void ui_screen_settings_handle_input(AppState *state, const InputState *input)
+static void settings_item_input(LocaleKey label, const InputState *input)
 {
-    if (state->settings_index >= 0 && state->settings_index < SETTINGS_MENU_COUNT &&
-        kSettingsMenu[state->settings_index].label == LOCALE_MENU_SPEED_TEST &&
+    if (label == LOCALE_MENU_SPEED_TEST &&
         (input->pressed & PSP_CTRL_CROSS)) {
         speed_test_request();
-    } else if (state->settings_index >= 0 && state->settings_index < SETTINGS_MENU_COUNT &&
-        kSettingsMenu[state->settings_index].label == LOCALE_MENU_AUDIO_QUALITY &&
-        (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-        !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
-        static const char *const kQualityOrder[] = { "lq", "nq", "hq", "auto", "mp3", "flac" };
-        const int n_q = (int)(sizeof(kQualityOrder) / sizeof(kQualityOrder[0]));
-        const char *cur = ym_api_download_quality();
-        int idx = 1, qi; /* nq */
-        for (qi = 0; qi < n_q; qi++) {
-            if (cur && strcmp(cur, kQualityOrder[qi]) == 0) { idx = qi; break; }
+        return;
+    }
+    if (!(input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) ||
+        (input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) return;
+
+    if (label == LOCALE_MENU_AUDIO_CODEC || label == LOCALE_MENU_AUDIO_QUALITY) {
+        DownloadSettings settings = download_settings_get();
+        int forward = (input->pressed & PSP_CTRL_RIGHT) != 0;
+        if (label == LOCALE_MENU_AUDIO_CODEC) {
+            int codec = (settings.codec + (forward ? 1 : DOWNLOAD_CODEC_COUNT - 1))
+                        % DOWNLOAD_CODEC_COUNT;
+            download_settings_set_codec((DownloadCodec)codec);
+        } else if (settings.codec != DOWNLOAD_CODEC_FLAC) {
+            int quality = (settings.quality + (forward ? 1 : DOWNLOAD_QUALITY_COUNT - 1))
+                          % DOWNLOAD_QUALITY_COUNT;
+            download_settings_set_quality((DownloadQuality)quality);
         }
-        if (input->pressed & PSP_CTRL_RIGHT) {
-            idx = (idx + 1) % n_q;
-        } else {
-            idx = (idx + n_q - 1) % n_q;
-        }
-        if (strcmp(cur ? cur : "", kQualityOrder[idx]) != 0) {
-            ym_api_download_set_quality(kQualityOrder[idx]);
-            eq_save();
-        }
-    } else if (state->settings_index >= 0 &&
-               state->settings_index < SETTINGS_MENU_COUNT &&
-               kSettingsMenu[state->settings_index].label == LOCALE_MENU_AUTOPLAY &&
-               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+    } else if (label == LOCALE_MENU_CPU_CLOCK) {
+        cpu_clock_cycle((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
+    } else if (label == LOCALE_MENU_AUTOPLAY) {
         last_play_set_autostart((input->pressed & PSP_CTRL_RIGHT) != 0);
-    } else if (state->settings_index >= 0 &&
-               state->settings_index < SETTINGS_MENU_COUNT &&
-               kSettingsMenu[state->settings_index].label == LOCALE_MENU_THEME &&
-               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+    } else if (label == LOCALE_MENU_RETAIN_DOWNLOADS) {
+        audio_cache_set_retain_downloads((input->pressed & PSP_CTRL_RIGHT) != 0);
+    } else if (label == LOCALE_MENU_THEME) {
         ui_theme_cycle((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
-    } else if (state->settings_index >= 0 &&
-               state->settings_index < SETTINGS_MENU_COUNT &&
-               kSettingsMenu[state->settings_index].label == LOCALE_MENU_IDLE &&
-               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+    } else if (label == LOCALE_MENU_IDLE) {
         idle_cycle_mode((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
-    } else if (state->settings_index >= 0 &&
-               state->settings_index < SETTINGS_MENU_COUNT &&
-               kSettingsMenu[state->settings_index].label == LOCALE_MENU_IDLE_DELAY &&
-               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+    } else if (label == LOCALE_MENU_IDLE_DELAY) {
         idle_cycle_delay((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
-    } else if (state->settings_index >= 0 &&
-               state->settings_index < SETTINGS_MENU_COUNT &&
-               kSettingsMenu[state->settings_index].label == LOCALE_MENU_LOGS &&
-               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+    } else if (label == LOCALE_MENU_SCREEN_OFF) {
+        screen_idle_cycle_delay((input->pressed & PSP_CTRL_RIGHT) ? 1 : -1);
+    } else if (label == LOCALE_MENU_SCREEN_OFF_ON_POWER) {
+        screen_idle_set_off_on_power((input->pressed & PSP_CTRL_RIGHT) != 0);
+    } else if (label == LOCALE_MENU_LOGS) {
         logger_set_enabled((input->pressed & PSP_CTRL_RIGHT) != 0);
-    } else if (state->settings_index >= 0 &&
-               state->settings_index < SETTINGS_MENU_COUNT &&
-               kSettingsMenu[state->settings_index].label == LOCALE_MENU_GLOW_STYLE &&
-               (input->pressed & (PSP_CTRL_LEFT | PSP_CTRL_RIGHT)) &&
-               !(input->pressed & (PSP_CTRL_UP | PSP_CTRL_DOWN | PSP_CTRL_CROSS))) {
+    } else if (label == LOCALE_MENU_GLOW_STYLE) {
         int style = glow_bg_get_style();
         if (input->pressed & PSP_CTRL_RIGHT) {
             style = (style + 1) % GLOW_STYLE_COUNT;
@@ -299,12 +316,65 @@ void ui_screen_settings_handle_input(AppState *state, const InputState *input)
         }
         glow_bg_set_style(style);
     }
-    menu_handle_input(state, input, kSettingsMenu, SETTINGS_MENU_COUNT,
-                      &state->settings_index, "settings");
+}
+
+static void settings_handle_input(AppState *state, const InputState *input,
+                                  const MenuItem *items, int item_count,
+                                  int *selected_index)
+{
+    if (*selected_index >= 0 && *selected_index < item_count) {
+        settings_item_input(items[*selected_index].label, input);
+    }
+    menu_handle_input(state, input, items, item_count, selected_index, "settings");
+}
+
+void ui_screen_settings_handle_input(AppState *state, const InputState *input)
+{
+    settings_handle_input(state, input, kSettingsMenu, MENU_COUNT(kSettingsMenu),
+                          &state->settings_index);
 }
 
 void ui_screen_settings_render(const AppState *state)
 {
-    menu_render(state, kSettingsMenu, SETTINGS_MENU_COUNT,
+    menu_render(state, kSettingsMenu, MENU_COUNT(kSettingsMenu),
                 state->settings_index, LOCALE_MENU_SETTINGS);
+}
+
+void ui_screen_playback_settings_handle_input(AppState *state, const InputState *input)
+{
+    settings_handle_input(state, input, kPlaybackSettingsMenu,
+                          MENU_COUNT(kPlaybackSettingsMenu),
+                          &state->playback_settings_index);
+}
+
+void ui_screen_playback_settings_render(const AppState *state)
+{
+    menu_render(state, kPlaybackSettingsMenu, MENU_COUNT(kPlaybackSettingsMenu),
+                state->playback_settings_index, LOCALE_SETTINGS_PLAYBACK);
+}
+
+void ui_screen_display_settings_handle_input(AppState *state, const InputState *input)
+{
+    settings_handle_input(state, input, kDisplaySettingsMenu,
+                          MENU_COUNT(kDisplaySettingsMenu),
+                          &state->display_settings_index);
+}
+
+void ui_screen_display_settings_render(const AppState *state)
+{
+    menu_render(state, kDisplaySettingsMenu, MENU_COUNT(kDisplaySettingsMenu),
+                state->display_settings_index, LOCALE_SETTINGS_DISPLAY);
+}
+
+void ui_screen_diagnostics_settings_handle_input(AppState *state, const InputState *input)
+{
+    settings_handle_input(state, input, kDiagnosticsSettingsMenu,
+                          MENU_COUNT(kDiagnosticsSettingsMenu),
+                          &state->diagnostics_settings_index);
+}
+
+void ui_screen_diagnostics_settings_render(const AppState *state)
+{
+    menu_render(state, kDiagnosticsSettingsMenu, MENU_COUNT(kDiagnosticsSettingsMenu),
+                state->diagnostics_settings_index, LOCALE_SETTINGS_DIAGNOSTICS);
 }

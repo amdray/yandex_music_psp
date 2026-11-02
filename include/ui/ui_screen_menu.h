@@ -8,5 +8,11 @@ void ui_screen_menu_handle_input(AppState *state, const InputState *input);
 void ui_screen_menu_render(const AppState *state);
 void ui_screen_settings_handle_input(AppState *state, const InputState *input);
 void ui_screen_settings_render(const AppState *state);
+void ui_screen_playback_settings_handle_input(AppState *state, const InputState *input);
+void ui_screen_playback_settings_render(const AppState *state);
+void ui_screen_display_settings_handle_input(AppState *state, const InputState *input);
+void ui_screen_display_settings_render(const AppState *state);
+void ui_screen_diagnostics_settings_handle_input(AppState *state, const InputState *input);
+void ui_screen_diagnostics_settings_render(const AppState *state);
 
 #endif

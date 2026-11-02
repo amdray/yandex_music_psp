@@ -47,6 +47,8 @@ static SystemStatusSnapshot s_status;
 static u32 s_impose_get_param;
 static u64 s_last_volume_us;
 static u64 s_last_battery_us;
+static u64 s_last_battery_poll_begin_us;
+static u64 s_battery_state_read_us;
 static u64 s_last_battery_log_us;
 static u64 s_last_cpu_sample_us;
 static u64 s_cpu_previous_idle_us;
@@ -142,6 +144,9 @@ static void update_battery(void)
     int full;
     int percent;
 
+    s_status.power_online = scePowerIsPowerOnline();
+    s_status.battery_charging = scePowerIsBatteryCharging();
+    s_battery_state_read_us = sceKernelGetSystemTimeWide();
     if (exists <= 0) {
         s_status.battery_available = 0;
         return;
@@ -164,15 +169,14 @@ static void update_battery(void)
     if (percent > 100) percent = 100;
 
     s_status.battery_percent = percent;
-    s_status.battery_charging = scePowerIsBatteryCharging() > 0;
     s_status.battery_available = 1;
 }
 
 static void log_battery_telemetry(void)
 {
-    int online = scePowerIsPowerOnline();
+    int online = s_status.power_online;
     int exists = scePowerIsBatteryExist();
-    int charging = scePowerIsBatteryCharging();
+    int charging = s_status.battery_charging;
     int charging_status = scePowerGetBatteryChargingStatus();
     int low = scePowerIsLowBattery();
     int suspend_required = scePowerIsSuspendRequired();
@@ -307,6 +311,7 @@ void system_status_init(void)
     s_impose_get_param = 0;
     s_last_volume_us = 0;
     s_last_battery_us = 0;
+    s_last_battery_poll_begin_us = 0;
     s_last_battery_log_us = 0;
     s_last_cpu_sample_us = 0;
     s_cpu_previous_idle_us = 0;
@@ -337,7 +342,20 @@ void system_status_update(int volume_button_down)
         s_last_volume_us = now;
     }
     if (s_last_battery_us == 0 || now - s_last_battery_us >= BATTERY_POLL_US) {
+        u64 poll_begin_us = sceKernelGetSystemTimeWide();
         update_battery();
+        u64 poll_end_us = sceKernelGetSystemTimeWide();
+        logLine("battery: poll begin_us=%llu state_us=%llu end_us=%llu gap_us=%llu "
+                "elapsed_us=%llu online=%d charging=%d available=%d percent=%d\n",
+                (unsigned long long)poll_begin_us,
+                (unsigned long long)s_battery_state_read_us,
+                (unsigned long long)poll_end_us,
+                (unsigned long long)(s_last_battery_poll_begin_us
+                    ? poll_begin_us - s_last_battery_poll_begin_us : 0),
+                (unsigned long long)(poll_end_us - poll_begin_us),
+                s_status.power_online, s_status.battery_charging,
+                s_status.battery_available, s_status.battery_percent);
+        s_last_battery_poll_begin_us = poll_begin_us;
         s_last_battery_us = now;
     }
     if (s_last_battery_log_us == 0 ||

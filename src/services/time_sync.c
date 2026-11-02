@@ -1,3 +1,4 @@
+#include "services/net_activity.h"
 #include "services/time_sync.h"
 
 #include <arpa/inet.h>
@@ -190,6 +191,7 @@ static int ntp_exchange(const struct in_addr *address,
         int sent = (int)sceNetInetSendto(fd, request, sizeof(request), 0,
                                         (struct sockaddr *)&peer,
                                         sizeof(peer));
+        net_activity_record_transfer(sent);
         if (sent == (int)sizeof(request)) break;
         if (sent >= 0) {
             logLine("time_sync: ntp short send bytes=%d\n", sent);
@@ -231,6 +233,7 @@ static int ntp_exchange(const struct in_addr *address,
         received = (int)sceNetInetRecvfrom(fd, response, sizeof(response), 0,
                                           (struct sockaddr *)&from,
                                           &from_len);
+        net_activity_record_transfer(received);
         if (received < 0) {
             error = sceNetInetGetErrno();
             if (error == EAGAIN || error == EWOULDBLOCK) continue;

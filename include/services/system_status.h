@@ -6,7 +6,9 @@ typedef struct SystemStatusSnapshot {
     int volume_available;
     int volume_button_down;
     int battery_percent;
+    /* Power queries: 1 yes, 0 no, negative value on read error. */
     int battery_charging;
+    int power_online;
     int battery_available;
 } SystemStatusSnapshot;
 

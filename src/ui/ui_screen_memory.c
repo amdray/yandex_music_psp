@@ -82,9 +82,9 @@ static void draw_graph(const UiLayoutWidget *widget,
 
     for (i = 0; i < context->count; i++) {
         const MemProbeSample *sample = &context->samples[i];
-        u32 heap_cap = sample->heap_cap;
+        u32 heap_cap = sample->heap_configured;
         u32 heap_used = sample->heap_used;
-        u32 largest_free = sample->largest_free;
+        u32 largest_free = sample->partition_largest_free;
         u32 cumulative;
         int used_y;
         int heap_y;
@@ -155,28 +155,24 @@ static void draw_legend(const UiLayoutWidget *widget,
                         const MemoryScreenContext *context)
 {
     const MemProbeSample *sample;
-    u32 heap_cap;
-    u32 heap_used;
-    u32 largest_free;
+    u32 heap_budget_left;
+    u64 accounted;
     u32 other;
 
     if (context->count <= 0 || context->total_bytes == 0) return;
     sample = &context->samples[context->count - 1];
-    heap_cap = sample->heap_cap > context->total_bytes
-                   ? context->total_bytes : sample->heap_cap;
-    heap_used = sample->heap_used > heap_cap ? heap_cap : sample->heap_used;
-    largest_free = sample->largest_free;
-    if (largest_free > context->total_bytes - heap_cap) {
-        largest_free = context->total_bytes - heap_cap;
-    }
-    other = context->total_bytes - heap_cap - largest_free;
+    heap_budget_left = sample->heap_configured > sample->heap_used
+                           ? sample->heap_configured - sample->heap_used : 0;
+    accounted = (u64)sample->heap_configured + sample->partition_largest_free;
+    other = accounted < context->total_bytes
+                ? context->total_bytes - (u32)accounted : 0;
 
     draw_legend_row(widget->x, widget->y, COLOR_HEAP_USED,
-                    "Heap used", heap_used);
+                    "Heap used", sample->heap_used);
     draw_legend_row(widget->x + 224.0f, widget->y, COLOR_HEAP_RESERVE,
-                    "Heap reserve", heap_cap - heap_used);
+                    "Heap budget left", heap_budget_left);
     draw_legend_row(widget->x, widget->y + 17.0f, COLOR_LARGEST_FREE,
-                    "Largest free", largest_free);
+                    "Largest free", sample->partition_largest_free);
     draw_legend_row(widget->x + 224.0f, widget->y + 17.0f, COLOR_OTHER,
                     "Other/fragmented", other);
 }
@@ -185,9 +181,9 @@ static void memory_layout_slot(const UiLayoutWidget *widget, void *user_data)
 {
     MemoryScreenContext *context = (MemoryScreenContext *)user_data;
 
-    if (strcmp(widget->binding, "memory.graph") == 0) {
+    if (widget == &ui_layout_slot_memory__graph) {
         draw_graph(widget, context);
-    } else if (strcmp(widget->binding, "memory.legend") == 0) {
+    } else if (widget == &ui_layout_slot_memory__legend) {
         draw_legend(widget, context);
     }
 }
@@ -200,7 +196,7 @@ void ui_screen_memory_render(const AppState *state)
     context.total_bytes = s_total_bytes;
     context.count = mem_probe_history_copy(context.samples,
                                             MEM_PROBE_HISTORY_CAPACITY);
-    (void)ui_layout_render("memory", NULL, memory_layout_slot, &context);
+    (void)ui_layout_render(&ui_layout_screen_memory, memory_layout_slot, &context);
     ui_common_draw_header(locale_get(LOCALE_SCREEN_MEMORY));
     if (context.total_bytes == 0) {
         ui_draw_text(24.0f, 106.0f, "Memory model unavailable",

@@ -13,7 +13,6 @@
 #include "core/logger.h"
 #include "core/fs.h"
 #include "mbedtls/ssl.h"
-#include "services/net_activity.h"
 
 // ------------------------------------------------------------------ helpers
 static int parse_https_url(const char *url, char *host, size_t host_len,
@@ -284,6 +283,7 @@ int http_request(const HttpRequest *req, NetHttpResponse *out)
     }
 
     memset(out, 0, sizeof(*out));
+    if (net_tls_cancel_requested()) return NET_HTTP_STREAM_CANCELLED;
 
     const char *accept = req->accept ? req->accept : "application/json";
     int initial_buffer = req->initial_buffer > 0 ? req->initial_buffer : HTTP_TLS_BUFFER_MEDIUM;
@@ -292,7 +292,7 @@ int http_request(const HttpRequest *req, NetHttpResponse *out)
     {
         int open_rc = http_open(req, accept, req->no_client_header ? 0 : 1, &conn);
         if (open_rc != 0) {
-            return open_rc;
+            return net_tls_cancel_requested() ? NET_HTTP_STREAM_CANCELLED : open_rc;
         }
     }
 
@@ -367,6 +367,7 @@ cleanup:
         free(response);
     }
     net_tls_disconnect(&conn);
+    if (net_tls_cancel_requested()) ret = NET_HTTP_STREAM_CANCELLED;
     if (ret != 0 && out->body) {
         free(out->body);
         memset(out, 0, sizeof(*out));
@@ -386,7 +387,6 @@ typedef struct {
     int content_length;    // -1 if unknown (chunked)
     int progress_base;     // absolute offset of this response body
     int progress_length;   // complete object length reported to callback
-    int activity_admitted;
 } StreamEmitCtx;
 
 // Emit one body segment. Returns 0 to continue, NET_HTTP_STREAM_CANCELLED if a
@@ -403,11 +403,6 @@ static int stream_emit(const char *data, int size, void *user)
     if (!net_tls_connection_is_current(e->conn)) {
         return NET_HTTP_ERR_OFFLINE;
     }
-    if (!e->activity_admitted) {
-        net_activity_begin();
-        e->activity_admitted = 1;
-    }
-    net_activity_body_bytes(size);
     if (e->fd >= 0) {
         if (write_fully(e->fd, data, size) != 0) {
             return -1;
@@ -569,7 +564,7 @@ int http_stream(const HttpRequest *req, const HttpSink *sink)
     }
 
     emit = (StreamEmitCtx){ sink, &conn, fd, 0, content_length,
-                            progress_base, progress_length, 0 };
+                            progress_base, progress_length };
 
     // Signal content_length to the consumer before the first body byte.
     if (sink->on_progress) {
@@ -701,7 +696,6 @@ cleanup:
     }
     free(hdr_buf);
     net_tls_disconnect(&conn);
-    if (emit.activity_admitted) net_activity_end();
     return ret;
 }
 
@@ -1122,7 +1116,6 @@ static char *read_tls_response(NetTlsConnection *conn, int initial_capacity, int
     int headers_done = 0;
     int content_length = -1;
     int is_chunked = 0;
-    int activity_admitted = 0;
 
     if (capacity <= 0) {
         logLine("tls: invalid initial capacity %d\n", capacity);
@@ -1137,7 +1130,6 @@ static char *read_tls_response(NetTlsConnection *conn, int initial_capacity, int
     http_log_large_alloc("tls buffer (initial)", (size_t)capacity);
 
     while (1) {
-        int had_headers = headers_done;
         /* Stop reading if we have received all body bytes per Content-Length. */
         if (headers_done && !is_chunked && content_length >= 0) {
             const char *header_end = strstr(buffer, "\r\n\r\n");
@@ -1175,34 +1167,16 @@ static char *read_tls_response(NetTlsConnection *conn, int initial_capacity, int
                 continue;
             }
             logLine("tls: read FAILED %d\n", read);
-            if (activity_admitted) net_activity_end();
             free(buffer);
             return NULL;
         }
         size += read;
         buffer[size] = '\0';
-        if (had_headers) {
-            if (!activity_admitted) {
-                net_activity_begin();
-                activity_admitted = 1;
-            }
-            net_activity_body_bytes(read);
-        }
 
         /* After headers arrive, parse content-length/chunked once. */
         if (!headers_done) {
             if (strstr(buffer, "\r\n\r\n")) {
-                const char *activity_header_end = strstr(buffer, "\r\n\r\n");
                 headers_done = 1;
-                if (activity_header_end) {
-                    int body_bytes =
-                        size - (int)(activity_header_end + 4 - buffer);
-                    if (body_bytes > 0) {
-                        net_activity_begin();
-                        activity_admitted = 1;
-                        net_activity_body_bytes(body_bytes);
-                    }
-                }
                 /* HTTP headers are case-insensitive but Yandex servers send
                  * standard casing, so strstr is sufficient here. */
                 const char *cl = strstr(buffer, "Content-Length:");
@@ -1223,7 +1197,6 @@ static char *read_tls_response(NetTlsConnection *conn, int initial_capacity, int
             char *next = (char *)realloc(buffer, (size_t)new_capacity + 1);
             if (!next) {
                 logLine("tls: realloc failed %d\n", new_capacity);
-                if (activity_admitted) net_activity_end();
                 free(buffer);
                 return NULL;
             }
@@ -1237,7 +1210,6 @@ static char *read_tls_response(NetTlsConnection *conn, int initial_capacity, int
     if (out_size) {
         *out_size = size;
     }
-    if (activity_admitted) net_activity_end();
     return buffer;
 }
 

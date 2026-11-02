@@ -1,4 +1,5 @@
 # Build artifacts
+generated/
 *.o
 *.d
 *.elf
@@ -14,15 +15,21 @@
 __pycache__/
 *.py[cod]
 layout_dump.txt
+.audit-roulette.json
 tools/
 assets/icon/
 devtools/
+build_support/
 design/
 
 # Local project notes (not part of the public repository)
 docs/
 AGENTS.md
 CHANGES_SINCE_GITHUB.md
+ASTRA_ARCHITECTURE_REVIEW.md
+ASTRA_REVIEW_LATEST.md
+AUDIO_PLAYER_ARCHITECTURAL_NECESSITY_AUDIT.md
+AUDIO_PLAYER_ARCHITECTURE_AUDIT.md
 
 # Local secrets
 config/token.txt

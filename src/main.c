@@ -1,3 +1,4 @@
+#include "core/io_profile.h"
 #include <pspkernel.h>
 #include <pspdisplay.h>
 #include <pspctrl.h>
@@ -9,6 +10,8 @@
 #include <pspsysmem.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/select.h>
+#include <curl/curl.h>
 
 #include "app/app_state.h"
 #include "hal/hal_input.h"
@@ -16,17 +19,23 @@
 #include "fonts/text.h"
 #include "ui/ui_draw.h"
 #include "ui/ui_screens.h"
-#include "services/libc_guard.h"
+#include "core/libc_runtime.h"
 #include "services/image_loader.h"
 #include "services/cover_manager.h"
 #include "services/eq.h"
+#include "services/download_settings.h"
+#include "services/screen_idle.h"
+#include "services/cpu_clock.h"
+#include "services/system_status.h"
 #include "services/playback_controller.h"
+#include "services/wave.h"
 #include "services/audio_player.h"
 #include "services/net_client.h"
 #include "core/logger.h"
 #include "core/fs.h"
 #include "core/mem_probe.h"
 #include "services/systemctrl_rng.h"
+#include "services/token_loader.h"
 
 #define LOGGER_PATH "data/logs/app.log"
 
@@ -57,28 +66,22 @@ static int hal_input_ready = 0;
 static void log_heap_state(const char *stage)
 {
     MemProbeSample sample;
-    size_t cap;
-    size_t used;
-    size_t free_bytes;
+    u32 heap_budget_left;
 
-    if (mem_probe_latest(&sample)) {
-        cap = sample.heap_cap;
-        used = sample.heap_used;
-    } else {
-        cap = mem_heap_cap();
-        used = mem_heap_used();
-    }
-    free_bytes = cap > used ? cap - used : 0;
+    if (!mem_probe_latest(&sample)) return;
+    heap_budget_left = sample.heap_configured > sample.heap_used
+                           ? sample.heap_configured - sample.heap_used : 0;
 
-    /* sys_free/sys_max — свободная СИСТЕМНАЯ память (стеки потоков, ядро),
-     * не куча: на PSP-1000 её после старта остаётся ~1,5 МБ. */
-    logLine("mem: heap stage=%s used=%u free=%u cap=%u sys_free=%d sys_max=%d\n",
-            stage ? stage : "periodic",
-            (unsigned int)used,
-            (unsigned int)free_bytes,
-            (unsigned int)cap,
-            (int)sceKernelTotalFreeMemSize(),
-            (int)sceKernelMaxFreeMemSize());
+    logLine("mem: sample stage=%s sample_us=%llu heap_configured=%u "
+            "heap_used=%u heap_budget_left=%u partition_free=%u "
+            "partition_largest_free=%u\n",
+            stage,
+            (unsigned long long)sample.time_us,
+            (unsigned int)sample.heap_configured,
+            (unsigned int)sample.heap_used,
+            (unsigned int)heap_budget_left,
+            (unsigned int)sample.partition_free,
+            (unsigned int)sample.partition_largest_free);
 }
 
 typedef enum {
@@ -227,22 +230,32 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // Максимальная частота CPU: без этого PSP работает на 222 МГц и весь
-    // интерфейс (не только свечение) тормозит. Игнорируем ошибку keeper'ов.
-    scePowerSetClockFrequency(333, 333, 166);
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return 1;
 
-    /* Мьютекс для strtod/cJSON до старта любых потоков (libc_guard.h). */
-    ym_libc_guard_init();
-
-    // Initialize fs module
-    if (fs_init() != 0) {
+    /* Мьютекс для strtod/cJSON до старта любых потоков (core/libc_runtime.h). */
+    if (ym_libc_guard_init() < 0) {
+        curl_global_cleanup();
         return 1;
     }
 
+    // Initialize fs module
+    if (fs_init() != 0) {
+        curl_global_cleanup();
+        return 1;
+    }
+    if (token_loader_init() != 0) {
+        curl_global_cleanup();
+        return 1;
+    }
+
+    download_settings_init();
     /* Эквалайзер: читает config/eq.cfg (нет файла = Off). */
     eq_init();
 
     LOG_INIT();
+    if (cpu_clock_init() < 0) {
+        goto cleanup;
+    }
     if (exit_on_stage(EXIT_STAGE_AFTER_LOGGER)) {
         return 0;
     }
@@ -287,6 +300,7 @@ int main(int argc, char *argv[])
     }
     ui_draw_ready = 1;
 
+    system_status_init();
     logLine("app: init - ui_screens_init\n");
     if (ui_screens_init() < 0) {
         logLine("app: UI screens initialization failed\n");
@@ -302,6 +316,10 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
     hal_input_ready = 1;
+
+    if (screen_idle_init() < 0) {
+        goto cleanup;
+    }
 
     logLine("app: init - app_state_init\n");
     if (app_state_init(&s_app_state) < 0) {
@@ -326,6 +344,10 @@ int main(int argc, char *argv[])
         int have_snap;
 
         hal_input_poll(&input);
+
+        system_status_update((input.buttons &
+                              (PSP_CTRL_VOLUP | PSP_CTRL_VOLDOWN)) != 0);
+        screen_idle_service();
 
         if (s_exit_requested) break;
 
@@ -378,7 +400,24 @@ int main(int argc, char *argv[])
         }
         ui_screens_handle_input(&s_app_state, &input);
         ui_screens_render(&s_app_state);
+        {
+            static int power_frame_recorded;
+            static SystemStatusSnapshot previous_power_frame;
+            SystemStatusSnapshot power_frame;
+            system_status_get_snapshot(&power_frame);
+            if (!power_frame_recorded ||
+                power_frame.power_online != previous_power_frame.power_online ||
+                power_frame.battery_charging != previous_power_frame.battery_charging ||
+                power_frame.battery_available != previous_power_frame.battery_available) {
+                logLine("battery: frame done screen=%d online=%d charging=%d available=%d\n",
+                        (int)app_state_get_current(&s_app_state), power_frame.power_online,
+                        power_frame.battery_charging, power_frame.battery_available);
+                previous_power_frame = power_frame;
+                power_frame_recorded = 1;
+            }
+        }
         playback_controller_service();
+        wave_service(app_state_get_current(&s_app_state) == SCREEN_NOW_PLAYING);
 
         if (last_heap_log_us == 0 || now_us - last_heap_log_us >= 120000000ULL) {
             log_heap_state("periodic");
@@ -447,7 +486,13 @@ cleanup:
     if (ui_screens_ready) {
         /* ui_screens_shutdown is join-only. Whether every join succeeds or not,
          * no application/network destructor runs in this process. */
-        (void)ui_screens_shutdown();
+        int profile_quiesced = ui_screens_shutdown() == 0;
+        if (profile_quiesced) {
+            int profile_rc = io_profile_save();
+            logLine("io_profile: save rc=%d path=data/io_profile.bin\n", profile_rc);
+        } else {
+            logLine("io_profile: not saved: workers not quiescent\n");
+        }
         logLine("app: shutdown\n");
         LOG_FLUSH();
         fs_flush_deferred();

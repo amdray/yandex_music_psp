@@ -1,12 +1,14 @@
 #include "services/playback_controller.h"
 
 #include <pspkernel.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "core/logger.h"
 #include "services/audio_cache.h"
 #include "services/audio_player.h"
 #include "services/cover_now_playing.h"
+#include "services/download_settings.h"
 #include "services/last_play.h"
 #include "services/playback_queue.h"
 #include "services/playback_reporter.h"
@@ -21,12 +23,17 @@ PlaybackState g_playback;
 /* Token buffer — loaded on UI thread, cleared after handoff to audio_cache. */
 static char s_token[256];
 static int s_play_current_requested = 0;
+static int s_play_prepared = 0;
 static int s_pause_toggle_requested = 0;
 static int s_stop_playback_requested = 0;
 /* -1 previous, +1 next, 0 no navigation intent. Kept separate from the
  * queue cursor so a failed transition cannot move the visible queue. */
 static int s_navigation_requested = 0;
 static int s_prefetch_triggered = 0;
+static TrackRef s_prefetch_target;
+static unsigned int s_observed_queue_revision;
+static int s_observed_queue_position = -1;
+static DownloadSettings s_download_settings;
 static int s_cover_prefetch_triggered = 0;
 static int s_advance_triggered = 0;
 /* Реакция на AUDIO_PLAYER_ERROR: не более N автопропусков подряд,
@@ -44,63 +51,47 @@ static u64 s_network_retry_backoff_us = 500000ULL;
  * is queued for every track with really-audible output. */
 static PlaybackReportContext s_report_ctx;
 static unsigned int s_report_seq = 0;
+static u64 s_report_checkpoint_us;
 
-static int wave_report_find_flow(const char *track_id, WaveQueueItem *out)
-{
-    WaveQueueItem batch[64];
-    int batch_count;
-    int batch_index;
-
-    if (!track_id || !track_id[0] || !out) {
-        return -1;
-    }
-    batch_count = playback_queue_get_flow_items(batch, 64);
-    for (batch_index = 0; batch_index < batch_count; ++batch_index) {
-        if (strcmp(batch[batch_index].track_id, track_id) == 0) {
-            *out = batch[batch_index];
-            return 0;
-        }
-    }
-    return -1;
-}
-
-static void wave_report_capture(const TrackEntry *track)
+static int wave_report_capture(const TrackEntry *track, int order_pos)
 {
     PlaybackQueueInfo queue_info;
     PlaybackQueueSource source = PLAYBACK_QUEUE_SOURCE_NONE;
     WaveQueueItem flow;
     int have_flow = 0;
     unsigned int generation;
+    char session_id[64] = "";
 
     if (!track || !track->id[0]) {
-        return;
-    }
-    /* Same-track restart (pause/buffering/network retry): keep play_id. */
-    if (strcmp(s_report_ctx.track_id, track->id) == 0 &&
-        !s_report_ctx.terminal_reported) {
-        return;
+        return -1;
     }
     if (playback_queue_get_info(&queue_info) == 0) {
         source = queue_info.source;
     }
     if (source == PLAYBACK_QUEUE_SOURCE_FLOW) {
         generation = wave_current_generation();
-        if (wave_report_find_flow(track->id, &flow) == 0) {
+        wave_get_session_id(session_id, sizeof(session_id));
+        if (playback_queue_get_flow_at(order_pos < 0 ? queue_info.order_pos : order_pos, &flow) == 0) {
             have_flow = 1;
         }
     } else {
+        generation = s_report_ctx.generation;
+    }
+    if (source != PLAYBACK_QUEUE_SOURCE_FLOW) {
         s_report_seq++;
         if (s_report_seq == 0) {
             s_report_seq = 1;
         }
         generation = s_report_seq;
     }
-    playback_report_context_start(&s_report_ctx,
+    if (playback_report_context_start(&s_report_ctx,
                                   track->id,
                                   have_flow ? flow.album_id : track->album_id,
                                   have_flow ? flow.batch_id : "",
                                   track->duration_ms,
-                                  generation, source);
+                                  generation, source, s_token) < 0) return -1;
+    snprintf(s_report_ctx.radio_session_id,
+             sizeof(s_report_ctx.radio_session_id), "%s", session_id);
     if (playback_reporter_new_play_id(s_report_ctx.play_id,
                                       sizeof(s_report_ctx.play_id)) != 0) {
         s_report_ctx.play_id[0] = '\0';
@@ -108,66 +99,55 @@ static void wave_report_capture(const TrackEntry *track)
     audio_player_set_report_generation(s_report_ctx.generation);
     logLine("pb: report ctx track='%s' flow=%d play='%s'\n",
             s_report_ctx.track_id, have_flow, s_report_ctx.play_id);
+    return 0;
 }
 
 static void wave_report_poll_first_pcm(void)
 {
     char pcm_id[40];
     unsigned int pcm_generation = 0;
-    char token[256];
-    char session_id[64];
-
-    if (audio_player_take_first_pcm_event(pcm_id, sizeof(pcm_id),
-                                          &pcm_generation) != 0) {
-        return;
+    if (audio_player_take_first_pcm_event(pcm_id, sizeof(pcm_id), &pcm_generation) == 0 &&
+        strcmp(s_report_ctx.track_id, pcm_id) == 0 && s_report_ctx.generation == pcm_generation &&
+        !s_report_ctx.had_first_pcm) {
+        s_report_ctx.had_first_pcm = 1;
+        s_report_checkpoint_us = sceKernelGetSystemTimeWide();
     }
-    if (!s_report_ctx.track_id[0] ||
-        strcmp(s_report_ctx.track_id, pcm_id) != 0 ||
-        s_report_ctx.generation != pcm_generation ||
-        s_report_ctx.first_pcm_reported ||
-        !s_report_ctx.play_id[0]) {
-        return;
-    }
-    s_report_ctx.first_pcm_reported = 1;
-    token[0] = '\0';
-    if (token_loader_read(token, sizeof(token)) != 0 || !token[0]) {
-        logLine("pb: report start skipped, no token\n");
-        return;
-    }
-    /* /play-audio for every audible track; trackStarted for FLOW only. */
-    playback_reporter_enqueue_play_audio(&s_report_ctx, token, 0);
-    if (s_report_ctx.active &&
-        s_report_ctx.source == PLAYBACK_QUEUE_SOURCE_FLOW &&
-        wave_get_session_id(session_id, sizeof(session_id)) == 0) {
-        double len_s = (s_report_ctx.duration_ms > 0)
-            ? ((double)s_report_ctx.duration_ms / 1000.0) : 0.0;
+    if (!s_report_ctx.had_first_pcm || s_report_ctx.start_reported ||
+        s_report_ctx.terminal_reported || !s_report_ctx.play_id[0]) return;
+    if (playback_reporter_enqueue_play_audio(&s_report_ctx, 0, 0, 0) < 0) return;
+    s_report_ctx.start_reported = 1;
+    if (s_report_ctx.active && s_report_ctx.source == PLAYBACK_QUEUE_SOURCE_FLOW &&
+        s_report_ctx.radio_session_id[0] &&
+        (s_report_ctx.generation != wave_current_generation() || wave_is_active())) {
+        wave_report_started(s_report_ctx.generation, s_report_ctx.token);
         playback_reporter_enqueue_feedback(PLAYBACK_REPORT_TRACK_STARTED,
-                                           &s_report_ctx, token, session_id,
-                                           0.0, len_s);
+                                           &s_report_ctx, s_report_ctx.token,
+                                           s_report_ctx.radio_session_id,
+                                           0, s_report_ctx.duration_ms);
     }
-    memset(token, 0, sizeof(token));
-    logLine("pb: report start queued track='%s'\n", s_report_ctx.track_id);
-    logger_flush();
+    logLine("pb: report start track='%s' uid=%d queued=1\n", s_report_ctx.track_id, s_report_ctx.uid);
 }
-
 /* Resolve really-audible ms for a stashed context: prefer the worker's
  * terminal snapshot on track+generation match, else the last value the
  * controller saw. *out_had_pcm gates event creation (spec 8.5: nothing
  * before the first PCM). */
 static void wave_report_terminal_time(const PlaybackReportContext *old,
-                                      int *out_audible_ms, int *out_had_pcm)
+                                      int *out_audible_ms, int *out_had_pcm, int *out_position_ms)
 {
     char snap_id[40];
     unsigned int snap_generation = 0;
     AudioEndReason snap_reason = AUDIO_END_MANUAL_STOP;
     int snap_audible = 0;
     int snap_had_pcm = 0;
+    int snap_position_ms = 0;
+
+    if (out_position_ms) *out_position_ms = old ? old->position_ms : 0;
 
     if (out_audible_ms) {
         *out_audible_ms = old ? old->audible_ms : 0;
     }
     if (out_had_pcm) {
-        *out_had_pcm = old ? old->first_pcm_reported : 0;
+        *out_had_pcm = old ? old->had_first_pcm : 0;
     }
     if (!old || !old->track_id[0]) {
         return;
@@ -175,102 +155,124 @@ static void wave_report_terminal_time(const PlaybackReportContext *old,
     if (audio_player_take_terminal_snapshot(snap_id, sizeof(snap_id),
                                             &snap_generation, &snap_reason,
                                             &snap_audible,
-                                            &snap_had_pcm) != 0) {
+                                            &snap_had_pcm, &snap_position_ms) != 0) {
         return;
     }
     (void)snap_reason; /* the controller branch owns the stop reason */
     if (strcmp(snap_id, old->track_id) == 0 &&
         snap_generation == old->generation) {
+        if (out_position_ms && snap_had_pcm) *out_position_ms = snap_position_ms;
         if (out_audible_ms) {
-            *out_audible_ms = snap_audible;
+            *out_audible_ms = old->audible_ms + snap_audible;
         }
         if (out_had_pcm) {
-            *out_had_pcm = snap_had_pcm;
+            *out_had_pcm = old->had_first_pcm || snap_had_pcm;
         }
     }
 }
 
-static void wave_report_note_old(const PlaybackReportContext *old, int finished)
+static int wave_report_note_old(PlaybackReportContext *old, int finished)
 {
-    int audible_ms = 0;
-    int had_pcm = 0;
-
-    if (!old || !old->track_id[0] || !old->active ||
-        old->source != PLAYBACK_QUEUE_SOURCE_FLOW) {
-        return;
-    }
-    if (old->first_pcm_reported == 0 || old->terminal_reported) {
-        return;
-    }
-    wave_report_terminal_time(old, &audible_ms, &had_pcm);
-    if (!had_pcm) {
-        return;
-    }
-    if (finished) {
-        wave_note_finished(old->track_id, old->album_id,
-                           audible_ms, old->duration_ms);
-    } else {
-        wave_note_skip(old->track_id, old->album_id,
-                       audible_ms, old->duration_ms);
-    }
+    int audible_ms = 0, had_pcm = 0, position_ms = 0;
+    if (!old || !old->track_id[0] || !old->had_first_pcm || old->terminal_reported) return 0;
+    wave_report_terminal_time(old, &audible_ms, &had_pcm, &position_ms);
+    if (!had_pcm) return 0;
+    old->audible_ms = audible_ms;
+    old->position_ms = position_ms;
+    if (!old->terminal_pending) old->terminal_finished = finished;
+    old->terminal_pending = 1;
+    if (!old->start_reported ||
+        playback_reporter_enqueue_play_audio(old, audible_ms, position_ms, 0) < 0) return -1;
+    old->terminal_reported = 1;
+    old->terminal_pending = 0;
+    logLine("pb: report end track='%s' uid=%d played_ms=%d position_ms=%d queued=1\n",
+            old->track_id, old->uid, audible_ms, position_ms);
+    if (old->active && old->source == PLAYBACK_QUEUE_SOURCE_FLOW &&
+        old->radio_session_id[0] && old->batch_id[0] &&
+        (old->generation != wave_current_generation() || wave_is_active()))
+        playback_reporter_enqueue_feedback(
+            old->terminal_finished ? PLAYBACK_REPORT_TRACK_FINISHED : PLAYBACK_REPORT_SKIP,
+            old, old->token, old->radio_session_id, audible_ms, old->duration_ms);
+    return 0;
 }
-/* SEEK: accumulated relative-seek request (ms) from UI hold handling. */
+
+static void playback_report_checkpoint(void)
+{
+    AudioPlayerSnapshot snap;
+    u64 now;
+    if (!s_report_ctx.start_reported || s_report_ctx.terminal_pending ||
+        s_report_ctx.terminal_reported) return;
+    now = sceKernelGetSystemTimeWide();
+    if (now - s_report_checkpoint_us < 10000000ULL) return;
+    if (!audio_player_get_snapshot(&snap) || snap.state != AUDIO_PLAYER_PLAYING ||
+        strcmp(snap.track_id, s_report_ctx.track_id) != 0) return;
+    if (playback_reporter_enqueue_play_audio(&s_report_ctx,
+            s_report_ctx.audible_ms + snap.total_played_ms, snap.position_ms, 1) == 0)
+        s_report_checkpoint_us = now;
+}/* SEEK: accumulated relative-seek request (ms) from UI hold handling. */
 static int s_seek_delta_ms = 0;
-/* One-shot absolute seek bound to the restored track id. It remains pending
+/* One-shot absolute seek bound to a track id. It remains pending
  * through asynchronous metadata hydration and is cleared only after the
  * audio worker accepts it or another playback intent supersedes it. */
-static int s_resume_seek_pending = 0;
-static int s_resume_position_ms = 0;
-static char s_resume_track_id[40];
+static int s_absolute_seek_pending = 0;
+static int s_absolute_position_ms = 0;
+static char s_absolute_track_id[40];
 static int s_restored_paused = 0;
 static int s_restored_position_ms = 0;
 static char s_restored_track_id[40];
 
-/* Queue metadata resolution can come back PENDING (id known, entry not in the
- * store yet — deep shuffle jump or evicted record). The controller then asks
- * the hydrator and retries on a slow tick instead of polling the Memory Stick
- * every frame. */
-#define PB_PENDING_RETRY_US 250000ULL
-static u64 s_play_retry_after_us = 0;
-static u64 s_prefetch_retry_after_us = 0;
+/* Pending metadata is checked in the update loop; hydration and disk reads
+ * remain in the worker. Transport retries have their own deadline. */
+static u64 s_metadata_retry_after_us = 0;
+static u64 s_metadata_retry_backoff_us = 500000ULL;
+#define PB_PREVIOUS_START_MS 3000
 
 static u64 pb_now_us(void)
 {
     return (u64)sceKernelGetSystemTimeWide();
 }
 
-static void pb_request_track_hydration(const TrackEntry *track)
+static int pb_request_track_hydration(const TrackEntry *track)
 {
-    static char s_last_requested[40];
-    static int s_last_requested_album = 0;
-    static u64 s_last_requested_us = 0;
-    u64 now = pb_now_us();
+    if (s_metadata_retry_after_us &&
+        (!net_stack_is_ready() || pb_now_us() < s_metadata_retry_after_us)) return 1;
+    s_metadata_retry_after_us = 0;
+    TrackRef refs[TRACK_HYDRATOR_JOB_MAX];
+    TrackRef window[TRACK_HYDRATOR_JOB_MAX];
+    PlaybackQueueInfo info;
     char token[256];
-
-    /* One request per id, re-issued at most every 3 s so a failed hydration
-     * can never wedge playback permanently. */
-    if (!track || !track->id[0]) {
-        return;
+    int count = 0;
+    if (playback_queue_get_info(&info) < 0 || info.count <= 0) return -1;
+    if (track && track->id[0]) {
+        memset(&refs[count], 0, sizeof(refs[count]));
+        snprintf(refs[count].id, sizeof(refs[count].id), "%s", track->id);
+        refs[count++].album_id = track->album_id;
     }
-    if (strcmp(s_last_requested, track->id) == 0 &&
-        s_last_requested_album == track->album_id &&
-        (now - s_last_requested_us) < 3000000ULL) {
-        return;
+    int n = playback_queue_get_window(window, TRACK_HYDRATOR_JOB_MAX);
+    for (int i = 0; i < n && count < TRACK_HYDRATOR_JOB_MAX; ++i) {
+        int j;
+        for (j = 0; j < count; ++j)
+            if (refs[j].album_id == window[i].album_id && strcmp(refs[j].id, window[i].id) == 0) break;
+        if (j == count) refs[count++] = window[i];
     }
-    token[0] = '\0';
-    if (token_loader_read(token, sizeof(token)) != 0) {
-        return;
-    }
-    track_hydrator_request_track(token, track->id, track->album_id, -1, 0);
+    if (!count || token_loader_read(token, sizeof(token)) != 0) return -1;
+    int rc = track_hydrator_request(TRACK_HYDRATOR_PLAYBACK, token, refs, NULL, count, info.revision);
     memset(token, 0, sizeof(token));
-    strncpy(s_last_requested, track->id, sizeof(s_last_requested) - 1);
-    s_last_requested[sizeof(s_last_requested) - 1] = '\0';
-    s_last_requested_album = track->album_id;
-    s_last_requested_us = now;
-    logLine("pb: hydration requested track_id='%s' album_id=%d\n",
-            track->id, track->album_id);
+    if (rc == TRACK_HYDRATOR_TRANSPORT_ERROR) {
+        track_hydrator_cancel(TRACK_HYDRATOR_PLAYBACK);
+        s_metadata_retry_after_us = pb_now_us() + s_metadata_retry_backoff_us;
+        logLine("pb: metadata transport retry delay_us=%llu revision=%u\n",
+            (unsigned long long)s_metadata_retry_backoff_us, info.revision);
+        if (s_metadata_retry_backoff_us < 10000000ULL) {
+            s_metadata_retry_backoff_us *= 2;
+            if (s_metadata_retry_backoff_us > 10000000ULL)
+                s_metadata_retry_backoff_us = 10000000ULL;
+        }
+        return 1;
+    }
+    if (rc == 0) s_metadata_retry_backoff_us = 500000ULL;
+    return rc;
 }
-
 static void pb_clear_restored_pause(void)
 {
     s_restored_paused = 0;
@@ -278,7 +280,8 @@ static void pb_clear_restored_pause(void)
     s_restored_track_id[0] = '\0';
 }
 
-static PlaybackIntentResult playback_controller_start_track(const TrackEntry *track)
+static PlaybackIntentResult playback_controller_start_track(const TrackEntry *track,
+                                                             int order_pos, int recovery)
 {
     if (!track || track->id[0] == '\0') {
         logLine("pb: reject invalid track\n");
@@ -294,40 +297,18 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
      * будущем prefetch в кэше ещё никто не знает. */
     {
         TrackEntry nxt;
-        if (playback_queue_get_next(&nxt) == PLAYBACK_QUEUE_OK &&
+        if (playback_queue_get_adjacent(1, &nxt, NULL) == PLAYBACK_QUEUE_OK &&
             nxt.id[0] != '\0') {
             audio_cache_hint_next(nxt.id);
         } else {
             audio_cache_hint_next(NULL);
         }
     }
-    if (s_resume_seek_pending &&
-        strcmp(s_resume_track_id, track->id) != 0) {
-        s_resume_seek_pending = 0;
-        s_resume_position_ms = 0;
-        s_resume_track_id[0] = '\0';
-    }
-
-    /* Early-exit if same track already in progress — avoids token disk read. */
-    {
-        AudioCacheStatus cur;
-        audio_cache_get_status(&cur);
-        if ((cur.state == AUDIO_CACHE_DOWNLOADING ||
-             cur.state == AUDIO_CACHE_PROGRESSIVE_READY ||
-             cur.state == AUDIO_CACHE_READY) &&
-            strcmp(cur.track_id, track->id) == 0) {
-            logLine("pb: same track already %s, skip\n",
-                    cur.state == AUDIO_CACHE_READY ? "READY" :
-                    (cur.state == AUDIO_CACHE_PROGRESSIVE_READY ? "PROGRESSIVE_READY" : "DOWNLOADING"));
-            memcpy(&g_playback.current_track, track, sizeof(TrackEntry));
-            /* WAVE-REPORT: keep (or restart, when terminal) the report ctx. */
-            wave_report_capture(track);
-            if (audio_player_start_current() == 0) {
-                return PLAYBACK_INTENT_ACCEPTED;
-            }
-            logLine("pb: reject same-track start_current failed track_id='%s'\n", track->id);
-            return PLAYBACK_INTENT_REJECTED;
-        }
+    if (s_absolute_seek_pending &&
+        strcmp(s_absolute_track_id, track->id) != 0) {
+        s_absolute_seek_pending = 0;
+        s_absolute_position_ms = 0;
+        s_absolute_track_id[0] = '\0';
     }
 
     s_token[0] = '\0';
@@ -336,10 +317,26 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
         return PLAYBACK_INTENT_REJECTED;
     }
 
-    /* WAVE-REPORT: stash the report context before the worker stops/starts
-     * (generation must be set before audio_player_start_current below). */
-    wave_report_capture(track);
     audio_player_stop();
+    AudioPlayerState stopped_state = audio_player_get_state();
+    if (stopped_state != AUDIO_PLAYER_STOPPED && stopped_state != AUDIO_PLAYER_IDLE) {
+        logLine("pb: reject start, previous player did not stop track_id='%s'\n", track->id);
+        memset(s_token, 0, sizeof(s_token));
+        return PLAYBACK_INTENT_REJECTED;
+    }
+    wave_report_poll_first_pcm();
+    if (recovery) {
+        int played_ms, had_pcm, position_ms = 0;
+        wave_report_terminal_time(&s_report_ctx, &played_ms, &had_pcm, &position_ms);
+        s_report_ctx.audible_ms = played_ms;
+        s_report_ctx.position_ms = position_ms;
+    } else {
+        if (wave_report_note_old(&s_report_ctx, 0) < 0 ||
+            wave_report_capture(track, order_pos) < 0) {
+            memset(s_token, 0, sizeof(s_token));
+            return PLAYBACK_INTENT_REJECTED;
+        }
+    }
     memcpy(&g_playback.current_track, track, sizeof(TrackEntry));
     if (audio_cache_start(track, s_token) != 0) {
         /* Кэш отказал (source ещё удержан, воркер недоступен) — плеер не
@@ -357,8 +354,23 @@ static PlaybackIntentResult playback_controller_start_track(const TrackEntry *tr
     return PLAYBACK_INTENT_ACCEPTED;
 }
 
+static void pb_sync_download_settings(void)
+{
+    DownloadSettings settings = download_settings_get();
+    if (download_settings_required_quality(settings) !=
+        download_settings_required_quality(s_download_settings)) {
+        s_prefetch_triggered = 0;
+        s_cover_prefetch_triggered = 0;
+    }
+    s_download_settings = settings;
+}
+
 void playback_controller_init(void)
 {
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
+    s_download_settings = download_settings_get();
+    s_play_prepared = 0;
     memset(&g_playback, 0, sizeof(g_playback));
     /* WAVE-REPORT: fresh telemetry state. */
     memset(&s_report_ctx, 0, sizeof(s_report_ctx));
@@ -377,9 +389,9 @@ void playback_controller_init(void)
     s_network_retry_backoff_us = 500000ULL;
     /* SEEK: no queued seek across init. */
     s_seek_delta_ms = 0;
-    s_resume_seek_pending = 0;
-    s_resume_position_ms = 0;
-    s_resume_track_id[0] = '\0';
+    s_absolute_seek_pending = 0;
+    s_absolute_position_ms = 0;
+    s_absolute_track_id[0] = '\0';
     pb_clear_restored_pause();
     playback_queue_init();
     audio_player_init();
@@ -388,6 +400,9 @@ void playback_controller_init(void)
 
 void playback_controller_shutdown(void)
 {
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
+    s_play_prepared = 0;
     s_play_current_requested = 0;
     s_pause_toggle_requested = 0;
     s_stop_playback_requested = 0;
@@ -396,9 +411,9 @@ void playback_controller_shutdown(void)
     s_cover_prefetch_triggered = 0;
     s_advance_triggered = 0;
     s_network_retry_pending = 0;
-    s_resume_seek_pending = 0;
-    s_resume_position_ms = 0;
-    s_resume_track_id[0] = '\0';
+    s_absolute_seek_pending = 0;
+    s_absolute_position_ms = 0;
+    s_absolute_track_id[0] = '\0';
     pb_clear_restored_pause();
     audio_player_shutdown();
     playback_queue_clear();
@@ -410,6 +425,9 @@ void playback_controller_shutdown(void)
 
 int playback_controller_quiesce(void)
 {
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
+    s_play_prepared = 0;
     s_play_current_requested = 0;
     s_pause_toggle_requested = 0;
     s_stop_playback_requested = 0;
@@ -420,26 +438,43 @@ int playback_controller_quiesce(void)
     s_network_retry_pending = 0;
     /* SEEK: drop any queued seek on quiesce. */
     s_seek_delta_ms = 0;
-    s_resume_seek_pending = 0;
-    s_resume_position_ms = 0;
-    s_resume_track_id[0] = '\0';
+    s_absolute_seek_pending = 0;
+    s_absolute_position_ms = 0;
+    s_absolute_track_id[0] = '\0';
     pb_clear_restored_pause();
-    return audio_player_quiesce();
+    if (audio_player_quiesce() < 0) return -1;
+    wave_report_poll_first_pcm();
+    return wave_report_note_old(&s_report_ctx, 0);
 }
 
 void playback_controller_request_play_current(void)
 {
+    track_hydrator_cancel(TRACK_HYDRATOR_PLAYBACK);
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
+    s_play_prepared = 0;
     pb_clear_restored_pause();
-    s_resume_seek_pending = 0;
-    s_resume_position_ms = 0;
-    s_resume_track_id[0] = '\0';
+    s_absolute_seek_pending = 0;
+    s_absolute_position_ms = 0;
+    s_absolute_track_id[0] = '\0';
     s_play_current_requested = 1;
     s_navigation_requested = 0;
     logLine("pb: play_current requested\n");
 }
 
+void playback_controller_request_play_prepared(const TrackEntry *track)
+{
+    if (!track || !track->id[0]) return;
+    playback_controller_request_play_current();
+    g_playback.current_track = *track;
+    s_play_prepared = 1;
+    pb_request_track_hydration(NULL);
+    track_hydrator_cancel(TRACK_HYDRATOR_PREPARE);
+}
+
 void playback_controller_request_resume_current(int position_ms)
 {
+    s_play_prepared = 0;
     TrackEntry track;
 
     memset(&track, 0, sizeof(track));
@@ -448,20 +483,23 @@ void playback_controller_request_resume_current(int position_ms)
         !track.id[0]) {
         return;
     }
+    track_hydrator_cancel(TRACK_HYDRATOR_PLAYBACK);
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
     pb_clear_restored_pause();
-    s_resume_seek_pending = position_ms > 0;
-    s_resume_position_ms = position_ms;
-    strncpy(s_resume_track_id, track.id, sizeof(s_resume_track_id) - 1);
-    s_resume_track_id[sizeof(s_resume_track_id) - 1] = '\0';
+    s_absolute_seek_pending = position_ms > 0;
+    s_absolute_position_ms = position_ms;
+    strncpy(s_absolute_track_id, track.id, sizeof(s_absolute_track_id) - 1);
+    s_absolute_track_id[sizeof(s_absolute_track_id) - 1] = '\0';
     s_play_current_requested = 1;
     s_navigation_requested = 0;
-    s_play_retry_after_us = 0;
     logLine("pb: resume requested track_id='%s' position_ms=%d\n",
-            s_resume_track_id, s_resume_position_ms);
+            s_absolute_track_id, s_absolute_position_ms);
 }
 
 void playback_controller_restore_paused_current(int position_ms)
 {
+    s_play_prepared = 0;
     TrackEntry track;
     int rc;
 
@@ -473,9 +511,9 @@ void playback_controller_restore_paused_current(int position_ms)
     }
     if (position_ms < 0) position_ms = 0;
     s_play_current_requested = 0;
-    s_resume_seek_pending = 0;
-    s_resume_position_ms = 0;
-    s_resume_track_id[0] = '\0';
+    s_absolute_seek_pending = 0;
+    s_absolute_position_ms = 0;
+    s_absolute_track_id[0] = '\0';
     s_restored_paused = 1;
     s_restored_position_ms = position_ms;
     strncpy(s_restored_track_id, track.id,
@@ -506,7 +544,7 @@ int playback_controller_prepare_current(TrackEntry *out)
         return -1;
     }
     if (rc == PLAYBACK_QUEUE_PENDING) {
-        pb_request_track_hydration(&track);
+        if (pb_request_track_hydration(&track) < 0) return -1;
         return 0;
     }
     memcpy(&g_playback.current_track, &track, sizeof(track));
@@ -537,17 +575,27 @@ int playback_controller_get_restored_pause(const char *track_id,
     return 1;
 }
 
-static void playback_controller_request_navigation(int direction)
+static void pb_reset_track_request(void)
 {
-    s_resume_seek_pending = 0;
-    s_resume_position_ms = 0;
-    s_resume_track_id[0] = '\0';
-    s_navigation_requested = direction;
+    track_hydrator_cancel(TRACK_HYDRATOR_PLAYBACK);
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
+    s_play_prepared = 0;
+    s_absolute_seek_pending = 0;
+    s_absolute_position_ms = 0;
+    s_absolute_track_id[0] = '\0';
+    s_navigation_requested = 0;
     s_play_current_requested = 0;
-    s_play_retry_after_us = 0;
     s_network_retry_pending = 0;
     s_advance_triggered = 0;
     s_error_handled = 0;
+}
+
+static void playback_controller_request_navigation(int direction)
+{
+    pb_reset_track_request();
+    s_error_skips = 0;
+    s_navigation_requested = direction;
     logLine("pb: %s requested\n", direction > 0 ? "next" : "previous");
 }
 
@@ -558,6 +606,30 @@ void playback_controller_request_next(void)
 
 void playback_controller_request_previous(void)
 {
+    AudioPlayerSnapshot snapshot;
+    if (s_navigation_requested == 0 &&
+        audio_player_get_snapshot(&snapshot) &&
+        (snapshot.state == AUDIO_PLAYER_PLAYING ||
+         snapshot.state == AUDIO_PLAYER_BUFFERING ||
+         snapshot.state == AUDIO_PLAYER_OPENING) &&
+        strcmp(snapshot.track_id, g_playback.current_track.id) == 0) {
+        int position_ms = snapshot.seek_pending
+            ? snapshot.seek_target_ms : snapshot.position_ms;
+        if (s_absolute_seek_pending &&
+            strcmp(s_absolute_track_id, snapshot.track_id) == 0) {
+            position_ms = s_absolute_position_ms;
+        }
+        if (position_ms >= PB_PREVIOUS_START_MS) {
+            pb_reset_track_request();
+            s_seek_delta_ms = 0;
+            s_absolute_seek_pending = 1;
+            s_absolute_position_ms = 0;
+            snprintf(s_absolute_track_id, sizeof(s_absolute_track_id), "%s",
+                     snapshot.track_id);
+            logLine("pb: restart requested track_id='%s'\n", snapshot.track_id);
+            return;
+        }
+    }
     playback_controller_request_navigation(-1);
 }
 
@@ -585,17 +657,15 @@ static void playback_controller_service_navigation(void)
 {
     TrackEntry target;
     /* WAVE-REPORT: outgoing context stashed before the cursor moves. */
-    PlaybackReportContext nav_outgoing;
     int direction = s_navigation_requested;
     int rc;
 
-    if (direction == 0 || pb_now_us() < s_play_retry_after_us) {
+    if (direction == 0) {
         return;
     }
 
-    rc = direction > 0
-        ? playback_queue_get_next(&target)
-        : playback_queue_get_previous(&target);
+    int target_pos = -1;
+    rc = playback_queue_get_adjacent(direction, &target, &target_pos);
 
     if (rc == PLAYBACK_QUEUE_EMPTY) {
         logLine("pb: %s rejected at queue boundary\n",
@@ -604,17 +674,16 @@ static void playback_controller_service_navigation(void)
         return;
     }
     if (rc == PLAYBACK_QUEUE_PENDING) {
-        pb_request_track_hydration(&target);
-        s_play_retry_after_us = pb_now_us() + PB_PENDING_RETRY_US;
-        logLine("pb: %s waiting metadata track_id='%s'\n",
-                direction > 0 ? "next" : "previous", target.id);
+        if (pb_request_track_hydration(&target) < 0) {
+            s_navigation_requested = 0;
+            return;
+        }
         return;
     }
-
-    s_play_retry_after_us = 0;
     /* WAVE-REPORT: stash the outgoing track; skip is queued after accept. */
-    nav_outgoing = s_report_ctx;
-    if (playback_controller_start_track(&target) != PLAYBACK_INTENT_ACCEPTED) {
+    s_metadata_retry_after_us = 0;
+    s_metadata_retry_backoff_us = 500000ULL;
+    if (playback_controller_start_track(&target, target_pos, 0) != PLAYBACK_INTENT_ACCEPTED) {
         /* The cursor remains unchanged. Do not spin on a permanent failure
          * (missing token, cache refusal); another key press is a fresh intent. */
         s_navigation_requested = 0;
@@ -623,9 +692,7 @@ static void playback_controller_service_navigation(void)
         return;
     }
 
-    rc = direction > 0
-        ? playback_queue_move_next()
-        : playback_queue_move_previous();
+    rc = playback_queue_select_order_pos(target_pos);
     if (rc != 0) {
         logLine("pb: %s queue commit failed track_id='%s'\n",
                 direction > 0 ? "next" : "previous", target.id);
@@ -638,18 +705,34 @@ static void playback_controller_service_navigation(void)
     s_navigation_requested = 0;
     s_prefetch_triggered = 0;
     s_cover_prefetch_triggered = 0;
-    s_prefetch_retry_after_us = 0;
     s_advance_triggered = 0;
-    s_error_skips = 0;
     s_network_retry_backoff_us = 500000ULL;
-    /* WAVE-REPORT: manual next/previous after first PCM → skip. */
-    wave_report_note_old(&nav_outgoing, 0);
     logLine("pb: manual %s committed track_id='%s'\n",
             direction > 0 ? "next" : "previous", target.id);
 }
 
 void playback_controller_service(void)
 {
+    PlaybackQueueInfo queue_info;
+    playback_queue_get_info(&queue_info);
+    if (queue_info.revision != s_observed_queue_revision ||
+        queue_info.order_pos != s_observed_queue_position) {
+        if (audio_cache_prefetch_cancel() >= 0) {
+            s_observed_queue_revision = queue_info.revision;
+            s_observed_queue_position = queue_info.order_pos;
+            s_prefetch_triggered = 0;
+            s_cover_prefetch_triggered = 0;
+            memset(&s_prefetch_target, 0, sizeof(s_prefetch_target));
+            track_hydrator_cancel(TRACK_HYDRATOR_PLAYBACK);
+            s_metadata_retry_after_us = 0;
+            s_metadata_retry_backoff_us = 500000ULL;
+            if (queue_info.count > 0) pb_request_track_hydration(NULL);
+            TrackEntry next;
+            int rc = playback_queue_get_adjacent(1, &next, NULL);
+            audio_cache_hint_next(rc != PLAYBACK_QUEUE_EMPTY ? next.id : NULL);
+        }
+    }
+    pb_sync_download_settings();
     if (s_restored_paused &&
         (g_playback.current_track.id[0] == '\0' ||
          strcmp(g_playback.current_track.id, s_restored_track_id) != 0 ||
@@ -658,23 +741,29 @@ void playback_controller_service(void)
     }
 
     if (s_stop_playback_requested) {
+        s_metadata_retry_after_us = 0;
+        s_metadata_retry_backoff_us = 500000ULL;
+        s_play_prepared = 0;
         s_stop_playback_requested = 0;
         s_play_current_requested = 0;
         s_navigation_requested = 0;
         s_network_retry_pending = 0;
         s_advance_triggered = 0;
-        s_resume_seek_pending = 0;
-        s_resume_position_ms = 0;
-        s_resume_track_id[0] = '\0';
+        s_absolute_seek_pending = 0;
+        s_absolute_position_ms = 0;
+        s_absolute_track_id[0] = '\0';
         audio_player_stop();
+        wave_report_poll_first_pcm();
         /* WAVE-REPORT: manual stop after first PCM → skip (snapshot taken
          * after the worker died, so audible_ms is final). */
         wave_report_note_old(&s_report_ctx, 0);
-        s_report_ctx.terminal_reported = 1;
     }
 
     /* WAVE-REPORT: first really-audible block → /play-audio (+trackStarted). */
     wave_report_poll_first_pcm();
+    if (s_report_ctx.terminal_pending)
+        wave_report_note_old(&s_report_ctx, s_report_ctx.terminal_finished);
+    playback_report_checkpoint();
 
     /* SEEK: forward one queued relative seek to the player engine. Dropped
      * when the engine is busy/idle; UI hold repeats re-issue it. */
@@ -701,14 +790,13 @@ void playback_controller_service(void)
             if (s_restored_paused &&
                 strcmp(s_restored_track_id,
                        g_playback.current_track.id) == 0) {
-                s_resume_seek_pending = s_restored_position_ms > 0;
-                s_resume_position_ms = s_restored_position_ms;
-                strncpy(s_resume_track_id, s_restored_track_id,
-                        sizeof(s_resume_track_id) - 1);
-                s_resume_track_id[sizeof(s_resume_track_id) - 1] = '\0';
+                s_absolute_seek_pending = s_restored_position_ms > 0;
+                s_absolute_position_ms = s_restored_position_ms;
+                strncpy(s_absolute_track_id, s_restored_track_id,
+                        sizeof(s_absolute_track_id) - 1);
+                s_absolute_track_id[sizeof(s_absolute_track_id) - 1] = '\0';
             }
             s_play_current_requested = 1;
-            s_play_retry_after_us = 0;
         }
     }
 
@@ -719,11 +807,11 @@ void playback_controller_service(void)
         pb_now_us() >= s_network_retry_after_us) {
         if (net_stack_is_ready()) {
             PlaybackIntentResult result =
-                playback_controller_start_track(&g_playback.current_track);
+                playback_controller_start_track(&g_playback.current_track, -1, 1);
             if (result == PLAYBACK_INTENT_ACCEPTED) {
                 logLine("pb: network recovered, retry track_id='%s'\n",
                         g_playback.current_track.id);
-                if (!s_resume_seek_pending) last_play_save();
+                if (!s_absolute_seek_pending) last_play_save();
                 s_network_retry_pending = 0;
                 s_error_handled = 0;
             } else {
@@ -735,8 +823,7 @@ void playback_controller_service(void)
         }
     }
 
-    if (s_play_current_requested &&
-        pb_now_us() >= s_play_retry_after_us) {
+    if (s_play_current_requested) {
         PlaybackIntentResult result;
         s_play_current_requested = 0;
         result = playback_controller_play_current();
@@ -748,21 +835,39 @@ void playback_controller_service(void)
         }
     }
 
-    if (s_resume_seek_pending) {
+    if (s_absolute_seek_pending) {
         AudioPlayerSnapshot resume_snapshot;
-        if (audio_player_get_snapshot(&resume_snapshot) &&
-            strcmp(resume_snapshot.track_id, s_resume_track_id) == 0 &&
-            audio_player_seek_to_ms(s_resume_position_ms) == 0) {
-            logLine("pb: resume seek accepted track_id='%s' position_ms=%d\n",
-                    s_resume_track_id, s_resume_position_ms);
-            s_resume_seek_pending = 0;
-            s_resume_position_ms = 0;
-            s_resume_track_id[0] = '\0';
+        int seek_ready = 1;
+        if (s_absolute_position_ms > 0) {
+            AudioCacheStatus cache;
+            if (!audio_cache_get_status(&cache) ||
+                strcmp(cache.track_id, s_absolute_track_id) != 0 ||
+                (cache.state != AUDIO_CACHE_READY &&
+                 cache.state != AUDIO_CACHE_PROGRESSIVE_READY)) {
+                seek_ready = 0;
+            } else if (!cache.from_disk_cache) {
+                logLine("pb: restored position reset, cache miss track_id='%s'\n",
+                        s_absolute_track_id);
+                s_absolute_seek_pending = 0;
+                s_absolute_position_ms = 0;
+                s_absolute_track_id[0] = '\0';
+                last_play_save();
+                seek_ready = 0;
+            }
+        }
+        if (seek_ready && audio_player_get_snapshot(&resume_snapshot) &&
+            strcmp(resume_snapshot.track_id, s_absolute_track_id) == 0 &&
+            audio_player_seek_to_ms(s_absolute_position_ms) == 0) {
+            logLine("pb: absolute seek accepted track_id='%s' position_ms=%d\n",
+                    s_absolute_track_id, s_absolute_position_ms);
+            s_absolute_seek_pending = 0;
+            s_absolute_position_ms = 0;
+            s_absolute_track_id[0] = '\0';
         }
     }
 
-    if (!s_prefetch_triggered && net_stack_is_ready() &&
-        pb_now_us() >= s_prefetch_retry_after_us) {
+    if (!s_prefetch_triggered && s_navigation_requested == 0 &&
+        !s_play_current_requested && net_stack_is_ready()) {
         AudioPlayerSnapshot snap;
         AudioCacheStatus ac_cur;
         audio_player_get_snapshot(&snap);
@@ -774,35 +879,38 @@ void playback_controller_service(void)
             g_playback.current_track.id[0] != '\0' &&
             strcmp(ac_cur.track_id, g_playback.current_track.id) == 0) {
             TrackEntry next;
-            int rc = playback_queue_get_next(&next);
+            int rc = playback_queue_get_adjacent(1, &next, NULL);
             if (rc == PLAYBACK_QUEUE_OK) {
                 if (!next.available) {
-                    s_prefetch_retry_after_us = pb_now_us() + PB_PENDING_RETRY_US;
                     logLine("pb: prefetch skipped unavailable track_id='%s'\n",
                             next.id);
                 } else {
                     char token[256];
                     token[0] = '\0';
                     if (token_loader_read(token, sizeof(token)) == 0) {
-                        audio_cache_prefetch_start(&next, token);
+                        int accepted = audio_cache_prefetch_start(&next, token);
                         memset(token, 0, sizeof(token));
-                        s_prefetch_triggered = 1;
+                        s_prefetch_triggered = accepted == 0;
+                        if (accepted == 0) {
+                            snprintf(s_prefetch_target.id, sizeof(s_prefetch_target.id), "%s", next.id);
+                            s_prefetch_target.album_id = next.album_id;
+                        }
                         s_cover_prefetch_triggered = 0;
                         logLine("pb: prefetch triggered track_id='%s'\n", next.id);
                     }
                 }
             } else if (rc == PLAYBACK_QUEUE_PENDING) {
                 pb_request_track_hydration(&next);
-                s_prefetch_retry_after_us =
-                    pb_now_us() + PB_PENDING_RETRY_US;
             }
         }
     }
 
     if (s_prefetch_triggered && !s_cover_prefetch_triggered &&
-        audio_cache_prefetch_get_state() == AUDIO_CACHE_READY) {
+        audio_cache_prefetch_get_state(s_prefetch_target.id) == AUDIO_CACHE_READY) {
         TrackEntry next;
-        if (playback_queue_get_next(&next) == PLAYBACK_QUEUE_OK) {
+        if (playback_queue_get_adjacent(1, &next, NULL) == PLAYBACK_QUEUE_OK &&
+            strcmp(next.id, s_prefetch_target.id) == 0 &&
+            next.album_id == s_prefetch_target.album_id) {
             if (next.album_id != 0 && next.cover_uri[0]) {
                 cover_now_playing_prefetch(next.album_id, next.cover_uri);
                 logLine("pb: cover prefetch triggered track_id='%s' album_id=%d\n",
@@ -819,44 +927,8 @@ void playback_controller_service(void)
         s_error_skips = 0;  /* трек доигран штатно — серия ошибок прервана */
         /* WAVE-REPORT: natural EOF → trackFinished before the cursor moves. */
         wave_report_note_old(&s_report_ctx, 1);
-        if (playback_queue_move_next() == 0) {
-            TrackEntry next;
-            int rc = playback_queue_get_current(&next);
-            last_play_save();
-            if (rc == PLAYBACK_QUEUE_PENDING) {
-                /* Queue already moved; start via the deferred-play path once
-                 * the metadata lands. play_current resets s_advance_triggered. */
-                pb_request_track_hydration(&next);
-                s_play_retry_after_us =
-                    pb_now_us() + PB_PENDING_RETRY_US;
-                s_play_current_requested = 1;
-                s_prefetch_triggered = 0;
-                s_cover_prefetch_triggered = 0;
-                logLine("pb: advance waiting metadata track_id='%s'\n", next.id);
-            } else if (s_prefetch_triggered && audio_cache_prefetch_swap() == 0) {
-                memcpy(&g_playback.current_track, &next, sizeof(next));
-                /* WAVE-REPORT: swapped-in track starts a fresh report ctx. */
-                wave_report_capture(&next);
-                audio_player_start_current();
-                logLine("pb: advance from prefetch track_id='%s'\n", next.id);
-                s_prefetch_triggered = 0;
-                s_cover_prefetch_triggered = 0;
-                s_advance_triggered = 0;
-            } else {
-                playback_controller_start_track(&next);
-                logLine("pb: advance cold start track_id='%s'\n", next.id);
-                s_prefetch_triggered = 0;
-                s_cover_prefetch_triggered = 0;
-                s_advance_triggered = 0;
-            }
-        } else {
-            /* WAVE-REPORT: natural EOF at queue end still closes the report. */
-            wave_report_note_old(&s_report_ctx, 1);
-            s_report_ctx.terminal_reported = 1;
-            logLine("pb: queue end\n");
-            s_prefetch_triggered = 0;
-            s_cover_prefetch_triggered = 0;
-        }
+        s_navigation_requested = 1;
+        playback_controller_service_navigation();
     }
 
     /* Ошибка плеера (кэш умер, watchdog, отказ бэкенда): один автопропуск
@@ -885,23 +957,9 @@ void playback_controller_service(void)
                  * actual audible time (the worker is already dead, so the
                  * terminal snapshot is final). */
                 wave_report_note_old(&s_report_ctx, 0);
-                if (s_error_skips <= PB_MAX_CONSECUTIVE_ERROR_SKIPS &&
-                    playback_queue_move_next() == 0) {
-                    TrackEntry next;
-                    int rc = playback_queue_get_current(&next);
-                    last_play_save();
-                    logLine("pb: error skip %d/%d -> track_id='%s'\n",
-                            s_error_skips, PB_MAX_CONSECUTIVE_ERROR_SKIPS, next.id);
-                    s_prefetch_triggered = 0;
-                    s_cover_prefetch_triggered = 0;
-                    if (rc == PLAYBACK_QUEUE_PENDING) {
-                        pb_request_track_hydration(&next);
-                        s_play_retry_after_us =
-                            pb_now_us() + PB_PENDING_RETRY_US;
-                        s_play_current_requested = 1;
-                    } else {
-                        playback_controller_start_track(&next);
-                    }
+                if (s_error_skips <= PB_MAX_CONSECUTIVE_ERROR_SKIPS) {
+                    s_navigation_requested = 1;
+                    playback_controller_service_navigation();
                 } else {
                     logLine("pb: stopping after %d consecutive errors\n", s_error_skips);
                 }
@@ -930,24 +988,21 @@ PlaybackIntentResult playback_controller_play_current(void)
     s_network_retry_pending = 0;
     s_network_retry_backoff_us = 500000ULL;
 
-    {
+    if (s_play_prepared) {
+        track = g_playback.current_track;
+        s_play_prepared = 0;
+    } else {
         int rc = playback_queue_get_current(&track);
         if (rc == PLAYBACK_QUEUE_EMPTY) {
             logLine("pb: play_current failed, queue empty\n");
             return PLAYBACK_INTENT_REJECTED;
         }
         if (rc == PLAYBACK_QUEUE_PENDING) {
-            /* Id known, metadata not in the store yet: hydrate and retry from
-             * service() on a slow tick. */
-            pb_request_track_hydration(&track);
-            s_play_retry_after_us =
-                pb_now_us() + PB_PENDING_RETRY_US;
+            /* Resolution uses the RAM store; the worker handles missing data. */
+            if (pb_request_track_hydration(&track) < 0) return PLAYBACK_INTENT_REJECTED;
             s_play_current_requested = 1;
-            logLine("pb: play_current waiting metadata track_id='%s'\n", track.id);
-            if (!s_resume_seek_pending) last_play_save();
             return PLAYBACK_INTENT_ACCEPTED;
         }
-        s_play_retry_after_us = 0;
     }
 
     if (playback_queue_get_info(&info) == 0) {
@@ -963,8 +1018,10 @@ PlaybackIntentResult playback_controller_play_current(void)
     }
 
     {
-        PlaybackIntentResult result = playback_controller_start_track(&track);
-        if (result == PLAYBACK_INTENT_ACCEPTED && !s_resume_seek_pending) {
+        PlaybackIntentResult result = playback_controller_start_track(&track, -1, 0);
+        logLine("pb: play_current start result=%d track=%s album=%d\n", result, track.id, track.album_id);
+        logger_flush();
+        if (result == PLAYBACK_INTENT_ACCEPTED && !s_absolute_seek_pending) {
             last_play_save();
         }
         return result;

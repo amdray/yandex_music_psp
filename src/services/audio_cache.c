@@ -842,6 +842,7 @@ static int run_file_job(AcSlot *slot, const AcJob *job,
         ctx.bitrate_kbps = variant->bitrate_kbps;
         ctx.duration_ms = job->track.duration_ms;
         ctx.progressive_need = ac_prebuffer_need(&ctx);
+        fs_ensure_dir(dl_path);
         ctx.fd = fs_open(dl_path, PSP_O_WRONLY | (base_size > 0 ? PSP_O_APPEND : (PSP_O_CREAT | PSP_O_TRUNC)), 0777);
         if (ctx.fd < 0) {
             logLine("ac: %s file open failed slot=%d '%s' rc=0x%08X\n",
